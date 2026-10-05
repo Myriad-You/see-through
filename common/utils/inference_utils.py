@@ -397,7 +397,7 @@ def process_cuts(img, depth, src_xyxy, tgt_bbox, p=5, mask=None):
         img[..., -1] *= mask
         depth = 1 - (1-depth) * mask
         if np.any(mask):
-            depth_median = np.median(depth[mask])
+            depth_median = np.median(depth[mask > 0])
     
     fxyxy = [tx1 + src_xyxy[0], ty1 + src_xyxy[1], tx2 + src_xyxy[0], ty2 + src_xyxy[1]]
 
