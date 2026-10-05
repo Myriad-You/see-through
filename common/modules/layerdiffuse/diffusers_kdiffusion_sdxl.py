@@ -325,6 +325,26 @@ class KDiffusionStableDiffusionXLPipeline(StableDiffusionXLImg2ImgPipeline):
     def device(self) -> torch.device:
         return self.unet.device
 
+    def _pin_known(self, latents, known_latents, known_mask, timesteps, i, generator):
+        known = known_latents.to(latents)
+        mask = known_mask.to(latents)
+        if latents.ndim == 5:
+            known = known[None]
+            mask = mask[None]
+        if i + 1 < len(timesteps):
+            noise = randn_tensor(known.shape, generator=generator, device=known.device, dtype=known.dtype)
+            known = self.scheduler.add_noise(known, noise, timesteps[i + 1:i + 2])
+        return known * mask + latents * (1 - mask)
+
+    @torch.inference_mode()
+    def encode_layers(self, layers):
+        '''RGBA uint8 HWC layers -> scaled frame latents [F, 4, h, w].'''
+        latents = [
+            self.trans_vae.encoder(self.vae, [layer]).to(self.unet.dtype) * self.vae.config.scaling_factor
+            for layer in layers
+        ]
+        return torch.cat(latents, dim=0)
+
     @torch.inference_mode()
     def __call__(
             self,
@@ -344,9 +364,16 @@ class KDiffusionStableDiffusionXLPipeline(StableDiffusionXLImg2ImgPipeline):
             show_progress=True,
             fullpage=None,
             group_index=None,
+            known_latents: Optional[torch.FloatTensor] = None,
+            known_mask: Optional[torch.FloatTensor] = None,
             size_condition: Optional[Tuple[int, int]] = None,
     ):
         '''
+        known_latents / known_mask: optional inpainting constraint, shaped like the
+        frame latents ([F, 4, h, w] and [F, 1, h, w]). Where known_mask is 1 the
+        sample is pinned to known_latents re-noised to the current timestep after
+        every step, so only the masked-out region is generated (RePaint-style).
+
         size_condition: the (h, w) given to SDXL's size conditioning instead of
         the sample's own. LayerDiff 3D was trained with 1280×1280 throughout, so
         a sample of another shape can keep the condition it was trained on.
@@ -472,6 +499,9 @@ class KDiffusionStableDiffusionXLPipeline(StableDiffusionXLImg2ImgPipeline):
                     if torch.backends.mps.is_available():
                         # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
                         latents = latents.to(latents_dtype)
+
+                if known_latents is not None:
+                    latents = self._pin_known(latents, known_latents, known_mask, timesteps, i, generator)
 
                 if i == len(timesteps) - 1 or (i + 1) % self.scheduler.order == 0:
                     progress_bar.update()
