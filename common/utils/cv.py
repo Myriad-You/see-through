@@ -274,6 +274,60 @@ def center_square_pad_resize(img: np.ndarray, target_size, pad_value=0, upscale_
         return img
 
 
+def round_half_up(value: float) -> int:
+    '''
+    Python's round() goes to even on .5; other implementations of the placement
+    below (a browser importer, say) round half up, so do the same here.
+    '''
+    return int(math.floor(value + 0.5))
+
+
+def fit_placement(src_hw, canvas_hw) -> Tuple[float, int, int, int, int]:
+    '''
+    Where an image of src_hw (h, w) sits on a canvas of canvas_hw (h, w): scaled
+    by one factor for both axes to fit, and centred. Returns (scale, x, y, w, h),
+    the scaled size w×h placed at (x, y). Nothing is stretched, whatever the
+    canvas shape.
+    '''
+    sh, sw = src_hw
+    ch, cw = canvas_hw
+    scale = min(cw / sw, ch / sh)
+    w = min(cw, round_half_up(sw * scale))
+    h = min(ch, round_half_up(sh * scale))
+    return scale, (cw - w) // 2, (ch - h) // 2, w, h
+
+
+def fit_pad_resize(img: np.ndarray, canvas_hw, pad_value=0, upscale_interpolation=cv2.INTER_LINEAR, downscale_interpolation=cv2.INTER_AREA):
+    '''
+    Scales img uniformly into a canvas of canvas_hw (h, w) and centres it, like
+    center_square_pad_resize for any canvas shape. Returns the canvas and its
+    fit_placement.
+    '''
+    placement = fit_placement(img.shape[:2], canvas_hw)
+    _, x, y, w, h = placement
+    shape = tuple(canvas_hw) + img.shape[2:]
+    canvas = np.full(shape, pad_value, dtype=img.dtype)
+    canvas[y: y + h, x: x + w] = smart_resize(img, (h, w), upscale_interpolation=upscale_interpolation, downscale_interpolation=downscale_interpolation)
+    return canvas, placement
+
+
+def fit_unpad_resize(canvas: np.ndarray, placement, src_hw, upscale_interpolation=cv2.INTER_LINEAR, downscale_interpolation=cv2.INTER_AREA):
+    '''The inverse of fit_pad_resize: the placed region, back at src_hw (h, w).'''
+    _, x, y, w, h = placement
+    return smart_resize(canvas[y: y + h, x: x + w], tuple(src_hw), upscale_interpolation=upscale_interpolation, downscale_interpolation=downscale_interpolation)
+
+
+def canvas_for_pixels(shape_hw, pixels: int, multiple: int = 64) -> List[int]:
+    '''
+    A canvas (h, w) in multiples of `multiple`, about `pixels` in area and about
+    the shape of shape_hw. Put an image on it with fit_pad_resize: the shape is
+    only close, and padding takes up the difference instead of stretching.
+    '''
+    sh, sw = shape_hw
+    scale = math.sqrt(pixels / (sh * sw))
+    return [max(multiple, round_half_up(sh * scale / multiple) * multiple), max(multiple, round_half_up(sw * scale / multiple) * multiple)]
+
+
 def random_hsv(img, hgain: float = 0.015, sgain: float = 0.6, vgain: float = 0.4):
     if hgain or sgain or vgain:
         dtype = img.dtype  # uint8

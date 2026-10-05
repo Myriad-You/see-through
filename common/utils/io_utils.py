@@ -497,7 +497,8 @@ def xyxy2center(xyxy):
 
 def save_psd(savep, img_list, h, w, pad_to_canvas=False, mode='RGBA', img_key='img'):
     from psd_tools import PSDImage
-    psd_image = PSDImage.new(mode=mode, size=(h, w), depth=8)
+    # psd-tools takes (width, height); only a square canvas hid passing (h, w).
+    psd_image = PSDImage.new(mode=mode, size=(w, h), depth=8)
     for imgd in img_list:
         img = imgd[img_key]
         x1 = y1 = 0
@@ -518,7 +519,12 @@ def save_psd(savep, img_list, h, w, pad_to_canvas=False, mode='RGBA', img_key='i
 
     psd_image.save(savep)
 
-def load_part(srcp: str, rotate=False, pad=0, min_width=64, min_sz=12, depth_min=None, depth_max=None):
+def load_part(srcp: str, rotate=False, pad=0, min_width=64, min_sz=12, depth_min=None, depth_max=None, edge_strip=True):
+    '''
+    edge_strip: drop a part found only in the bottom or right tenth of the
+    canvas. A square canvas pads a tall or wide figure, so little but stray
+    pixels lands there; on a canvas fitted to the figure its feet do.
+    '''
     img = Image.open(srcp).convert('RGBA')
     srcd = osp.dirname(srcp)
     tag = osp.splitext(osp.basename(srcp))[0]
@@ -539,7 +545,7 @@ def load_part(srcp: str, rotate=False, pad=0, min_width=64, min_sz=12, depth_min
         rst.update({'img': img, 'depth': depth, 'mask': mask, 'tag': tag})
         return rst
 
-    if np.sum(mask[:-p_test, :-p_test]) > 4:
+    if np.sum(mask[:-p_test, :-p_test] if edge_strip else mask) > 4:
         if rotate:
             img = np.rot90(img, 3)
             mask = np.rot90(mask, 3, )
@@ -636,7 +642,7 @@ def load_img_depth(srcd, src_info, pad=5, try_crop=False, rotate=False):
         part_info['mask'] = (img[..., -1] > 10).astype(np.uint8) * 255
 
 
-def load_parts(srcp, rotate=False, pad=0, min_width=64):
+def load_parts(srcp, rotate=False, pad=0, min_width=64, edge_strip=True):
     srcimg = osp.join(srcp, 'src_img.png')
     fullpage = np.array(Image.open(srcimg).convert('RGBA'))
 
@@ -707,7 +713,7 @@ def load_parts(srcp, rotate=False, pad=0, min_width=64):
             
         #     dmin, dmax = partdict['depth_min'], partdict['depth_max']
         #     depth = np.array(depth, dtype=np.float32) / 255 * (dmax - dmin) + dmin
-            p = load_part(osp.join(srcp, tag + '.png'), rotate=rotate, pad=pad, min_width=min_width, min_sz=min_sz)
+            p = load_part(osp.join(srcp, tag + '.png'), rotate=rotate, pad=pad, min_width=min_width, min_sz=min_sz, edge_strip=edge_strip)
             if p is not None:
                 tag2pd[tag] = p
                 tag2pd[tag]['part_id'] = part_id

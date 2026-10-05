@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Union, List, Optional
+from typing import Union, List, Optional, Tuple
 import gc
 
 import numpy as np
@@ -343,8 +343,14 @@ class KDiffusionStableDiffusionXLPipeline(StableDiffusionXLImg2ImgPipeline):
             negative_prompt=None,
             show_progress=True,
             fullpage=None,
-            group_index=None
+            group_index=None,
+            size_condition: Optional[Tuple[int, int]] = None,
     ):
+        '''
+        size_condition: the (h, w) given to SDXL's size conditioning instead of
+        the sample's own. LayerDiff 3D was trained with 1280×1280 throughout, so
+        a sample of another shape can keep the condition it was trained on.
+        '''
 
         device = self.unet.device
         dtype = self.unet.dtype
@@ -393,6 +399,8 @@ class KDiffusionStableDiffusionXLPipeline(StableDiffusionXLImg2ImgPipeline):
 
         height = lh * self.vae_scale_factor
         width = lw * self.vae_scale_factor
+        if size_condition is not None:
+            height, width = (int(v) for v in size_condition)
 
         add_time_ids = list((height, width) + (0, 0) + (height, width))
         add_time_ids = torch.tensor([add_time_ids], dtype=self.unet.dtype)

@@ -1,12 +1,14 @@
 import os
 import os.path as osp
 import gc
+import math
 
 from modules.layerdiffuse.diffusers_kdiffusion_sdxl import KDiffusionStableDiffusionXLPipeline, UNetFrameConditionModel
 from modules.layerdiffuse.vae import TransparentVAE
 from modules.layerdiffuse.layerdiff3d import UNetFrameConditionModel
 from modules.marigold import MarigoldDepthPipeline
-from utils.cv import center_square_pad_resize, img_alpha_blending, smart_resize, validate_resolution
+from utils.cv import center_square_pad_resize, img_alpha_blending, smart_resize, validate_resolution, \
+    fit_pad_resize, fit_unpad_resize, canvas_for_pixels, round_half_up
 from utils.torch_utils import seed_everything
 from utils.io_utils import json2dict, dict2json, load_parts, save_tmp_img, load_part, save_psd
 from utils.torchcv import cluster_inpaint_part
@@ -26,9 +28,25 @@ VALID_BODY_PARTS_V2 = [
 
 
 layerdiff_pipeline: KDiffusionStableDiffusionXLPipeline = None
+
+# Written beside the parts when apply_layerdiff runs on a canvas fitted to the
+# figure rather than a square: the canvas, where the source sits on it, and the
+# scale the parts are finally kept at.
+CANVAS_INFO = 'canvas.json'
+# LayerDiff 3D's training size, and the SDXL size condition it always saw.
+TRAINED_SIZE = 1280
+BODY_TAGS_V3 = ['front hair', 'back hair', 'head', 'neck', 'neckwear', 'topwear', 'handwear', 'bottomwear', 'legwear', 'footwear', 'tail', 'wings', 'objects']
+HEAD_TAGS_V3 = ['headwear', 'face', 'irides', 'eyebrow', 'eyewhite', 'eyelash', 'eyewear', 'ears', 'earwear', 'nose', 'mouth']
 def apply_layerdiff(
     imgp: str, pretrained: str, num_inference_steps=30, seed=0, save_dir='workspace/layerdiff_output', target_tag_list=VALID_BODY_PARTS_V2, 
-    resolution=1280, vae_ckpt=None, unet_ckpt=None, disable_progressbar=False, cache_tag_embeds=True, group_offload=False):
+    resolution=1280, vae_ckpt=None, unet_ckpt=None, disable_progressbar=False, cache_tag_embeds=True, group_offload=False,
+    head_resolution=TRAINED_SIZE, output_scale=1, size_condition='trained'):
+    '''
+    resolution: an int pads the image to that square, as before. An (h, w)
+    canvas instead fits the image on that canvas without stretching (see
+    _apply_layerdiff_canvas); head_resolution, output_scale and size_condition
+    apply to that mode only.
+    '''
     
     global layerdiff_pipeline
     if layerdiff_pipeline is None:
@@ -77,6 +95,11 @@ def apply_layerdiff(
 
     saved = osp.join(save_dir, osp.splitext(osp.basename(imgp))[0])
     os.makedirs(saved, exist_ok=True)
+    if not isinstance(resolution, int):
+        _apply_layerdiff_canvas(
+            pipeline, imgp, saved, seed, num_inference_steps, target_tag_list, validate_resolution(resolution, div=64),
+            head_resolution, output_scale, size_condition)
+        return
     input_img = np.array(Image.open(imgp).convert('RGBA'))
     fullpage, pad_size, pad_pos = center_square_pad_resize(input_img, resolution, return_pad_info=True)
     scale = pad_size[0] / resolution
@@ -186,6 +209,172 @@ def apply_layerdiff(
 
 
 marigold_pipeline: MarigoldDepthPipeline = None
+def _crop_head_box(img, xywh):
+    '''The head box with a fifth of its size around it, as apply_layerdiff's _crop_head.'''
+    x, y, w, h = xywh
+    ih, iw = img.shape[:2]
+    x1 = x
+    y1 = y
+    x2 = x + w
+    y2 = y + h
+    if w < iw // 2:
+        px = min(iw - x - w, x, w // 5)
+        x1 = min(max(x - px, 0), iw)
+        x2 = min(max(x + w + px, 0), iw)
+    if h < ih // 2:
+        py = min(ih - y - h, y, h // 5)
+        y2 = min(max(y + h + py, 0), ih)
+        y1 = min(max(y - py, 0), ih)
+    return img[y1: y2, x1: x2], (x1, y1, x2, y2)
+
+
+def _place_on_canvas(region, box, placement, canvas_hw, scale_out=1):
+    '''
+    `region`, a picture of the source's box (x1, y1, x2, y2), drawn where that
+    box falls on the canvas (scaled by scale_out): the same placement as the
+    whole source, so it lines up with every other part.
+    '''
+    scale, ox, oy, _, _ = placement
+    s = scale * scale_out
+    x1, y1, x2, y2 = box
+    x = round_half_up(ox * scale_out + x1 * s)
+    y = round_half_up(oy * scale_out + y1 * s)
+    w = max(1, round_half_up((x2 - x1) * s))
+    h = max(1, round_half_up((y2 - y1) * s))
+    ch, cw = canvas_hw[0] * scale_out, canvas_hw[1] * scale_out
+    out = np.zeros((ch, cw) + region.shape[2:], dtype=region.dtype)
+    patch = smart_resize(region, (h, w))
+    cx1, cy1, cx2, cy2 = max(x, 0), max(y, 0), min(x + w, cw), min(y + h, ch)
+    if cx2 > cx1 and cy2 > cy1:
+        out[cy1: cy2, cx1: cx2] = patch[cy1 - y: cy2 - y, cx1 - x: cx2 - x]
+    return out
+
+
+def _apply_layerdiff_canvas(pipeline, imgp, saved, seed, num_inference_steps, target_tag_list, canvas_hw,
+                            head_resolution, output_scale, size_condition):
+    '''
+    apply_layerdiff on a canvas of canvas_hw (h, w) fitted to the figure: the
+    source is scaled by one factor and centred, never stretched. The head pass
+    runs on a square of head_resolution as before, and its parts are drawn back
+    with the same placement as the source.
+
+    The parts are saved at the canvas size for the depth model. With
+    output_scale above 1, the head parts are also kept at that multiple of the
+    canvas under hires/, at the precision the head pass found them, for
+    promote_output_scale to use.
+
+    size_condition: 'trained' gives SDXL the 1280×1280 condition LayerDiff 3D
+    was trained with; 'actual' gives the canvas's own size.
+    '''
+    output_scale = int(output_scale)
+    if output_scale < 1:
+        raise ValueError('output_scale must be a whole number of at least 1')
+    if size_condition not in ('trained', 'actual'):
+        raise ValueError("size_condition must be 'trained' or 'actual'")
+    condition = (TRAINED_SIZE, TRAINED_SIZE) if size_condition == 'trained' else None
+
+    input_img = np.array(Image.open(imgp).convert('RGBA'))
+    fullpage, placement = fit_pad_resize(input_img, canvas_hw)
+    Image.fromarray(fullpage).save(osp.join(saved, 'src_img.png'))
+    dict2json({
+        'canvas': list(canvas_hw), 'placement': list(placement), 'source': list(input_img.shape[:2]),
+        'output_scale': output_scale, 'promoted': False,
+    }, osp.join(saved, CANVAS_INFO))
+    hires = osp.join(saved, 'hires')
+    if output_scale > 1:
+        os.makedirs(hires, exist_ok=True)
+
+    rng = torch.Generator(device=pipeline.unet.device).manual_seed(seed)
+
+    def run(tags, page, group_index):
+        return pipeline(
+            strength=1.0,
+            num_inference_steps=num_inference_steps,
+            batch_size=1,
+            generator=rng,
+            guidance_scale=1.0,
+            prompt=tags,
+            negative_prompt='',
+            fullpage=page,
+            group_index=group_index,
+            size_condition=condition,
+        ).images
+
+    tag_version = pipeline.unet.get_tag_version()
+    if tag_version == 'v2':
+        for rst, tag in zip(run(target_tag_list, fullpage, None), target_tag_list):
+            Image.fromarray(rst).save(osp.join(saved, f'{tag}.png'))
+        return
+    if tag_version != 'v3':
+        raise ValueError(f'unknown tag version {tag_version}')
+
+    images = run(BODY_TAGS_V3, fullpage, 0)
+    for rst, tag in zip(images, BODY_TAGS_V3):
+        Image.fromarray(rst).save(osp.join(saved, f'{tag}.png'))
+
+    head_mask = (images[BODY_TAGS_V3.index('head')][..., -1] > 15).astype(np.uint8)
+    if not head_mask.any():
+        return
+    # The head's box on the canvas, back in source pixels.
+    bx, by, bw, bh = cv2.boundingRect(cv2.findNonZero(head_mask))
+    scale, ox, oy, _, _ = placement
+    sh, sw = input_img.shape[:2]
+    x0 = min(max(int(math.floor((bx - ox) / scale)), 0), sw)
+    y0 = min(max(int(math.floor((by - oy) / scale)), 0), sh)
+    x1 = min(max(int(math.ceil((bx + bw - ox) / scale)), 0), sw)
+    y1 = min(max(int(math.ceil((by + bh - oy) / scale)), 0), sh)
+    if x1 <= x0 or y1 <= y0:
+        return
+    input_head, box = _crop_head_box(input_img, [x0, y0, x1 - x0, y1 - y0])
+    head_page, head_placement = fit_pad_resize(input_head, (head_resolution, head_resolution))
+    Image.fromarray(head_page).save(osp.join(saved, 'src_head.png'))
+
+    _, hx, hy, hw, hh = head_placement
+    for rst, tag in zip(run(HEAD_TAGS_V3, head_page, 1), HEAD_TAGS_V3):
+        region = rst[hy: hy + hh, hx: hx + hw]
+        Image.fromarray(_place_on_canvas(region, box, placement, canvas_hw)).save(osp.join(saved, f'{tag}.png'))
+        if output_scale > 1:
+            Image.fromarray(_place_on_canvas(region, box, placement, canvas_hw, output_scale)).save(osp.join(hires, f'{tag}.png'))
+
+
+def promote_output_scale(saved: str, imgp: str):
+    '''
+    After apply_marigold, brings a canvas-mode run's parts to output_scale times
+    the canvas, so further_extr builds the PSD there: head parts from their
+    hires copies, the rest and every depth map scaled up, and the source page
+    drawn again from the source itself. Does nothing for a square run or an
+    output_scale of 1, and only once.
+    '''
+    infop = osp.join(saved, CANVAS_INFO)
+    if not osp.exists(infop):
+        return
+    canvas = json2dict(infop)
+    k = int(canvas.get('output_scale', 1))
+    if k <= 1 or canvas.get('promoted'):
+        return
+    ch, cw = canvas['canvas']
+    target = (ch * k, cw * k)
+    input_img = np.array(Image.open(imgp).convert('RGBA'))
+    if list(input_img.shape[:2]) != list(canvas['source']):
+        raise ValueError(f'{imgp} is not the source this run was made from')
+    page, _ = fit_pad_resize(input_img, target)
+    Image.fromarray(page).save(osp.join(saved, 'src_img.png'))
+    hires = osp.join(saved, 'hires')
+    for tag in json2dict(osp.join(saved, 'info.json'))['parts']:
+        for name in (f'{tag}.png', f'{tag}_depth.png'):
+            path = osp.join(saved, name)
+            if not osp.exists(path):
+                continue
+            sharp = osp.join(hires, name)
+            if osp.exists(sharp):
+                img = np.array(Image.open(sharp))
+            else:
+                img = smart_resize(np.array(Image.open(path)), target)
+            Image.fromarray(img).save(path)
+    canvas['promoted'] = True
+    dict2json(canvas, infop)
+
+
 def apply_marigold(srcp, pretrained: str, num_inference_steps=-1, seed=0, save_dir='workspace/layerdiff_output', target_tag_list=VALID_BODY_PARTS_V2, \
     resolution=768, normalize_depth=False, disable_progressbar=False, cache_tag_embeds=True, group_offload=False):
     global marigold_pipeline
@@ -210,6 +399,11 @@ def apply_marigold(srcp, pretrained: str, num_inference_steps=-1, seed=0, save_d
     src_h, src_w = fullpage.shape[:2]
     if isinstance(resolution, int) and resolution == -1:
         resolution = [src_h, src_w]
+    # A canvas fitted to the figure keeps its shape at the depth model's pixel
+    # budget, padded rather than squeezed into a square.
+    fit = isinstance(resolution, int) and src_h != src_w
+    if fit:
+        resolution = canvas_for_pixels((src_h, src_w), resolution * resolution)
     resolution = validate_resolution(resolution)
     src_rescaled = resolution[0] != src_h or resolution[1] != src_w
 
@@ -258,7 +452,11 @@ def apply_marigold(srcp, pretrained: str, num_inference_steps=-1, seed=0, save_d
     img_list.append(fullpage)
 
     img_list_input = img_list
-    if src_rescaled:
+    if src_rescaled and fit:
+        fitted = [fit_pad_resize(img, resolution) for img in img_list]
+        img_list_input = [img for img, _ in fitted]
+        depth_placement = fitted[0][1]
+    elif src_rescaled:
         img_list_input = [smart_resize(img, resolution) for img in img_list]
 
     seed_everything(seed)
@@ -271,7 +469,9 @@ def apply_marigold(srcp, pretrained: str, num_inference_steps=-1, seed=0, save_d
     depth_pred: np.ndarray = pipe_out.depth_tensor
     
     depth_pred = depth_pred.to(device='cpu', dtype=torch.float32).numpy()
-    if src_rescaled:
+    if src_rescaled and fit:
+        depth_pred = [fit_unpad_resize(d, depth_placement, (src_h, src_w)) for d in depth_pred]
+    elif src_rescaled:
         depth_pred = [smart_resize(d, (src_h, src_w)) for d in depth_pred]
     drawables = [{'img': img, 'depth': depth} for img, depth in zip(img_list, depth_pred)]
     drawables = drawables[:-1]
@@ -440,7 +640,9 @@ def further_extr(srcd: str, rotate=True, save_to_psd=False, tblr_split=True):
     # infos = json2dict(osp.join(srcd, 'info.json'))
     os.makedirs(saved, exist_ok=True)
 
-    fullpage, infos, part_dict_list = load_parts(srcd, rotate=rotate)
+    # On a canvas fitted to the figure its feet reach the bottom tenth.
+    fitted = osp.exists(osp.join(srcd, CANVAS_INFO))
+    fullpage, infos, part_dict_list = load_parts(srcd, rotate=rotate, edge_strip=not fitted)
 
     # optim_depth(part_dict_list, fullpage)
 
