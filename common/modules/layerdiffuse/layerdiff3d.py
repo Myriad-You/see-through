@@ -535,12 +535,15 @@ class GroupEmbedding(nn.Module):
         super().__init__(*args, **kwargs)
         self.params = nn.Parameter(torch.randn((n_cls, ndim)))
         self.linear = nn.Linear(ndim, ndim)
+        # Indices of the group's tags being run, when only some of them are (see select_tags).
+        self.select = None
 
     def forward(self, x: torch.Tensor):
+        params = self.params if self.select is None else self.params[self.select]
         if x.ndim == 3:
-            x = x + self.params[:, None]
+            x = x + params[:, None]
         else:
-            x = x + self.params
+            x = x + params
         return self.linear(x)
 
 

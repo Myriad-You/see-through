@@ -250,6 +250,25 @@ def _place_on_canvas(region, box, placement, canvas_hw, scale_out=1):
     return out
 
 
+def run_tags(run, pipeline, group_tags, tags, page, group_index):
+    '''
+    run() on some of a group's tags: each tag keeps the embedding of its own
+    place in the group, which the model learned per place.
+    '''
+    if list(tags) == list(group_tags):
+        return run(tags, page, group_index)
+    unet = pipeline.unet
+    embeds = [m[group_index] for m in (getattr(unet, 'group_embeds', None), getattr(unet, 'group_embeds2', None)) if m is not None]
+    select = [group_tags.index(t) for t in tags]
+    for e in embeds:
+        e.select = select
+    try:
+        return run(tags, page, group_index)
+    finally:
+        for e in embeds:
+            e.select = None
+
+
 def _apply_layerdiff_canvas(pipeline, imgp, saved, seed, num_inference_steps, target_tag_list, canvas_hw,
                             head_resolution, output_scale, size_condition, hair_pass='canvas', body_tags=None):
     '''
@@ -320,7 +339,7 @@ def _apply_layerdiff_canvas(pipeline, imgp, saved, seed, num_inference_steps, ta
     if tag_version != 'v3':
         raise ValueError(f'unknown tag version {tag_version}')
 
-    images = run(body, fullpage, 0)
+    images = run_tags(run, pipeline, BODY_TAGS_V3, body, fullpage, 0)
     for rst, tag in zip(images, body):
         Image.fromarray(rst).save(osp.join(saved, f'{tag}.png'))
 
