@@ -12,7 +12,7 @@ for each lattice point, how far back to where it was at rest. Its runtime
 (Myriad's turnKeyforms) inverts it per vertex.
 
 What a turn uncovers is taken from the turned drawings themselves: for each
-hidden pixel of the back hair, front hair, ears and neck, the key says where
+hidden pixel of the back hair, front hair and ears, the key says where
 it lands; where the turned decomposition shows that same part on top there,
 its pixel is baked into the front layer. The face under the hair stays as it
 is (skin only, the runtime's to clean).
@@ -63,7 +63,11 @@ GRID = {'face': 17, 'eye:L': 13, 'eye:R': 13, 'ears': 13, 'neck': 13, 'neckwear'
 COARSE_GRID = 9
 FRONT_HAIR_GRID = 5
 ACCESSORIES = ['headwear', 'earwear']
-BAKED = {'back hair': 'back-hair', 'front hair': 'front-hair', 'ears-r': 'ears', 'ears-l': 'ears', 'ears': 'ears', 'neck': 'neck'}
+# The neck is not taken from the turned drawings: each is lit its own way, and
+# under the chin they patch into bands. The decomposition's own inpainting is
+# one smooth cylinder of skin with the chin's shadow, which the neck's key
+# carries up with the chin.
+BAKED = {'back hair': 'back-hair', 'front hair': 'front-hair', 'ears-r': 'ears', 'ears-l': 'ears', 'ears': 'ears'}
 # The front hair as locks (hair_locks.py): layers 'front hair-1'.., families
 # 'front-hair:1'.., each fitted against the turned decompositions' whole front hair.
 LOCK_LAYER = re.compile(r'front hair-(\d+)$')
