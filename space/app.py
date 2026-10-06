@@ -240,6 +240,47 @@ def refine(image: Image.Image, canvas: str = "", target: str = "back hair", mode
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def keyforms(front_psd, right_psd, left_psd, up_psd, down_psd,
+             front_png=None, right_png=None, left_png=None, up_png=None, down_png=None):
+    """
+    Keyed head turns (turn_keyforms.py): each part of the front decomposition
+    fitted onto the same part of four decompositions of the head turned toward
+    image right and left, raised and lowered (same canvas, body lined up).
+    With the five pictures that were decomposed, accessories are matched on
+    them and every key is refined until the drawn turn matches its picture.
+    Returns the keys as JSON (canvas coordinates) and the front decomposition
+    with what the turns uncover baked in from the turned drawings. CPU only.
+    """
+    import turn_keyforms
+
+    paths = [front_psd, right_psd, left_psd, up_psd, down_psd]
+    if any(p is None for p in paths):
+        raise gr.Error("The front and all four turned decompositions are needed.")
+    path = lambda f: f if isinstance(f, str) else f.name
+    pictures = [front_png, right_png, left_png, up_png, down_png]
+    if any(p is not None for p in pictures) and any(p is None for p in pictures):
+        raise gr.Error("Give all five pictures, or none.")
+    pictures = dict(zip(("front", "plus", "minus", "up", "down"), map(path, pictures))) if pictures[0] is not None else None
+    t0 = time.time()
+    try:
+        front, result = turn_keyforms.turn_keyforms(
+            path(front_psd),
+            dict(plus=path(right_psd), minus=path(left_psd), up=path(up_psd), down=path(down_psd)),
+            log=_log,
+            pictures=pictures,
+        )
+    except ValueError as error:
+        raise gr.Error(str(error))
+    out_dir = tempfile.mkdtemp(prefix="seethrough_keyforms_")
+    psd_path = os.path.join(out_dir, "baked.psd")
+    turn_keyforms.save_psd(front, psd_path)
+    json_path = os.path.join(out_dir, "keyforms.json")
+    with open(json_path, "w") as f:
+        json.dump(result, f)
+    _log(f"Keyforms done ({time.time() - t0:.1f}s)")
+    return json_path, psd_path
+
+
 with gr.Blocks(title="See-through: Layer Decomposition") as demo:
     gr.Markdown(
         "# See-through: Single-image Layer Decomposition for Anime Characters\n\n"
@@ -334,6 +375,37 @@ with gr.Blocks(title="See-through: Layer Decomposition") as demo:
             inputs=[refine_image, refine_canvas, refine_target, refine_modes, refine_seeds, refine_condition, refine_hint],
             outputs=[refine_zip, refine_gallery, refine_stats],
             api_name="refine",
+        )
+
+    with gr.Tab("Turn keyforms"):
+        gr.Markdown(
+            "Per-part keys for a head turned ±30° either way and raised or lowered, fitted from four "
+            "turned decompositions onto the front one (all on the same canvas), and the front "
+            "decomposition with what the turns uncover baked in. The pictures that were decomposed, "
+            "if given, refine every key against them. CPU only."
+        )
+        with gr.Row():
+            with gr.Column(scale=1):
+                key_front = gr.File(label="Front PSD")
+                key_right = gr.File(label="Turned toward image right PSD")
+                key_left = gr.File(label="Turned toward image left PSD")
+                key_up = gr.File(label="Raised PSD")
+                key_down = gr.File(label="Lowered PSD")
+                with gr.Accordion("Pictures (optional)", open=False):
+                    pic_front = gr.File(label="Front picture")
+                    pic_right = gr.File(label="Turned toward image right picture")
+                    pic_left = gr.File(label="Turned toward image left picture")
+                    pic_up = gr.File(label="Raised picture")
+                    pic_down = gr.File(label="Lowered picture")
+                key_btn = gr.Button("Run", variant="primary")
+            with gr.Column(scale=2):
+                key_json = gr.File(label="Keyforms JSON")
+                key_psd = gr.File(label="Baked front PSD")
+        key_btn.click(
+            fn=keyforms,
+            inputs=[key_front, key_right, key_left, key_up, key_down, pic_front, pic_right, pic_left, pic_up, pic_down],
+            outputs=[key_json, key_psd],
+            api_name="keyforms",
         )
 
 if __name__ == "__main__":
