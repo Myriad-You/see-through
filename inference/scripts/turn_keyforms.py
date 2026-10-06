@@ -29,6 +29,7 @@ and no layer does, and are keyed with the rest.
 """
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -63,6 +64,19 @@ COARSE_GRID = 9
 FRONT_HAIR_GRID = 5
 ACCESSORIES = ['headwear', 'earwear']
 BAKED = {'back hair': 'back-hair', 'front hair': 'front-hair', 'ears-r': 'ears', 'ears-l': 'ears', 'ears': 'ears', 'neck': 'neck'}
+# The front hair as locks (hair_locks.py): layers 'front hair-1'.., families
+# 'front-hair:1'.., each fitted against the turned decompositions' whole front hair.
+LOCK_LAYER = re.compile(r'front hair-(\d+)$')
+
+
+def lock_family(name):
+    m = LOCK_LAYER.match(name)
+    return f'front-hair:{m.group(1)}' if m else None
+
+
+def turned_names(family):
+    """The layers that draw a family in a turned decomposition, which keeps its front hair whole."""
+    return ['front hair'] if family.startswith('front-hair:') else FAMILIES[family]
 
 
 # ---------------------------------------------------------------- layers
@@ -544,6 +558,9 @@ PICTURE_HOLD = 0.05
 
 
 def family_of(name):
+    lock = lock_family(name)
+    if lock:
+        return lock
     for family, names in FAMILIES.items():
         if name in names:
             return family
@@ -693,6 +710,68 @@ def refine_on_picture(front, keys, side, picture, extra, log):
     return [round(start, 3), round(before, 3)]
 
 
+# ---------------------------------------------------------------- locks
+
+LOCK_GRID = 9
+
+
+def sub_lattice(key, box, grid=LOCK_GRID):
+    """The same backward field, on a lattice over a smaller box."""
+    g = key['grid']
+    x0, y0, x1, y1 = key['box']
+    back = np.asarray(key['back'], np.float32).reshape(-1, 2)
+    gx, gy = np.meshgrid(np.linspace(box[0], box[2], grid), np.linspace(box[1], box[3], grid))
+    bx, by = sample(back, np.linspace(x0, x1, g), np.linspace(y0, y1, g), gx.ravel(), gy.ravel())
+    return dict(box=[float(v) for v in box], grid=grid, back=[float(v) for p in zip(bx, by) for v in p])
+
+
+def split_front_hair(front, keys, log):
+    """
+    The front hair as locks (hair_locks.py): one layer per lock in its place in
+    the order, and one key per lock, the whole front hair's to begin with. The
+    keys are then refined lock by lock on the pictures. Returns the lock count.
+    """
+    import hair_locks
+    if 'front hair' not in front.layers or 'front-hair' not in keys:
+        return 0
+    L = front.layers['front hair']
+    ys, xs = np.nonzero(L[..., 3] > 0.02)
+    if not len(ys):
+        return 0
+    y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+    lab, info = hair_locks.split_locks(L[y0:y1, x0:x1, :3], L[y0:y1, x0:x1, 3])
+    if info['locks'] < 2:
+        return info['locks']
+    full = np.zeros(L.shape[:2], np.int32)
+    full[y0:y1, x0:x1] = lab
+    # The soft rim joins the lock next to it.
+    soft = L[..., 3] > 0
+    for _ in range(24):
+        if not (soft & (full == 0)).any():
+            break
+        grown = cv2.dilate(full.astype(np.float32), np.ones((3, 3), np.uint8)).astype(np.int32)
+        full = np.where((full == 0) & soft, grown, full)
+    # Locks nearer the parting lie over the ones to the sides.
+    cx = info['crown'][1] + x0
+    ids = [k for k in range(1, full.max() + 1) if (full == k).any()]
+    ids.sort(key=lambda k: -abs(np.nonzero(full == k)[1].mean() - cx))
+    at = front.order.index('front hair')
+    del front.layers['front hair']
+    front.order.pop(at)
+    whole = keys.pop('front-hair')
+    for n, k in enumerate(ids, 1):
+        name = f'front hair-{n}'
+        layer = L.copy()
+        layer[..., 3] *= full == k
+        front.layers[name] = layer
+        front.order.insert(at + n - 1, name)
+        ly, lx = np.nonzero(layer[..., 3] > 0.02)
+        box = (float(lx.min() - 30), float(ly.min() - 30), float(lx.max() + 30), float(ly.max() + 30))
+        keys[lock_family(name)] = {side: sub_lattice(key, box) for side, key in whole.items()}
+    log(f'front hair: {len(ids)} locks')
+    return len(ids)
+
+
 # ---------------------------------------------------------------- baking
 
 def turned_position(key, qx, qy):
@@ -713,7 +792,7 @@ def bake(front, turned, keys, log):
     owners = {side: t.owner() for side, t in turned.items()}
     report = {}
     for li, name in enumerate(front.order):
-        family = BAKED.get(name)
+        family = BAKED.get(name) or lock_family(name)
         if not family or family not in keys:
             continue
         layer = front.layers[name]
@@ -731,8 +810,8 @@ def bake(front, turned, keys, log):
                 continue
             tx, ty = turned_position(key, qx.astype(np.float32), qy.astype(np.float32))
             ix = np.clip(np.round(tx).astype(int), 0, front.W - 1); iy = np.clip(np.round(ty).astype(int), 0, front.H - 1)
-            mine = np.isin(owners[side][iy, ix], FAMILIES[family]) & ~filled[qy, qx]
-            src = t.family(FAMILIES[family])
+            mine = np.isin(owners[side][iy, ix], turned_names(family)) & ~filled[qy, qx]
+            src = t.family(turned_names(family))
             x0 = np.clip(np.floor(tx).astype(int), 0, front.W - 2); y0 = np.clip(np.floor(ty).astype(int), 0, front.H - 2)
             fx = np.clip(tx - x0, 0, 1)[:, None]; fy = np.clip(ty - y0, 0, 1)[:, None]
             vals = (src[y0, x0] * (1 - fx) * (1 - fy) + src[y0, x0 + 1] * fx * (1 - fy) +
@@ -849,8 +928,9 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
             entry['down'] = {k: v for k, v in sides['down'].items() if k != 'fit'}
         complete[family] = entry
     report = {f: {s: v.get('fit') for s, v in sides.items() if 'fit' in v} for f, sides in keys.items()}
+    locks = split_front_hair(front, complete, log)
     baked = bake(front, turned, complete, log)
-    result = dict(canvas=[front.W, front.H], keyforms=complete, fit=report, baked=baked)
+    result = dict(canvas=[front.W, front.H], keyforms=complete, fit=report, baked=baked, locks=locks)
     if drawn:
         # Drawn together with what they uncover, as the runtime draws them, the
         # keys move to where the pictures have the parts; then what they
