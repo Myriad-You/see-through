@@ -776,6 +776,167 @@ def split_front_hair(front, keys, log):
     return len(ids)
 
 
+LOCK_FEATURES = ('eyewhite', 'irides', 'eyelash', 'eyebrow', 'nose', 'mouth')
+LOCK_STEPS = (16.0, 8.0, 4.0, 2.0)
+LOCK_COARSE = 3
+LOCK_FEATURE_WEIGHT = 4.0
+LOCK_SCALE = 0.5
+LOCK_MIN_DET = 0.35
+
+
+def folds(back, box, min_det=LOCK_MIN_DET):
+    """Whether a backward lattice squeezes a cell flat or turns it over (the local area ratio below min_det)."""
+    g = back.shape[0]
+    hx, hy = (box[2] - box[0]) / (g - 1), (box[3] - box[1]) / (g - 1)
+    dbx = np.diff(back, axis=1) / hx
+    dby = np.diff(back, axis=0) / hy
+    det = (1 + dbx[:-1, :, 0]) * (1 + dby[:, :-1, 1]) - dby[:, :-1, 0] * dbx[:-1, :, 1]
+    return float(det.min()) < min_det
+
+
+def _over(rgb, a, src):
+    sa = src[..., 3:4]
+    return rgb * (1 - sa) + src[..., :3] * sa, src[..., 3] + a * (1 - src[..., 3])
+
+
+def fit_locks_on_turned(front, turned, keys, side, log):
+    """
+    Each lock of the front hair moved on its own until the locks together cover
+    what the turned decomposition draws as front hair, and nothing it shows on
+    top of the face (eyes, brows, nose, mouth). The whole front hair's key is
+    one low-order warp of a drawing the turned picture redraws; a lock that
+    inherits it can end up across an eye. Each lock's key takes a smooth
+    correction (LOCK_COARSE x LOCK_COARSE over its box), searched coordinate
+    by coordinate at half size, never folding. Returns the moved keys.
+    """
+    names = [n for n in front.order if lock_family(n) and lock_family(n) in keys and side in keys[lock_family(n)]]
+    if len(names) < 2 or 'front hair' not in turned.layers:
+        return {}
+    T = turned.layers['front hair']
+    owner = turned.owner()
+    feature = np.isin(owner, [n for n in turned.order if n.split('-')[0] in LOCK_FEATURES])
+    ys, xs = np.nonzero((T[..., 3] > 0.02) | np.any([front.layers[n][..., 3] > 0.02 for n in names], 0))
+    cx0, cy0 = max(0, xs.min() - 80), max(0, ys.min() - 80)
+    cx1, cy1 = min(front.W, xs.max() + 80), min(front.H, ys.max() + 80)
+    small = lambda img: cv2.resize(img, None, fx=LOCK_SCALE, fy=LOCK_SCALE, interpolation=cv2.INTER_AREA)
+    Ta = small(T[cy0:cy1, cx0:cx1, 3])
+    Trgb = small(T[cy0:cy1, cx0:cx1, :3])
+    F = small(feature[cy0:cy1, cx0:cx1].astype(np.float32))
+    layers = {n: small(front.layers[n]) for n in names}
+    h, w = Ta.shape
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    px = cx0 + (xx + 0.5) / LOCK_SCALE - 0.5
+    py = cy0 + (yy + 0.5) / LOCK_SCALE - 0.5
+    corr = {n: np.zeros((LOCK_COARSE, LOCK_COARSE, 2), np.float32) for n in names}
+
+    def lattice(n):
+        key = keys[lock_family(n)][side]
+        g = key['grid']
+        back = np.asarray(key['back'], np.float32).reshape(g, g, 2)
+        return key, back + cv2.resize(corr[n], (g, g), interpolation=cv2.INTER_LINEAR)
+
+    def render(n):
+        key, back = lattice(n)
+        x0, y0, x1, y1 = key['box']
+        g = key['grid']
+        gx = np.clip((px - x0) / max(1e-6, x1 - x0) * (g - 1), 0, g - 1).astype(np.float32)
+        gy = np.clip((py - y0) / max(1e-6, y1 - y0) * (g - 1), 0, g - 1).astype(np.float32)
+        o = cv2.remap(back, gx, gy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+        return remap(layers[n], (px + o[..., 0] + 0.5) * LOCK_SCALE - 0.5, (py + o[..., 1] + 0.5) * LOCK_SCALE - 0.5)
+
+    def cost(rgb, a):
+        both = np.minimum(a, Ta)
+        return float((np.abs(a - Ta) * 4 + np.abs(rgb - Trgb).mean(2) * both + a * F * LOCK_FEATURE_WEIGHT).mean())
+
+    rendered = {n: render(n) for n in names}
+    rgb, a = np.zeros((h, w, 3), np.float32), np.zeros((h, w), np.float32)
+    for n in names:
+        rgb, a = _over(rgb, a, rendered[n])
+    best = start = cost(rgb, a)
+    for step in LOCK_STEPS:
+        for _ in range(2):
+            moved = 0
+            for k, n in enumerate(names):
+                # What lies under and over this lock stays put while it moves.
+                below_rgb, below_a = np.zeros((h, w, 3), np.float32), np.zeros((h, w), np.float32)
+                for m in names[:k]:
+                    below_rgb, below_a = _over(below_rgb, below_a, rendered[m])
+                above_rgb, above_a = np.zeros((h, w, 3), np.float32), np.zeros((h, w), np.float32)
+                for m in names[k + 1:]:
+                    above_rgb, above_a = _over(above_rgb, above_a, rendered[m])
+                for j in range(LOCK_COARSE):
+                    for i in range(LOCK_COARSE):
+                        for c in range(2):
+                            for sign in (1, -1):
+                                corr[n][j, i, c] += sign * step
+                                key, back = lattice(n)
+                                if not folds(back, key['box']):
+                                    r = render(n)
+                                    mid_rgb, mid_a = _over(below_rgb, below_a, r)
+                                    e = cost(mid_rgb * (1 - above_a[..., None]) + above_rgb, above_a + mid_a * (1 - above_a))
+                                    if e < best - 1e-7:
+                                        best = e
+                                        rendered[n] = r
+                                        moved += 1
+                                        break
+                                corr[n][j, i, c] -= sign * step
+            if not moved:
+                break
+    log(f'{side:5s} locks on the turned front hair: {start:.4f} -> {best:.4f}')
+    return {lock_family(n): dict(lattice(n)[0], back=[float(v) for v in lattice(n)[1].reshape(-1)]) for n in names}
+
+
+# A moved lock is kept where the picture agrees: its outline no further off
+# than this without covering this much more of the face's features, or the
+# features it covered at least halved.
+LOCK_KEEP_SLACK = 0.15
+LOCK_KEEP_COVER = 200
+
+
+def keep_where_picture_agrees(front, turned, keys, moved, side, picture, log):
+    """
+    The turned decomposition says where the front hair is, not which lock is
+    which: a lock can end up filling for another. Each moved lock is checked on
+    the turned picture itself and kept only if its outline is no further off,
+    or if it uncovers a face feature the old key had it across.
+    """
+    if not moved:
+        return moved
+    W, H = front.W, front.H
+    layers = [(name, family_of(name), front.layers[name]) for name in front.order]
+    old_rgb, old_top = render_keys(layers, keys, side, W, H)
+    trial = {family: dict(sides, **({side: moved[family]} if family in moved else {})) for family, sides in keys.items()}
+    new_rgb, new_top = render_keys(layers, trial, side, W, H)
+    owner = turned.owner()
+    feature = np.isin(owner, [n for n in turned.order if n.split('-')[0] in LOCK_FEATURES])
+    kept = {}
+    for i, (name, family, _) in enumerate(layers):
+        if family not in moved:
+            continue
+        near = cv2.dilate(((old_top == i) | (new_top == i)).astype(np.uint8), np.ones((9, 9), np.uint8)) > 0
+        old_d = edge_distance(old_rgb, picture, near)
+        new_d = edge_distance(new_rgb, picture, near)
+        old_cover = int(((old_top == i) & feature).sum())
+        new_cover = int(((new_top == i) & feature).sum())
+        uncovers = old_cover > LOCK_KEEP_COVER and new_cover <= old_cover / 2
+        covers = new_cover > old_cover + LOCK_KEEP_COVER
+        if (new_d <= old_d + LOCK_KEEP_SLACK and not covers) or uncovers:
+            kept[family] = moved[family]
+        log(f'{side:5s} {family}: outline {old_d:.2f} -> {new_d:.2f}, over the face {old_cover} -> {new_cover} px, '
+            f'{"kept" if family in kept else "left"}')
+    return kept
+
+
+def _fit_locks_direction(front_path, keys, side, turned_path, picture_path=None):
+    lines = []
+    front, turned = Decomposition(front_path), Decomposition(turned_path)
+    moved = fit_locks_on_turned(front, turned, keys, side, lines.append)
+    if picture_path:
+        picture, _ = placed_illustration(picture_path, front.W, front.H)
+        moved = keep_where_picture_agrees(front, turned, keys, moved, side, picture, lines.append)
+    return moved, lines
+
+
 # ---------------------------------------------------------------- baking
 
 def turned_position(key, qx, qy):
@@ -933,6 +1094,20 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
         complete[family] = entry
     report = {f: {s: v.get('fit') for s, v in sides.items() if 'fit' in v} for f, sides in keys.items()}
     locks = split_front_hair(front, complete, log)
+    if locks >= 2:
+        with tempfile.TemporaryDirectory() as tmp:
+            split_path = os.path.join(tmp, 'split.psd')
+            save_psd(front, split_path)
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                jobs = {side: pool.submit(_fit_locks_direction, split_path, complete, side, path,
+                                          pictures.get(side) if pictures else None)
+                        for side, path in turned_paths.items()}
+                for side, job in jobs.items():
+                    moved, lines = job.result()
+                    for line in lines:
+                        log(line)
+                    for family, key in moved.items():
+                        complete[family][side] = key
     baked = bake(front, turned, complete, log)
     result = dict(canvas=[front.W, front.H], keyforms=complete, fit=report, baked=baked, locks=locks)
     if drawn:
