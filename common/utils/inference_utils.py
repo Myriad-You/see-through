@@ -342,6 +342,10 @@ def _apply_layerdiff_canvas(pipeline, imgp, saved, seed, num_inference_steps, ta
     images = run_tags(run, pipeline, BODY_TAGS_V3, body, fullpage, 0)
     for rst, tag in zip(images, body):
         Image.fromarray(rst).save(osp.join(saved, f'{tag}.png'))
+    # The tags not run are empty parts, as a figure without them would have.
+    for tag in BODY_TAGS_V3:
+        if tag not in body:
+            Image.fromarray(np.zeros(tuple(canvas_hw) + (4,), np.uint8)).save(osp.join(saved, f'{tag}.png'))
 
     head_mask = (images[body.index('head')][..., -1] > 15).astype(np.uint8)
     if not head_mask.any():
