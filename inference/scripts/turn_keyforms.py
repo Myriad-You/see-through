@@ -1037,6 +1037,93 @@ def turned_position(key, qx, qy):
     return tx, ty
 
 
+# A decomposition paints a part's hidden side whole, and some parts lie over
+# others they should not cover: the face's crown over back hair the front hair
+# does not reach (a band of skin across the top of the head). The picture
+# says what is on top: where such a part is on top, the picture is far from it
+# (RGB distance over CUT_DIFFERENT) and close to what lies under it (under
+# CUT_MATCH, and nearer by CUT_GAIN), the part is cut away.
+PAINTED_OVER = ('face', 'neck', 'ears-r', 'ears-l', 'ears')
+CUT_DIFFERENT = 35
+CUT_MATCH = 30
+CUT_GAIN = 20
+CUT_MIN_AREA = 200
+
+
+def cut_by_picture(front, picture, log):
+    """Cuts each of PAINTED_OVER where the picture shows what lies under it instead."""
+    report = {}
+    for name in PAINTED_OVER:
+        if name not in front.layers:
+            continue
+        on_top = front.owner() == name
+        under = np.ones((front.H, front.W, 3), np.float32)
+        for other in front.order:
+            if other != name:
+                a = front.layers[other][..., 3:4]
+                under = under * (1 - a) + front.layers[other][..., :3] * a
+        now = np.linalg.norm(front.composite() - picture, axis=-1) * 255
+        then = np.linalg.norm(under - picture, axis=-1) * 255
+        cut = on_top & (now > CUT_DIFFERENT) & (then < CUT_MATCH) & (now - then > CUT_GAIN)
+        cut = cv2.morphologyEx(cut.astype(np.uint8), cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+        n, lab, stats, _ = cv2.connectedComponentsWithStats(cut)
+        cut = np.isin(lab, [k for k in range(1, n) if stats[k, 4] >= CUT_MIN_AREA])
+        if cut.any():
+            soft = cv2.GaussianBlur(cv2.dilate(cut.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(np.float32), (5, 5), 0)
+            front.layers[name][..., 3] *= 1 - np.clip(soft, 0, 1)
+            report[name] = int(cut.sum())
+    log(f'cut by the picture {report}')
+    return report
+
+
+# The face's crown, painted whole, reaches up under the back hair over the
+# skull. Front hair that does not reach the back of the head leaves it to come
+# out as skin when the head turns (Myriad paints the face under hair as plain
+# skin). Above the hairline, where back hair lies under it, the face is cut:
+# the back hair is the scalp there. The hairline is the highest forehead that
+# shows at rest (patches of skin of CROWN_MIN_SKIN px or more, up to
+# CROWN_FOREHEAD eye spans above the eyes; 0.25-0.43 on every character so
+# far), less CROWN_MARGIN eye spans for the forehead under the bangs. What
+# shows at rest is never cut.
+CROWN_FOREHEAD = 0.6
+CROWN_MARGIN = 0.1
+CROWN_MIN_SKIN = 300
+
+
+def cut_crown(front, log):
+    """Cuts the face above its hairline where back hair lies under it."""
+    if 'face' not in front.layers:
+        return 0
+    face = front.layers['face']
+    shows = cv2.morphologyEx(((front.owner() == 'face') & (face[..., 3] > 0.5)).astype(np.uint8), cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    eyes = np.zeros((front.H, front.W), bool)
+    for name in front.order:
+        if name.split('-')[0] in ('eyewhite', 'irides', 'eyelash'):
+            eyes |= front.layers[name][..., 3] > 0.5
+    if not eyes.any():
+        log('cut the crown: no eyes')
+        return 0
+    ey, ex = np.nonzero(eyes)
+    span = float(ex.max() - ex.min())
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(shows)
+    tops = [stats[k, 1] for k in range(1, n)
+            if stats[k, 4] >= CROWN_MIN_SKIN and stats[k, 1] >= ey.min() - CROWN_FOREHEAD * span]
+    if not tops:
+        log('cut the crown: no forehead shows')
+        return 0
+    hairline = int(min(tops) - CROWN_MARGIN * span)
+    li = front.order.index('face')
+    under = np.zeros((front.H, front.W), np.float32)
+    for below in front.order[:li]:
+        if below in FAMILIES['back-hair']:
+            under = np.maximum(under, front.layers[below][..., 3])
+    cut = (face[..., 3] > 0) & (under > 0.9) & ~(cv2.dilate(shows, np.ones((5, 5), np.uint8)) > 0)
+    cut[max(0, hairline):] = False
+    face[..., 3] *= 1 - cut
+    log(f'cut the crown above y {hairline}: {int(cut.sum())} px')
+    return int(cut.sum())
+
+
 def bake(front, turned, keys, log):
     """Hidden pixels of the parts a turn uncovers, from the turned drawings where the same part is on top."""
     owners = {side: t.owner() for side, t in turned.items()}
@@ -1303,6 +1390,9 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
                         log(line)
                     for family, key in moved.items():
                         complete[family][side] = key
+    if drawn:
+        cut_by_picture(front, drawn['front'][0], log)
+    cut_crown(front, log)
     baked = bake(front, turned, complete, log)
     result = dict(canvas=[front.W, front.H], keyforms=complete, fit=report, baked=baked, locks=locks)
     if drawn:
