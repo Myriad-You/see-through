@@ -499,10 +499,15 @@ def accessory_pieces(front):
 # A piece rides what holds it (an earring the ear, a clip the hair): it is
 # looked for this far around where that host's key carries it (a share of the
 # piece's size, at least ACCESSORY_REACH px), and stays there when nothing in
-# reach looks like it (mean squared colour error per pixel over this).
+# reach looks like it (mean squared colour error per pixel over this). The
+# reach is what keeps a match from the wrong piece (an earring found on the
+# other ear matched at 0.05); a right one foreshortened by the turn can match
+# at 0.1 (a hair clip on the far side).
 ACCESSORY_REACH = 30
 ACCESSORY_REACH_SHARE = 0.5
-ACCESSORY_MATCH_ERROR = 0.03
+ACCESSORY_MATCH_ERROR = 0.12
+# An earring's hook lies within this many px of the ear.
+EAR_HOOK_REACH = 15
 # A piece of the outfit rides the neck when this share of its rim is the neck.
 ACCESSORY_NECK_SHARE = 0.1
 
@@ -518,8 +523,11 @@ def group_pieces(front, pieces):
     """
     Pieces (mask, earring) that touch within ACCESSORY_GROUP_GAP, merged, with
     the host of each (accessory_host). Pieces of the outfit stay apart.
+    earring: True for a drawn earring, False for a drawn hair ornament, None
+    for a recovered piece; a group with a drawn hair ornament is not an
+    earring.
     """
-    hosts = [accessory_host(front, mask) for mask, _ in pieces]
+    hosts = [accessory_host(front, mask, earring) for mask, earring in pieces]
     worn = [piece for piece, host in zip(pieces, hosts) if host is not None]
     outfit = [piece for piece, host in zip(pieces, hosts) if host is None]
     if len(worn) >= 2:
@@ -531,21 +539,46 @@ def group_pieces(front, pieces):
         groups = {}
         for mask, earring in worn:
             g = int(np.bincount(lab[mask]).argmax())
-            groups[g] = (groups[g][0] | mask, groups[g][1] or earring) if g in groups else (mask, earring)
+            groups[g] = (groups[g][0] | mask, joined(groups[g][1], earring)) if g in groups else (mask, earring)
         worn = list(groups.values())
-        hosts = [accessory_host(front, mask) for mask, _ in worn] + [None] * len(outfit)
+        hosts = [accessory_host(front, mask, earring) for mask, earring in worn] + [None] * len(outfit)
     else:
         hosts = [host for host in hosts if host is not None] + [None] * len(outfit)
     return worn + outfit, hosts
 
 
-def accessory_host(front, mask):
+def hangs_from_ear(front, mask):
+    """Whether a piece hangs from an ear: the top of it (the hook) is at the ear."""
+    ears = np.zeros((front.H, front.W), np.uint8)
+    for name in FAMILIES['ears']:
+        if name in front.layers:
+            ears |= (front.layers[name][..., 3] > 0.3).astype(np.uint8)
+    if not ears.any():
+        return False
+    ys, _ = np.nonzero(mask)
+    top = mask.copy()
+    top[int(ys.min() + 0.15 * (ys.max() - ys.min() + 1)):] = False
+    near = cv2.dilate(ears, np.ones((2 * EAR_HOOK_REACH + 1, 2 * EAR_HOOK_REACH + 1), np.uint8)) > 0
+    return (top & near).sum() >= 10
+
+
+def joined(a, b):
+    """The earring flag of two pieces as one: a drawn hair ornament wins, then a drawn earring."""
+    if a is False or b is False:
+        return False
+    return True if a or b else None
+
+
+def accessory_host(front, mask, earring=None):
     """
-    The part around a piece the most (its rim's owners), which it rides; the
-    face if only the background is around it. When the body is around it the
+    The ear for an earring that hangs from it; else the part
+    around a piece the most (its rim's owners), which it rides; the face if
+    only the background is around it. When the body is around it the
     most it is part of the outfit: on the neck (a choker's charm) it rides the
     neck, elsewhere (None) it stays put.
     """
+    if earring is not False and hangs_from_ear(front, mask):
+        return 'ears'
     owner = front.owner()
     ring = (cv2.dilate(mask.astype(np.uint8), np.ones((15, 15), np.uint8)) > 0) & ~mask
     counts, body = {}, 0
@@ -564,6 +597,84 @@ def accessory_host(front, mask):
             return 'neckwear'
         return max(neck, key=neck.get)
     return max(counts, key=counts.get) if counts else 'face'
+
+
+# Under a clip the decomposition did not draw (the import recovers it from the
+# illustration) the hair it sits on has a hole with the face's skin under it;
+# when the clip moves on its own key the hole comes out as a patch of skin. The
+# hair is filled in under it from the hair around (inpainting), over at most
+# this much of the piece's rim's width.
+UNDER_PIECE_RADIUS = 6
+
+
+# A decomposition can order an accessory under what it sits on (a clip drawn
+# under the bun it holds): the picture shows it on top. Myriad's import then
+# erases the hair over it, and when the hair and the clip turn by their own
+# keys the erased hole comes out. The part of the accessory the picture shows
+# on top (its colour within BURIED_MATCH of the picture, the composite past
+# MISMATCH_DISTANCE from it) is moved to a layer of its own over the others,
+# whole (its holes filled) and coloured as the picture shows it.
+BURIED_MATCH = 40
+
+
+def raise_buried_accessories(front, picture, log):
+    """Moves the parts of accessory layers the picture shows on top to a layer over the others."""
+    owner = front.owner()
+    composite = front.composite()
+    for name in list(front.order):
+        if name.split('-')[0] not in ACCESSORIES:
+            continue
+        layer = front.layers[name]
+        own = np.linalg.norm(layer[..., :3] - picture, axis=-1) * 255 < BURIED_MATCH
+        off = np.linalg.norm(composite - picture, axis=-1) * 255 > MISMATCH_DISTANCE
+        buried = (layer[..., 3] > 0.5) & (owner != name) & own & off
+        buried = cv2.morphologyEx(buried.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        n, lab, stats, _ = cv2.connectedComponentsWithStats(cv2.dilate(buried, np.ones((9, 9), np.uint8)))
+        keep = np.isin(lab, [k for k in range(1, n) if (buried * (lab == k)).sum() >= MIN_MISSING_AREA])
+        if not keep.any():
+            continue
+        # The whole of the drawing there, its soft edge too, and what it encloses.
+        part = keep & (layer[..., 3] > 0)
+        _, gaps = cv2.connectedComponents((~part).astype(np.uint8))
+        outside = np.unique(np.concatenate([gaps[0], gaps[-1], gaps[:, 0], gaps[:, -1]]))
+        part |= ~np.isin(gaps, outside)
+        raised = np.zeros_like(layer)
+        raised[part, :3] = picture[part]
+        raised[part, 3] = np.where(layer[part, 3] > 0, np.maximum(layer[part, 3], 0.0), 1.0)
+        inner = cv2.erode(part.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+        raised[inner, 3] = 1.0
+        layer[part, 3] = 0
+        # Numbered, as Myriad reads a further drawing of the same part.
+        number = 2
+        while f'{name.split("-")[0]}-{number}' in front.layers:
+            number += 1
+        new = f'{name.split("-")[0]}-{number}'
+        front.layers[new] = raised
+        front.order.append(new)
+        log(f'raised {int(part.sum())} px of {name} over the layers that covered it')
+
+
+def fill_under_piece(front, mask, family, log):
+    """Fills the hair a piece riding `family` sits on where it has a hole under the piece."""
+    names = [n for n in front.order if (family_of(n) or '').split(':')[0] == family]
+    if not names or family not in ('front-hair', 'back-hair'):
+        return 0
+    # The layer around the piece the most.
+    ring = (cv2.dilate(mask.astype(np.uint8), np.ones((15, 15), np.uint8)) > 0) & ~mask
+    name = max(names, key=lambda n: (front.layers[n][..., 3][ring] > 0.5).sum())
+    layer = front.layers[name]
+    hole = mask & (layer[..., 3] < 0.5)
+    if hole.sum() < 50 or (layer[..., 3][ring] > 0.5).mean() < 0.5:
+        return 0
+    rgb = (np.clip(layer[..., :3], 0, 1) * 255).astype(np.uint8)
+    # Every transparent pixel near the piece is unknown, so only the hair itself is read.
+    k = 4 * UNDER_PIECE_RADIUS + 1
+    unknown = (layer[..., 3] < 0.5) & (cv2.dilate(mask.astype(np.uint8), np.ones((k, k), np.uint8)) > 0)
+    filled = cv2.inpaint(rgb, unknown.astype(np.uint8), UNDER_PIECE_RADIUS, cv2.INPAINT_TELEA)
+    layer[hole, :3] = filled[hole].astype(np.float32) / 255
+    layer[hole, 3] = 1.0
+    log(f'filled {hole.sum()} px of {name} under a piece')
+    return int(hole.sum())
 
 
 def match_piece(mask, front_rgb, turned_rgb, side, face_cx, earring, center=None):
@@ -606,10 +717,11 @@ def match_piece(mask, front_rgb, turned_rgb, side, face_cx, earring, center=None
     source = ((x0 + x1) / 2, (y0 + y1) / 2)
     if best is None or (center is not None and best[0] > ACCESSORY_MATCH_ERROR):
         return dict(source=source, target=(float(cx), float(cy)), scale=1.0, squeeze=1.0,
-                    box=(int(x0), int(y0), int(x1), int(y1)), matched=False)
-    _, s, q, tx, ty = best
+                    box=(int(x0), int(y0), int(x1), int(y1)), matched=False,
+                    error=None if best is None else float(best[0]))
+    error, s, q, tx, ty = best
     return dict(source=source, target=(tx, ty), scale=float(s), squeeze=float(q),
-                box=(int(x0), int(y0), int(x1), int(y1)), matched=True)
+                box=(int(x0), int(y0), int(x1), int(y1)), matched=True, error=float(error))
 
 
 def accessory_lattice(found, grid=25):
@@ -1398,23 +1510,28 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
     # decompositions re-render or drop).
     face = front.layers.get('face')
     face_cx = float(np.nonzero(face[..., 3] > 0.5)[1].mean()) if face is not None else front.W / 2
-    pieces = [(mask, name.startswith('earwear')) for mask, name in accessory_pieces(front)]
     drawn = {}
     recovered = []
     if pictures:
         drawn = {side: placed_illustration(path, front.W, front.H) for side, path in pictures.items()}
-        ears = [front.layers[n][..., 3] > 0.3 for n in front.order if n.split('-')[0] == 'ears']
-        ears_top = min(np.nonzero(e)[0].min() for e in ears if e.any()) if any(e.any() for e in ears) else front.H
+        raise_buried_accessories(front, drawn['front'][0], log)
+    pieces = [(mask, name.startswith('earwear')) for mask, name in accessory_pieces(front)]
+    clips = []
+    if pictures:
         recovered = missing_pieces(front, *drawn['front'])
         for mask in recovered:
-            # Below the top of the ears a recovered piece hangs (an earring); above, it is a clip.
-            pieces.append((mask, np.nonzero(mask)[0].mean() > ears_top))
+            # Whether it is an earring the ear says: it hangs from one or not (accessory_host).
+            pieces.append((mask, None))
             ys, xs = np.nonzero(mask)
             log(f'recovered piece at ({xs.mean():.0f}, {ys.mean():.0f}), {mask.sum()} px')
     front_rgb = drawn['front'][0] if drawn else front.composite()
     if pieces:
         pieces, hosts = group_pieces(front, pieces)
         log(f'accessory hosts {hosts}')
+        # A clip on the front hair (not what hangs in front of the back hair: an
+        # openwork earring shows what is behind it, which a fill would change) has
+        # the hair under it filled, once the front hair is cut into locks.
+        clips = [mask for (mask, _), host in zip(pieces, hosts) if host == 'front-hair']
     if pieces:
         for side, t in turned.items():
             turned_rgb = drawn[side][0] if side in drawn else t.composite()
@@ -1433,7 +1550,7 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
                     center = (float(tx[0]), float(ty[0]))
                 else:
                     center = (cx, cy)
-                found.append(match_piece(mask, front_rgb, turned_rgb, side, face_cx, earring, center))
+                found.append(match_piece(mask, front_rgb, turned_rgb, side, face_cx, host == 'ears', center))
             lattice = accessory_lattice(found)
             for family in ACCESSORIES:
                 keys.setdefault(family, {})[side] = lattice
@@ -1464,6 +1581,8 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
                         log(line)
                     for family, key in moved.items():
                         complete[family][side] = key
+    for mask in clips:
+        fill_under_piece(front, mask, 'front-hair', log)
     if drawn:
         cut_by_picture(front, drawn['front'][0], log)
     cut_crown(front, log)
