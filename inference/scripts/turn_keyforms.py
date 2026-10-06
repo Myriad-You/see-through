@@ -1093,15 +1093,108 @@ def save_psd(front, path):
 
 # ---------------------------------------------------------------- entry
 
+# A turn can hide an ear behind the hair: the turned decomposition then has one
+# ear where the front has two, and fitting both onto the one pulls the hidden
+# ear across the head (or off it). The hidden ear is put where the head carries
+# it (ear_carrier), and fitted with the one that shows. An ear shows when this share
+# of it, so carried, lies near the turned ears.
+EAR_SHOWN_SHARE = 0.3
+EAR_NEAR = 31
+# Turned ears this far from the front's in area (the hidden one put in) are
+# not ears (a decomposition that took half the head for them): they ride the
+# face's key, or the back hair's (ear_carrier), instead.
+EAR_AREA_RATIO = (0.4, 2.5)
+# Ears fitted no better than this (IoU) are not the same ears: they ride the head.
+EAR_FIT_IOU = 0.8
+
+
+def ear_carrier(fits, box):
+    """
+    The key an ear rides when its own cannot be fitted: the face's when the
+    ear lies wholly within the face's box, else the back hair's (cat ears on the
+    scalp, past where the face's lattice reaches), else none.
+    """
+    face = fits.get('face')
+    if face is not None:
+        x0, y0, x1, y1 = face['box']
+        if x0 <= box[0] and box[2] <= x1 and y0 <= box[1] and box[3] <= y1:
+            return face, 'face'
+    if fits.get('back-hair') is not None:
+        return fits['back-hair'], 'back hair'
+    return (face, 'face') if face is not None else (None, None)
+
+
+def hidden_ears(front, turned, fits, log):
+    """The front's ears the turned decomposition does not show, carried by the head's keys (RGBA), or None."""
+    shown = np.zeros((turned.H, turned.W), np.uint8)
+    for n in FAMILIES['ears']:
+        if n in turned.layers:
+            shown |= (turned.layers[n][..., 3] > 0.3).astype(np.uint8)
+    near = cv2.dilate(shown, np.ones((EAR_NEAR, EAR_NEAR), np.uint8)) > 0
+    ears = front.family(FAMILIES['ears'])
+    n, lab = cv2.connectedComponents((ears[..., 3] > 0.3).astype(np.uint8))
+    # Only when the turn shows fewer ears than the front.
+    pieces = lambda labels, count: sum((labels == k).sum() >= 150 for k in range(1, count))
+    shown_n, shown_lab = cv2.connectedComponents(shown)
+    if pieces(shown_lab, shown_n) >= pieces(lab, n):
+        return None
+    out = None
+    for k in range(1, n):
+        if (lab == k).sum() < 150:
+            continue
+        ys, xs = np.nonzero(lab == k)
+        key, by = ear_carrier(fits, (xs.min(), ys.min(), xs.max() + 1, ys.max() + 1))
+        if key is None:
+            continue
+        piece = ears.copy()
+        piece[..., 3] *= (lab == k)
+        carried = remap(piece, *lattice_maps(key, front.W, front.H))
+        m = carried[..., 3] > 0.3
+        if not m.any() or (m & near).sum() >= EAR_SHOWN_SHARE * m.sum():
+            continue
+        log(f'ears       one hidden by the turn ({m.sum()} px), carried by the {by}')
+        if out is None:
+            out = carried
+        else:
+            sa = carried[..., 3:4]
+            out = np.concatenate([out[..., :3] * (1 - sa) + carried[..., :3] * sa, sa + out[..., 3:4] * (1 - sa)], 2)
+    return out
+
+
 def _fit_direction(front_path, turned_path):
     front = Decomposition(front_path)
     turned = Decomposition(turned_path)
     lines = []
     fits = {}
-    for family, names in FAMILIES.items():
+    # The ears last: when they cannot be fitted they ride the face or the back hair.
+    order = [f for f in FAMILIES if f != 'ears'] + ['ears']
+    for family in order:
+        names = FAMILIES[family]
         if not any(n in front.layers for n in names) or not any(n in turned.layers for n in names):
             continue
+        if family == 'ears':
+            hidden = hidden_ears(front, turned, fits, lines.append)
+            if hidden is not None:
+                turned.layers['ears-hidden'] = hidden
+                turned.order.insert(0, 'ears-hidden')
+                names = names + ['ears-hidden']
+            front_ears = front.family(names)[..., 3] > 0.5
+            ratio = (turned.family(names)[..., 3] > 0.5).sum() / max(1, front_ears.sum())
+            if not EAR_AREA_RATIO[0] <= ratio <= EAR_AREA_RATIO[1]:
+                ys, xs = np.nonzero(front_ears)
+                key, by = ear_carrier(fits, (xs.min(), ys.min(), xs.max() + 1, ys.max() + 1)) if len(xs) else (None, None)
+                if key is not None:
+                    lines.append(f'ears        turned ears are {ratio:.1f}x the front ones: they ride the {by}')
+                    fits['ears'] = dict(key, fit=None)
+                continue
         fit = fit_family(front, turned, names, family, lines.append)
+        if fit and family == 'ears' and fit['fit']['iou'] < EAR_FIT_IOU:
+            # The turned ears are other parts (a human ear where a cat ear was dropped).
+            ys, xs = np.nonzero(front.family(names)[..., 3] > 0.5)
+            key, by = ear_carrier(fits, (xs.min(), ys.min(), xs.max() + 1, ys.max() + 1))
+            if key is not None:
+                lines.append(f'ears        fitted at IoU {fit["fit"]["iou"]:.2f}: they ride the {by}')
+                fit = dict(key, fit=None)
         if fit:
             fits[family] = fit
     return fits, lines
