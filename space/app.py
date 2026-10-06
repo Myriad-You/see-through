@@ -105,7 +105,7 @@ def _parse_canvas(canvas):
     return h, w
 
 
-def _decompose(image, resolution, seed, tblr_split, output_scale=1, size_condition="trained"):
+def _decompose(image, resolution, seed, tblr_split, output_scale=1, size_condition="trained", hair_pass="canvas"):
     """resolution: a square side, as the original demo, or an (h, w) canvas."""
     t_start = time.time()
     if image is None:
@@ -123,7 +123,7 @@ def _decompose(image, resolution, seed, tblr_split, output_scale=1, size_conditi
 
         t0 = time.time()
         _log("Running LayerDiff...")
-        extra = {"output_scale": output_scale, "size_condition": size_condition} if canvas_mode else {}
+        extra = {"output_scale": output_scale, "size_condition": size_condition, "hair_pass": hair_pass} if canvas_mode else {}
         apply_layerdiff(
             input_path, REPO_LAYERDIFF,
             save_dir=tmpdir, seed=seed, resolution=resolution, **extra,
@@ -192,6 +192,19 @@ def decompose(image: Image.Image, canvas: str = "1088x1664", seed: int = 42, tbl
     if size_condition not in ("trained", "actual"):
         raise gr.Error("Size condition must be 'trained' or 'actual'.")
     return _decompose(image, _parse_canvas(canvas), seed, tblr_split, output_scale, size_condition)
+
+
+@spaces.GPU(duration=300)
+def decompose_hair(image: Image.Image, canvas: str = "1088x1664", seed: int = 42, tblr_split: bool = True,
+                   hair_pass: str = "head"):
+    """
+    decompose with the hair from a pass of its own: the body tags run again on
+    the hair's box scaled to the head pass's square, and its front and back
+    hair replace the body pass's. 'canvas' is decompose as it is.
+    """
+    if hair_pass not in ("canvas", "head"):
+        raise gr.Error("Hair pass must be 'canvas' or 'head'.")
+    return _decompose(image, _parse_canvas(canvas), seed, tblr_split, 1, "trained", hair_pass)
 
 
 @spaces.GPU(duration=300)
@@ -349,6 +362,14 @@ with gr.Blocks(title="See-through: Layer Decomposition") as demo:
             inputs=[canvas_image, canvas_size, canvas_seed, canvas_split, canvas_scale, canvas_condition],
             outputs=[canvas_psd, canvas_gallery],
             api_name="decompose",
+        )
+        canvas_hair = gr.Radio(choices=["canvas", "head"], value="head", label="Hair pass")
+        canvas_hair_btn = gr.Button("Run with hair pass")
+        canvas_hair_btn.click(
+            fn=decompose_hair,
+            inputs=[canvas_image, canvas_size, canvas_seed, canvas_split, canvas_hair],
+            outputs=[canvas_psd, canvas_gallery],
+            api_name="decompose_hair",
         )
 
     with gr.Tab("Hidden region"):
