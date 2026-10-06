@@ -458,9 +458,11 @@ def missing_pieces(front, rgb, art):
     covered = cv2.dilate((alpha > 0.3).astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
     other = np.linalg.norm(front.composite() - rgb, axis=-1) * 255 > MISMATCH_DISTANCE
     miss = cv2.morphologyEx((art & (~covered | other)).astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    # The head itself; back hair long enough to reach the waist would take in
+    # the body (an obi the decomposition left out is not on the head).
     head = np.zeros((front.H, front.W), bool)
     for name in front.order:
-        if name.split('-')[0] in ('face', 'front hair', 'back hair', 'ears', 'headwear', 'earwear'):
+        if name.split('-')[0] in ('face', 'front hair', 'ears', 'headwear', 'earwear'):
             head |= front.layers[name][..., 3] > 0.3
     if not head.any() or not miss.any():
         return []
@@ -494,7 +496,82 @@ def accessory_pieces(front):
     return pieces
 
 
-def match_piece(mask, front_rgb, turned_rgb, side, face_cx, earring):
+# A piece rides what holds it (an earring the ear, a clip the hair): it is
+# looked for this far around where that host's key carries it (a share of the
+# piece's size, at least ACCESSORY_REACH px), and stays there when nothing in
+# reach looks like it (mean squared colour error per pixel over this).
+ACCESSORY_REACH = 30
+ACCESSORY_REACH_SHARE = 0.5
+ACCESSORY_MATCH_ERROR = 0.03
+# A piece of the outfit rides the neck when this share of its rim is the neck.
+ACCESSORY_NECK_SHARE = 0.1
+
+
+# Pieces this close are one accessory (a hairpin and the tassels the
+# decomposition dropped, which the import recovers on their own): they move
+# as one. Matched apart, each lands a little elsewhere and the lattice
+# between them smears the accessory.
+ACCESSORY_GROUP_GAP = 12
+
+
+def group_pieces(front, pieces):
+    """
+    Pieces (mask, earring) that touch within ACCESSORY_GROUP_GAP, merged, with
+    the host of each (accessory_host). Pieces of the outfit stay apart.
+    """
+    hosts = [accessory_host(front, mask) for mask, _ in pieces]
+    worn = [piece for piece, host in zip(pieces, hosts) if host is not None]
+    outfit = [piece for piece, host in zip(pieces, hosts) if host is None]
+    if len(worn) >= 2:
+        k = 2 * (ACCESSORY_GROUP_GAP // 2) + 1
+        near = np.zeros(worn[0][0].shape, np.uint8)
+        for mask, _ in worn:
+            near |= cv2.dilate(mask.astype(np.uint8), np.ones((k, k), np.uint8))
+        _, lab = cv2.connectedComponents(near)
+        groups = {}
+        for mask, earring in worn:
+            g = int(np.bincount(lab[mask]).argmax())
+            groups[g] = (groups[g][0] | mask, groups[g][1] or earring) if g in groups else (mask, earring)
+        worn = list(groups.values())
+        hosts = [accessory_host(front, mask) for mask, _ in worn] + [None] * len(outfit)
+    else:
+        hosts = [host for host in hosts if host is not None] + [None] * len(outfit)
+    return worn + outfit, hosts
+
+
+def accessory_host(front, mask):
+    """
+    The part around a piece the most (its rim's owners), which it rides; the
+    face if only the background is around it. When the body is around it the
+    most it is part of the outfit: on the neck (a choker's charm) it rides the
+    neck, elsewhere (None) it stays put.
+    """
+    owner = front.owner()
+    ring = (cv2.dilate(mask.astype(np.uint8), np.ones((15, 15), np.uint8)) > 0) & ~mask
+    counts, body = {}, 0
+    for name in owner[ring]:
+        family = family_of(name) if name else None
+        if family and family not in ACCESSORIES:
+            counts[family] = counts.get(family, 0) + 1
+        elif name and not family and name.split('-')[0] not in ACCESSORIES:
+            body += 1
+    if body > sum(counts.values()):
+        neck = {f: counts.get(f, 0) for f in ('neckwear', 'neck')}
+        if sum(neck.values()) < ACCESSORY_NECK_SHARE * ring.sum():
+            return None
+        # Drawn over the neckwear (a choker's charm the decomposition drew in both), it rides the neckwear.
+        if 'neckwear' in front.layers and (front.layers['neckwear'][..., 3][mask] > 0.5).mean() >= 0.3:
+            return 'neckwear'
+        return max(neck, key=neck.get)
+    return max(counts, key=counts.get) if counts else 'face'
+
+
+def match_piece(mask, front_rgb, turned_rgb, side, face_cx, earring, center=None):
+    """
+    Where a piece went in the turned picture: the best match of its drawing,
+    squeezed as the turn foreshortens it, near `center` (where its host's key
+    carries it); at `center` itself when nothing near looks like it.
+    """
     ys, xs = np.nonzero(mask)
     x0, x1, y0, y1 = xs.min(), xs.max() + 1, ys.min(), ys.max() + 1
     tmpl = front_rgb[y0:y1, x0:x1].astype(np.float32)
@@ -506,6 +583,10 @@ def match_piece(mask, front_rgb, turned_rgb, side, face_cx, earring):
         reach = (260, 120)
     else:
         squeeze, reach = (0.9, 1.1), (30, 90)
+    if center is not None:
+        r = max(ACCESSORY_REACH, ACCESSORY_REACH_SHARE * max(x1 - x0, y1 - y0))
+        reach = (r, r)
+        cx, cy = center
     H, W = turned_rgb.shape[:2]
     best = None
     for s in np.linspace(0.85, 1.1, 6):
@@ -522,9 +603,13 @@ def match_piece(mask, front_rgb, turned_rgb, side, face_cx, earring):
             _, _, mn, _ = cv2.minMaxLoc(r)
             if best is None or r[mn[1], mn[0]] < best[0]:
                 best = (r[mn[1], mn[0]], s, q, sx0 + mn[0] + tw / 2, sy0 + mn[1] + th / 2)
+    source = ((x0 + x1) / 2, (y0 + y1) / 2)
+    if best is None or (center is not None and best[0] > ACCESSORY_MATCH_ERROR):
+        return dict(source=source, target=(float(cx), float(cy)), scale=1.0, squeeze=1.0,
+                    box=(int(x0), int(y0), int(x1), int(y1)), matched=False)
     _, s, q, tx, ty = best
-    return dict(source=(cx, cy), target=(tx, ty), scale=float(s), squeeze=float(q),
-                box=(int(x0), int(y0), int(x1), int(y1)))
+    return dict(source=source, target=(tx, ty), scale=float(s), squeeze=float(q),
+                box=(int(x0), int(y0), int(x1), int(y1)), matched=True)
 
 
 def accessory_lattice(found, grid=25):
@@ -1074,14 +1159,31 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
             log(f'recovered piece at ({xs.mean():.0f}, {ys.mean():.0f}), {mask.sum()} px')
     front_rgb = drawn['front'][0] if drawn else front.composite()
     if pieces:
+        pieces, hosts = group_pieces(front, pieces)
+        log(f'accessory hosts {hosts}')
+    if pieces:
         for side, t in turned.items():
             turned_rgb = drawn[side][0] if side in drawn else t.composite()
-            found = [match_piece(mask, front_rgb, turned_rgb, side, face_cx, earring)
-                     for mask, earring in pieces]
+            found = []
+            for (mask, earring), host in zip(pieces, hosts):
+                ys, xs = np.nonzero(mask)
+                cx, cy = (xs.min() + xs.max() + 1) / 2, (ys.min() + ys.max() + 1) / 2
+                if host is None:
+                    # Part of the outfit: it does not turn with the head, and holds the lattice still around it.
+                    found.append(dict(source=(cx, cy), target=(cx, cy), scale=1.0, squeeze=1.0,
+                                      box=(int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1), matched=False))
+                    continue
+                key = keys.get(host, {}).get(side)
+                if key is not None:
+                    tx, ty = turned_position(key, np.array([cx], np.float32), np.array([cy], np.float32))
+                    center = (float(tx[0]), float(ty[0]))
+                else:
+                    center = (cx, cy)
+                found.append(match_piece(mask, front_rgb, turned_rgb, side, face_cx, earring, center))
             lattice = accessory_lattice(found)
             for family in ACCESSORIES:
                 keys.setdefault(family, {})[side] = lattice
-            log(f'{side:5s} accessories {[(round(f["target"][0]), round(f["target"][1]), round(f["squeeze"], 2)) for f in found]}')
+            log(f'{side:5s} accessories {[(round(f["target"][0]), round(f["target"][1]), round(f["squeeze"], 2), "m" if f["matched"] else "h") for f in found]}')
     # A family is keyed only with both turn keys; nod keys only as a pair.
     complete = {}
     for family, sides in keys.items():
