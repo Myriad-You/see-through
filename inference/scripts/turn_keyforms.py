@@ -1191,19 +1191,47 @@ def cut_by_picture(front, picture, log):
 # The face's crown, painted whole, reaches up under the back hair over the
 # skull. Front hair that does not reach the back of the head leaves it to come
 # out as skin when the head turns (Myriad paints the face under hair as plain
-# skin). Above the hairline, where back hair lies under it, the face is cut:
-# the back hair is the scalp there. The hairline is the highest forehead that
-# shows at rest (patches of skin of CROWN_MIN_SKIN px or more, up to
-# CROWN_FOREHEAD eye spans above the eyes; 0.25-0.43 on every character so
-# far), less CROWN_MARGIN eye spans for the forehead under the bangs. What
-# shows at rest is never cut.
+# skin). Above the hairline the face is cut: the back hair is the scalp there.
+# The hairline is the highest forehead that shows at rest (patches of skin of
+# CROWN_MIN_SKIN px or more, up to CROWN_FOREHEAD eye spans above the eyes;
+# 0.25-0.43 on every character so far), less CROWN_MARGIN eye spans for the
+# forehead under the bangs. The forehead lies between the eyes' outer corners:
+# above the eyes and outside them (CROWN_MARGIN eye spans out) are the
+# temples, under the side hair, cut too. Where the back hair has a gap under
+# them (the decomposition painted the scalp only behind the face's outline),
+# hidden at rest, it is filled from the back hair around. A pixel is cut only
+# where no pose would show a hole for it: at rest and at every key, it is
+# still covered, or back hair lies where it goes. What shows at rest is never
+# cut.
 CROWN_FOREHEAD = 0.6
 CROWN_MARGIN = 0.1
 CROWN_MIN_SKIN = 300
+CROWN_FILL_RADIUS = 8
 
 
-def cut_crown(front, log):
-    """Cuts the face above its hairline where back hair lies under it."""
+def keyed_alpha(front, names, keys, side):
+    """The coverage of the given layers drawn at their keys for `side` (rest when None)."""
+    cover = np.zeros((front.H, front.W), np.float32)
+    maps = {}
+    for name in names:
+        a = front.layers[name][..., 3]
+        family = family_of(name)
+        key = keys.get(family, {}).get(side) if side else None
+        if key is not None:
+            if family not in maps:
+                maps[family] = lattice_maps(key, front.W, front.H)
+            a = cv2.remap(a, *maps[family], cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+            # The lattice clamps past its box; the layer itself is not there.
+            x0, y0, x1, y1 = (int(round(v)) for v in key['box'])
+            inside = np.zeros_like(a)
+            inside[max(0, y0):max(0, y1 + 1), max(0, x0):max(0, x1 + 1)] = 1
+            a = a * inside
+        cover = np.maximum(cover, a)
+    return cover
+
+
+def cut_crown(front, keys, log):
+    """Cuts the face above its hairline and at the temples where no pose shows a hole for it."""
     if 'face' not in front.layers:
         return 0
     face = front.layers['face']
@@ -1224,20 +1252,50 @@ def cut_crown(front, log):
         log('cut the crown: no forehead shows')
         return 0
     hairline = int(min(tops) - CROWN_MARGIN * span)
+    margin = int(CROWN_MARGIN * span)
+    zone = np.zeros((front.H, front.W), bool)
+    zone[:max(0, hairline)] = True
+    zone[:ey.min(), :max(0, ex.min() - margin)] = True
+    zone[:ey.min(), ex.max() + margin:] = True
+    cut = zone & (face[..., 3] > 0) & ~(cv2.dilate(shows, np.ones((5, 5), np.uint8)) > 0)
     li = front.order.index('face')
-    under = np.zeros((front.H, front.W), np.float32)
-    for below in front.order[:li]:
-        if below in FAMILIES['back-hair']:
-            under = np.maximum(under, front.layers[below][..., 3])
-    cut = (face[..., 3] > 0) & (under > 0.9) & ~(cv2.dilate(shows, np.ones((5, 5), np.uint8)) > 0)
-    cut[max(0, hairline):] = False
+    above = front.order[li + 1:]
+    back = [name for name in front.order[:li] if name in FAMILIES['back-hair']]
+    if back:
+        hair = front.layers[back[0]]
+        covered = keyed_alpha(front, above, keys, None) > 0.9
+        gap = cut & covered & (hair[..., 3] < 0.5)
+        if gap.sum() >= 50:
+            rgb = (np.clip(hair[..., :3], 0, 1) * 255).astype(np.uint8)
+            unknown = (hair[..., 3] < 0.5).astype(np.uint8)
+            filled = cv2.inpaint(rgb, unknown, CROWN_FILL_RADIUS, cv2.INPAINT_TELEA)
+            hair[gap, :3] = filled[gap].astype(np.float32) / 255
+            hair[gap, 3] = 1.0
+            log(f'filled {int(gap.sum())} px of {back[0]} under the crown')
+    face_keys = keys.get('face', {})
+    for side in [None] + [s for s in SIDES if s in face_keys]:
+        qy, qx = np.nonzero(cut)
+        if not len(qy):
+            break
+        if side is None:
+            tx, ty = qx, qy
+        else:
+            tx, ty = turned_position(face_keys[side], qx.astype(np.float32), qy.astype(np.float32))
+        ix = np.clip(np.round(tx).astype(int), 0, front.W - 1); iy = np.clip(np.round(ty).astype(int), 0, front.H - 1)
+        safe = (keyed_alpha(front, above, keys, side)[iy, ix] > 0.9) | (keyed_alpha(front, back, keys, side)[iy, ix] > 0.9)
+        cut[qy[~safe], qx[~safe]] = False
     face[..., 3] *= 1 - cut
-    log(f'cut the crown above y {hairline}: {int(cut.sum())} px')
+    log(f'cut the crown above y {hairline} and the temples: {int(cut.sum())} px')
     return int(cut.sum())
 
 
-def bake(front, turned, keys, log):
-    """Hidden pixels of the parts a turn uncovers, from the turned drawings where the same part is on top."""
+def bake(front, turned, keys, log, pictures=None):
+    """
+    Hidden pixels of the parts a turn uncovers, from the turned drawings where
+    the same part is on top: their pictures' colours when given (side -> RGB)
+    and the decomposition's part looks like them there, else the turned
+    decompositions'.
+    """
     owners = {side: t.owner() for side, t in turned.items()}
     report = {}
     for li, name in enumerate(front.order):
@@ -1259,8 +1317,20 @@ def bake(front, turned, keys, log):
                 continue
             tx, ty = turned_position(key, qx.astype(np.float32), qy.astype(np.float32))
             ix = np.clip(np.round(tx).astype(int), 0, front.W - 1); iy = np.clip(np.round(ty).astype(int), 0, front.H - 1)
-            mine = np.isin(owners[side][iy, ix], turned_names(family)) & ~filled[qy, qx]
-            src = t.family(turned_names(family))
+            names = turned_names(family)
+            mine = np.isin(owners[side][iy, ix], names)
+            if family == 'back-hair':
+                # Where nothing keyed covers it at this turn, the back hair is what shows of
+                # the scalp there: whatever hair the turn has on top.
+                names = names + ['front hair']
+                exposed = keyed_alpha(front, front.order[li + 1:], keys, side)[iy, ix] < 0.5
+                mine |= exposed & np.isin(owners[side][iy, ix], names)
+            mine &= ~filled[qy, qx]
+            src = t.family(names)
+            if pictures and side in pictures:
+                # The picture where the decomposition's part is what it shows (not other art it took in).
+                agrees = np.linalg.norm(src[..., :3] - pictures[side], axis=-1) * 255 < BURIED_MATCH
+                src = np.concatenate([np.where(agrees[..., None], pictures[side], src[..., :3]), src[..., 3:4]], 2)
             x0 = np.clip(np.floor(tx).astype(int), 0, front.W - 2); y0 = np.clip(np.floor(ty).astype(int), 0, front.H - 2)
             fx = np.clip(tx - x0, 0, 1)[:, None]; fy = np.clip(ty - y0, 0, 1)[:, None]
             vals = (src[y0, x0] * (1 - fx) * (1 - fy) + src[y0, x0 + 1] * fx * (1 - fy) +
@@ -1585,8 +1655,13 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
         fill_under_piece(front, mask, 'front-hair', log)
     if drawn:
         cut_by_picture(front, drawn['front'][0], log)
-    cut_crown(front, log)
-    baked = bake(front, turned, complete, log)
+    turned_pictures = {side: drawn[side][0] for side in turned if side in drawn} if drawn else None
+    if turned_pictures:
+        # The turned decompositions paint over alike; their pictures say what is on top there.
+        for side, picture in turned_pictures.items():
+            cut_by_picture(turned[side], picture, lambda line, side=side: log(f'{side:5s} {line}'))
+    cut_crown(front, complete, log)
+    baked = bake(front, turned, complete, log, turned_pictures)
     result = dict(canvas=[front.W, front.H], keyforms=complete, fit=report, baked=baked, locks=locks)
     if drawn:
         # Drawn together with what they uncover, as the runtime draws them, the
@@ -1606,7 +1681,7 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
                     for family, key in moved.items():
                         complete[family][side] = key
                     result['picture'][side] = change
-        result['baked'] = bake(front, turned, complete, log)
+        result['baked'] = bake(front, turned, complete, log, turned_pictures)
     return front, result
 
 
