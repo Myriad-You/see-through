@@ -1298,6 +1298,78 @@ def _refine_direction(front_path, keys, side, front_picture, picture_path, recov
     return {family: sides[side] for family, sides in keys.items() if side in sides}, change, lines
 
 
+# ---------------------------------------------------------------- checking a decomposition
+
+# A decomposition can take the long hair at the sides of the face into the
+# face layer (a pale character whose hair is near her skin): the face then
+# runs as wide as the hair below the eyes. A face is about as wide as the eyes
+# reach (0.9-1.25 on every character so far, turned or not; the hidden crown
+# above the eyes is the face's too and may be wider).
+FACE_SPREAD_LIMIT = 1.5
+# Or the headwear takes in the outfit and the hair hanging over it: headwear
+# below the chin, over the face's area (0.02 at most so far; 1.35 when it did).
+HEADWEAR_BELOW_CHIN_LIMIT = 0.5
+# Or the ears take in the head: the ears over the face's area (cat ears 0.18;
+# 0.94 when they did).
+EARS_LIMIT = 0.5
+
+
+def face_spread(dec):
+    """The face layer's widest row below the eyes over the eyes' span; None without a face or eyes."""
+    face = dec.layers.get('face')
+    eyes = np.zeros((dec.H, dec.W), bool)
+    for name in dec.order:
+        if name.split('-')[0] in ('eyewhite', 'irides', 'eyelash'):
+            eyes |= dec.layers[name][..., 3] > 0.5
+    if face is None or not eyes.any():
+        return None
+    face = face[..., 3] > 0.5
+    ey, ex = np.nonzero(eyes)
+    span = ex.max() - ex.min()
+    widths = [np.ptp(xs) for xs in (np.nonzero(row)[0] for row in face[int(ey.mean()):]) if len(xs)]
+    if not widths or span < 8:
+        return None
+    return float(max(widths) / span)
+
+
+def part_shares(dec):
+    """Headwear below the chin and the ears, each over the face's area; None without a face."""
+    face = dec.layers.get('face')
+    if face is None or not (face[..., 3] > 0.5).any():
+        return None
+    face = face[..., 3] > 0.5
+    chin = np.nonzero(face)[0].max()
+    shares = {'headwear': 0.0, 'ears': 0.0}
+    for name in dec.order:
+        a = dec.layers[name][..., 3] > 0.5
+        if name.split('-')[0] == 'headwear':
+            shares['headwear'] += a[chin:].sum() / face.sum()
+        elif name in FAMILIES['ears']:
+            shares['ears'] += a.sum() / face.sum()
+    return shares
+
+
+def check_decomposition(path):
+    """
+    Whether a decomposition can be keyed from: its faults, and how far past
+    its limits it is at worst (badness, over 1 when faulty), for choosing the
+    least faulty of several.
+    """
+    dec = Decomposition(path)
+    spread = face_spread(dec)
+    shares = part_shares(dec)
+    if spread is None or shares is None:
+        return dict(ok=False, faults=['no face or eyes'], badness=None, face_spread=None)
+    measures = {
+        'face takes in the hair': spread / FACE_SPREAD_LIMIT,
+        'headwear takes in the outfit': shares['headwear'] / HEADWEAR_BELOW_CHIN_LIMIT,
+        'ears take in the head': shares['ears'] / EARS_LIMIT,
+    }
+    faults = [fault for fault, over in measures.items() if over > 1]
+    return dict(ok=not faults, faults=faults, badness=round(float(max(measures.values())), 3),
+                face_spread=round(spread, 3))
+
+
 def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
     """
     Keys and baked front decomposition. turned_paths: {'plus','minus','up','down'}
@@ -1308,6 +1380,8 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
     for side, t in turned.items():
         if (t.W, t.H) != (front.W, front.H):
             raise ValueError(f'{side}: canvas {t.W}x{t.H} is not the front canvas {front.W}x{front.H}')
+    spreads = {side: face_spread(d) for side, d in [('front', front), *turned.items()]}
+    log(f'face spread {({side: None if v is None else round(v, 2) for side, v in spreads.items()})}')
     keys = {}
     # The four directions fit apart, one process each where the machine has them.
     workers = max(1, min(len(turned_paths), (os.cpu_count() or 1)))

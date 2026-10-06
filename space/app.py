@@ -270,6 +270,18 @@ def refine(image: Image.Image, canvas: str = "", target: str = "back hair", mode
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def check(psd):
+    """
+    Whether a decomposition can be keyed from (turn_keyforms.check_decomposition):
+    {ok, faults, badness, face_spread}. A caller redoes a faulty one with another seed. CPU only.
+    """
+    import turn_keyforms
+
+    if psd is None:
+        raise gr.Error("A decomposition PSD is needed.")
+    return turn_keyforms.check_decomposition(psd if isinstance(psd, str) else psd.name)
+
+
 def keyforms(front_psd, right_psd, left_psd, up_psd, down_psd,
              front_png=None, right_png=None, left_png=None, up_png=None, down_png=None):
     """
@@ -454,6 +466,11 @@ with gr.Blocks(title="See-through: Layer Decomposition") as demo:
             outputs=[key_json, key_psd],
             api_name="keyforms",
         )
+        with gr.Row():
+            check_psd = gr.File(label="Decomposition PSD to check")
+            check_json = gr.JSON(label="Check")
+        check_btn = gr.Button("Check")
+        check_btn.click(fn=check, inputs=[check_psd], outputs=[check_json], api_name="check")
 
 if __name__ == "__main__":
     demo.launch()
