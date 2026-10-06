@@ -40,7 +40,7 @@ HEAD_TAGS_V3 = ['headwear', 'face', 'irides', 'eyebrow', 'eyewhite', 'eyelash', 
 def apply_layerdiff(
     imgp: str, pretrained: str, num_inference_steps=30, seed=0, save_dir='workspace/layerdiff_output', target_tag_list=VALID_BODY_PARTS_V2, 
     resolution=1280, vae_ckpt=None, unet_ckpt=None, disable_progressbar=False, cache_tag_embeds=True, group_offload=False,
-    head_resolution=TRAINED_SIZE, output_scale=1, size_condition='trained', hair_pass='canvas'):
+    head_resolution=TRAINED_SIZE, output_scale=1, size_condition='trained', hair_pass='canvas', body_tags=None):
     '''
     resolution: an int pads the image to that square, as before. An (h, w)
     canvas instead fits the image on that canvas without stretching (see
@@ -98,7 +98,7 @@ def apply_layerdiff(
     if not isinstance(resolution, int):
         _apply_layerdiff_canvas(
             pipeline, imgp, saved, seed, num_inference_steps, target_tag_list, validate_resolution(resolution, div=64),
-            head_resolution, output_scale, size_condition, hair_pass)
+            head_resolution, output_scale, size_condition, hair_pass, body_tags)
         return
     input_img = np.array(Image.open(imgp).convert('RGBA'))
     fullpage, pad_size, pad_pos = center_square_pad_resize(input_img, resolution, return_pad_info=True)
@@ -251,7 +251,7 @@ def _place_on_canvas(region, box, placement, canvas_hw, scale_out=1):
 
 
 def _apply_layerdiff_canvas(pipeline, imgp, saved, seed, num_inference_steps, target_tag_list, canvas_hw,
-                            head_resolution, output_scale, size_condition, hair_pass='canvas'):
+                            head_resolution, output_scale, size_condition, hair_pass='canvas', body_tags=None):
     '''
     apply_layerdiff on a canvas of canvas_hw (h, w) fitted to the figure: the
     source is scaled by one factor and centred, never stretched. The head pass
@@ -274,6 +274,10 @@ def _apply_layerdiff_canvas(pipeline, imgp, saved, seed, num_inference_steps, ta
     '''
     if hair_pass not in ('canvas', 'head'):
         raise ValueError("hair_pass must be 'canvas' or 'head'")
+    # body_tags: only these of the body pass's tags (it needs 'head' to find the head pass's box).
+    body = list(BODY_TAGS_V3) if body_tags is None else [t for t in BODY_TAGS_V3 if t in body_tags]
+    if 'head' not in body:
+        raise ValueError("body_tags must include 'head'")
     output_scale = int(output_scale)
     if output_scale < 1:
         raise ValueError('output_scale must be a whole number of at least 1')
@@ -316,11 +320,11 @@ def _apply_layerdiff_canvas(pipeline, imgp, saved, seed, num_inference_steps, ta
     if tag_version != 'v3':
         raise ValueError(f'unknown tag version {tag_version}')
 
-    images = run(BODY_TAGS_V3, fullpage, 0)
-    for rst, tag in zip(images, BODY_TAGS_V3):
+    images = run(body, fullpage, 0)
+    for rst, tag in zip(images, body):
         Image.fromarray(rst).save(osp.join(saved, f'{tag}.png'))
 
-    head_mask = (images[BODY_TAGS_V3.index('head')][..., -1] > 15).astype(np.uint8)
+    head_mask = (images[body.index('head')][..., -1] > 15).astype(np.uint8)
     if not head_mask.any():
         return
     scale, ox, oy, _, _ = placement
@@ -341,7 +345,8 @@ def _apply_layerdiff_canvas(pipeline, imgp, saved, seed, num_inference_steps, ta
     if hair_pass == 'head':
         hair_mask = head_mask.copy()
         for tag in ('front hair', 'back hair'):
-            hair_mask |= (images[BODY_TAGS_V3.index(tag)][..., -1] > 15).astype(np.uint8)
+            if tag in body:
+                hair_mask |= (images[body.index(tag)][..., -1] > 15).astype(np.uint8)
         hair_box = source_box(hair_mask)
         if hair_box is not None:
             input_hair, box = _crop_head_box(input_img, hair_box)

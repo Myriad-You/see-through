@@ -105,7 +105,8 @@ def _parse_canvas(canvas):
     return h, w
 
 
-def _decompose(image, resolution, seed, tblr_split, output_scale=1, size_condition="trained", hair_pass="canvas"):
+def _decompose(image, resolution, seed, tblr_split, output_scale=1, size_condition="trained", hair_pass="canvas",
+               body_tags=None, steps=30):
     """resolution: a square side, as the original demo, or an (h, w) canvas."""
     t_start = time.time()
     if image is None:
@@ -123,10 +124,11 @@ def _decompose(image, resolution, seed, tblr_split, output_scale=1, size_conditi
 
         t0 = time.time()
         _log("Running LayerDiff...")
-        extra = {"output_scale": output_scale, "size_condition": size_condition, "hair_pass": hair_pass} if canvas_mode else {}
+        extra = {"output_scale": output_scale, "size_condition": size_condition, "hair_pass": hair_pass,
+                 "body_tags": body_tags} if canvas_mode else {}
         apply_layerdiff(
             input_path, REPO_LAYERDIFF,
-            save_dir=tmpdir, seed=seed, resolution=resolution, **extra,
+            save_dir=tmpdir, seed=seed, resolution=resolution, num_inference_steps=steps, **extra,
         )
         _log(f"LayerDiff done ({time.time() - t0:.1f}s)")
 
@@ -192,6 +194,21 @@ def decompose(image: Image.Image, canvas: str = "1088x1664", seed: int = 42, tbl
     if size_condition not in ("trained", "actual"):
         raise gr.Error("Size condition must be 'trained' or 'actual'.")
     return _decompose(image, _parse_canvas(canvas), seed, tblr_split, output_scale, size_condition)
+
+
+@spaces.GPU(duration=180)
+def decompose_lean(image: Image.Image, canvas: str = "1088x1664", seed: int = 42, tblr_split: bool = True,
+                   body_tags: str = "front hair,back hair,head,neck,neckwear", steps: int = 30):
+    """
+    decompose for a picture whose body is another's: only the given body tags
+    (the head and what turns with it), at the given number of steps. The head
+    pass is whole.
+    """
+    tags = [t.strip() for t in str(body_tags).split(",") if t.strip()]
+    steps = int(steps)
+    if "head" not in tags or not 10 <= steps <= 30:
+        raise gr.Error("Body tags must include head; steps 10..30.")
+    return _decompose(image, _parse_canvas(canvas), seed, tblr_split, 1, "trained", "canvas", tags, steps)
 
 
 @spaces.GPU(duration=300)
@@ -362,6 +379,15 @@ with gr.Blocks(title="See-through: Layer Decomposition") as demo:
             inputs=[canvas_image, canvas_size, canvas_seed, canvas_split, canvas_scale, canvas_condition],
             outputs=[canvas_psd, canvas_gallery],
             api_name="decompose",
+        )
+        lean_tags = gr.Textbox(value="front hair,back hair,head,neck,neckwear", label="Body tags (lean)")
+        lean_steps = gr.Slider(minimum=10, maximum=30, value=30, step=1, label="Steps (lean)")
+        lean_btn = gr.Button("Run lean")
+        lean_btn.click(
+            fn=decompose_lean,
+            inputs=[canvas_image, canvas_size, canvas_seed, canvas_split, lean_tags, lean_steps],
+            outputs=[canvas_psd, canvas_gallery],
+            api_name="decompose_lean",
         )
         canvas_hair = gr.Radio(choices=["canvas", "head"], value="head", label="Hair pass")
         canvas_hair_btn = gr.Button("Run with hair pass")
