@@ -59,10 +59,55 @@ FAMILIES = {
     'front-hair': ['front hair'],
 }
 # Finer keys where the drawing holds, coarser where the turned drawing redraws.
-GRID = {'face': 17, 'eye:L': 13, 'eye:R': 13, 'ears': 13, 'neck': 13, 'neckwear': 13, 'back-hair': 17}
+GRID = {'face': 17, 'eye:L': 13, 'eye:R': 13, 'ears': 13, 'neck': 13, 'neckwear': 13, 'back-hair': 17, 'headwear': 13}
 COARSE_GRID = 9
 FRONT_HAIR_GRID = 5
 ACCESSORIES = ['headwear', 'earwear']
+# Headwear as big as the head (headphones, a hood, a hat) is no clip: it turns
+# in depth, its near side growing and its far side going behind the head, which
+# no rigid move draws. When it covers BIG_HEADWEAR of the face's area and every
+# turned decomposition has it at about its size (BIG_HEADWEAR_RATIO), it is
+# fitted on them as a part of its own, like the face.
+BIG_HEADWEAR = 0.5
+BIG_HEADWEAR_RATIO = (0.5, 2.0)
+# A turned decomposition can drop most of it (headphones kept at a tenth of
+# their size): fitted under BIG_HEADWEAR_IOU, or not there at its size, it
+# starts from the head's own move (the face key's affine part, over the
+# headwear's box and HEAD_KEY_PAD around it) and is fitted on the pictures.
+BIG_HEADWEAR_IOU = 0.8
+HEAD_KEY_PAD = 60
+
+
+def head_key(face_key, box, face, grid=13):
+    """
+    A backward lattice over `box` moving as the face key does on the whole (its
+    affine part), read where the key draws the face (`face`: its front alpha);
+    the lattice off the face holds nothing.
+    """
+    fx0, fy0, fx1, fy1 = face_key['box']
+    g = face_key['grid']
+    back = np.asarray(face_key['back'], np.float64).reshape(g * g, 2)
+    yy, xx = np.meshgrid(np.linspace(fy0, fy1, g), np.linspace(fx0, fx1, g), indexing='ij')
+    P = np.stack([xx.reshape(-1), yy.reshape(-1), np.ones(g * g)], 1)
+    sx = np.clip(np.round(P[:, 0] + back[:, 0]).astype(int), 0, face.shape[1] - 1)
+    sy = np.clip(np.round(P[:, 1] + back[:, 1]).astype(int), 0, face.shape[0] - 1)
+    on = face[sy, sx] > 0.5
+    if on.sum() >= 6:
+        P, back = P[on], back[on]
+    M, *_ = np.linalg.lstsq(P, back, rcond=None)
+    x0, y0, x1, y1 = box
+    yy, xx = np.meshgrid(np.linspace(y0, y1, grid), np.linspace(x0, x1, grid), indexing='ij')
+    out = np.stack([xx.reshape(-1), yy.reshape(-1), np.ones(grid * grid)], 1) @ M
+    return dict(box=[float(v) for v in box], grid=grid, back=[float(v) for v in out.reshape(-1)])
+
+
+def big_headwear(dec):
+    """The headwear layer's area over the face's when it is as big as BIG_HEADWEAR, else None."""
+    if 'headwear' not in dec.layers or 'face' not in dec.layers:
+        return None
+    face = (dec.layers['face'][..., 3] > 0.5).sum()
+    area = (dec.layers['headwear'][..., 3] > 0.5).sum()
+    return area if face and area >= BIG_HEADWEAR * face else None
 # The neck is not taken from the turned drawings: each is lit its own way, and
 # under the chin they patch into bands. The decomposition's own inpainting is
 # one smooth cylinder of skin with the chin's shadow, which the neck's key
@@ -876,6 +921,18 @@ def edge_distance(a, b, region):
     return 0.5 * (float(da.mean()) + float(db.mean()))
 
 
+def headwear_error(front, keys, side, key, picture, box):
+    """How far the picture's outlines are from the front drawn at `side`'s keys with `key` for the headwear, around `box`."""
+    layers = [(name, family_of(name), front.layers[name]) for name in front.order]
+    trial = {f: {side: v[side]} for f, v in keys.items() if side in v and f != 'headwear'}
+    trial['headwear'] = {side: key}
+    rgb, _ = render_keys(layers, trial, side, front.W, front.H)
+    region = np.zeros((front.H, front.W), bool)
+    x0, y0, x1, y1 = (int(v) for v in box)
+    region[y0:y1 + 1, x0:x1 + 1] = True
+    return edge_distance(rgb, picture, region)
+
+
 def refit_lattice(key, px, py, target):
     """Least squares of a lattice through backward offsets measured at turned points, smooth, held near the old one."""
     x0, y0, x1, y1 = key['box']
@@ -896,7 +953,7 @@ def refit_lattice(key, px, py, target):
     return dict(key, back=[float(v) for v in out.reshape(-1)])
 
 
-def refine_on_picture(front, keys, side, picture, extra, log):
+def refine_on_picture(front, keys, side, picture, extra, log, own=()):
     """
     Moves each keyed part toward where the turned picture has it. extra:
     (name, family, layer) pieces drawn above the front layers (recovered art).
@@ -924,7 +981,7 @@ def refine_on_picture(front, keys, side, picture, extra, log):
         ok = agree[yy, xx] & region[yy, xx] & (shown >= 0)
         trial = dict(keys)
         for family in {f for _, f, _ in layers if f and f in keys and side in keys[f]}:
-            if family in ACCESSORIES:
+            if family in ACCESSORIES and family not in own:
                 continue
             mine = np.array([i for i, (_, f, _) in enumerate(layers) if f == family])
             sel = ok & np.isin(shown, mine)
@@ -1661,17 +1718,22 @@ def _fit_direction(front_path, turned_path):
                 fit = dict(key, fit=None)
         if fit:
             fits[family] = fit
+    front_area, turned_area = big_headwear(front), big_headwear(turned)
+    if front_area and turned_area and BIG_HEADWEAR_RATIO[0] <= turned_area / front_area <= BIG_HEADWEAR_RATIO[1]:
+        fit = fit_family(front, turned, ['headwear'], 'headwear', lines.append)
+        if fit and fit['fit']['iou'] >= BIG_HEADWEAR_IOU:
+            fits['headwear'] = fit
     return fits, lines
 
 
-def _refine_direction(front_path, keys, side, front_picture, picture_path, recovered):
+def _refine_direction(front_path, keys, side, front_picture, picture_path, recovered, own=()):
     front = Decomposition(front_path)
     rgb, _ = placed_illustration(front_picture, front.W, front.H)
     extra = [('recovered', 'earwear', np.concatenate([rgb, m[..., None].astype(np.float32)], 2)) for m in recovered]
     picture, _ = placed_illustration(picture_path, front.W, front.H)
     keys = {family: dict(sides) for family, sides in keys.items()}
     lines = []
-    change = refine_on_picture(front, keys, side, picture, extra, lines.append)
+    change = refine_on_picture(front, keys, side, picture, extra, lines.append, own)
     return {family: sides[side] for family, sides in keys.items() if side in sides}, change, lines
 
 
@@ -1770,6 +1832,49 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
                 log(f'{side:5s} {line}')
             for family, fit in fits.items():
                 keys.setdefault(family, {})[side] = fit
+    # Big headwear is a part of its own: where its decomposition failed it, it starts from the head's move.
+    if big_headwear(front) and 'face' in keys:
+        ys, xs = np.nonzero(front.layers['headwear'][..., 3] > 0.3)
+        box = (max(0, xs.min() - HEAD_KEY_PAD), max(0, ys.min() - HEAD_KEY_PAD),
+               min(front.W - 1, xs.max() + HEAD_KEY_PAD), min(front.H - 1, ys.max() + HEAD_KEY_PAD))
+        layer = front.layers['headwear']
+        face_cx = float(np.nonzero(front.layers['face'][..., 3] > 0.5)[1].mean())
+        whole = layer[..., 3] > 0.5
+        for side in turned_paths:
+            if side in keys.get('headwear', {}) or side not in keys['face']:
+                continue
+            key = head_key(keys['face'][side], box, front.layers['face'][..., 3])
+            chosen, note = key, 'rides the head'
+            if pictures and side in pictures:
+                # The picture says where it went: the head's move as it is, shifted to the
+                # best match near it, or the whole moved rigidly; the nearest drawn wins.
+                picture = placed_illustration(pictures[side], front.W, front.H)[0]
+                candidates = [(key, 'rides the head')]
+                moved = remap(layer, *lattice_maps(key, front.W, front.H))
+                mask = moved[..., 3] > 0.5
+                if mask.sum() >= MIN_MISSING_AREA:
+                    rgb = moved[..., :3] * moved[..., 3:4] + (1 - moved[..., 3:4])
+                    ys, xs = np.nonzero(mask)
+                    center = ((xs.min() + xs.max() + 1) / 2, (ys.min() + ys.max() + 1) / 2)
+                    found = match_piece(mask, rgb, picture, side, face_cx, False, center)
+                    if found['matched']:
+                        dx, dy = found['target'][0] - found['source'][0], found['target'][1] - found['source'][1]
+                        back = np.asarray(key['back'], np.float32).reshape(-1, 2) - [dx, dy]
+                        x0, y0, x1, y1 = key['box']
+                        candidates.append((dict(key, box=[x0 + dx, y0 + dy, x1 + dx, y1 + dy],
+                                                back=[float(v) for v in back.reshape(-1)]),
+                                           f'rides the head, shifted ({dx:.0f}, {dy:.0f})'))
+                rigid = match_piece(whole, placed_illustration(pictures['front'], front.W, front.H)[0], picture, side, face_cx, False)
+                candidates.append((accessory_lattice([rigid]), 'moves whole'))
+                errors = [headwear_error(front, keys, side, k, picture, box) for k, _ in candidates]
+                best = int(np.argmin(errors))
+                chosen = candidates[best][0]
+                note = f'{candidates[best][1]} ({" / ".join(f"{e:.2f}" for e in errors)})'
+            keys.setdefault('headwear', {})[side] = chosen
+            log(f'{side:5s} headwear    {note}: its decomposition does not hold it')
+    own = tuple(f for f in ACCESSORIES if len(keys.get(f, {})) == len(turned_paths))
+    if own:
+        log(f'fitted as parts of their own: {own}')
     # Accessories ride rigidly: every piece of every hair clip and earring,
     # matched on the illustrations when given (they hold what the
     # decompositions re-render or drop).
@@ -1781,7 +1886,7 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
         drawn = {side: placed_illustration(path, front.W, front.H) for side, path in pictures.items()}
         raise_buried_accessories(front, drawn['front'][0], log)
         restore_ornaments(front, drawn['front'][0], log)
-    pieces = [(mask, name.startswith('earwear')) for mask, name in accessory_pieces(front)]
+    pieces = [(mask, name.startswith('earwear')) for mask, name in accessory_pieces(front) if name.split('-')[0] not in own]
     clips = []
     if pictures:
         recovered = missing_pieces(front, *drawn['front'])
@@ -1819,7 +1924,8 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
                 found.append(match_piece(mask, front_rgb, turned_rgb, side, face_cx, host == 'ears', center))
             lattice = accessory_lattice(found)
             for family in ACCESSORIES:
-                keys.setdefault(family, {})[side] = lattice
+                if family not in own:
+                    keys.setdefault(family, {})[side] = lattice
             log(f'{side:5s} accessories {[(round(f["target"][0]), round(f["target"][1]), round(f["squeeze"], 2), "m" if f["matched"] else "h") for f in found]}')
     # A family is keyed only with both turn keys; nod keys only as a pair.
     complete = {}
@@ -1873,7 +1979,7 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
             baked_path = os.path.join(tmp, 'baked.psd')
             save_psd(front, baked_path)
             with ProcessPoolExecutor(max_workers=workers) as pool:
-                jobs = {side: pool.submit(_refine_direction, baked_path, complete, side, pictures['front'], pictures[side], recovered)
+                jobs = {side: pool.submit(_refine_direction, baked_path, complete, side, pictures['front'], pictures[side], recovered, own)
                         for side in turned if side in pictures}
                 result['picture'] = {}
                 for side, job in jobs.items():
