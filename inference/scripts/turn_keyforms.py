@@ -1401,6 +1401,53 @@ def lift_ornaments(front, name, cut, below, log):
     return cut
 
 
+# A decomposition draws the eyes whole and over the front hair (eyes drawn
+# through the bangs, as much art has them). Where the picture shows the hair
+# over an eye instead (a lock hanging over it), the lock goes over the eyes:
+# it does when over HAIR_OVER_EYES of where it and the eyes overlap the picture
+# is nearer the lock's colour than the eyes' (by HAIR_OVER_EYES_MARGIN).
+HAIR_OVER_EYES = 0.5
+HAIR_OVER_EYES_MARGIN = 10
+EYE_PARTS = ('eyewhite', 'irides', 'eyelash', 'eyebrow')
+
+
+def raise_hair_over_eyes(front, picture, log):
+    """Moves the front hair the picture shows over the eyes above them."""
+    eyes = [n for n in front.order if n.split('-')[0] in EYE_PARTS]
+    locks = [n for n in front.order if n == 'front hair' or LOCK_LAYER.match(n)]
+    if not eyes or not locks:
+        return []
+    eye_rgb = np.ones((front.H, front.W, 3), np.float32)
+    eye_a = np.zeros((front.H, front.W), np.float32)
+    for n in eyes:
+        a = front.layers[n][..., 3:4]
+        eye_rgb = eye_rgb * (1 - a) + front.layers[n][..., :3] * a
+        eye_a = np.maximum(eye_a, a[..., 0])
+    top = max(front.order.index(n) for n in eyes)
+    raised = []
+    for name in locks:
+        if front.order.index(name) > min(front.order.index(n) for n in eyes):
+            continue
+        lock = front.layers[name]
+        overlap = (lock[..., 3] > 0.5) & (eye_a > 0.5)
+        if overlap.sum() < MIN_MISSING_AREA:
+            continue
+        to_lock = np.linalg.norm(lock[..., :3] - picture, axis=-1)[overlap] * 255
+        to_eyes = np.linalg.norm(eye_rgb - picture, axis=-1)[overlap] * 255
+        shown = float((to_lock + HAIR_OVER_EYES_MARGIN < to_eyes).mean())
+        if shown >= HAIR_OVER_EYES:
+            raised.append((name, shown, int(overlap.sum())))
+    if raised:
+        # Over the eyes, in their own order among themselves.
+        names = [n for n, _, _ in raised]
+        rest = [n for n in front.order if n not in names]
+        top = max(rest.index(n) for n in eyes)
+        front.order[:] = rest[:top + 1] + names + rest[top + 1:]
+    if raised:
+        log(f'front hair over the eyes: {[(n, round(s, 2), a) for n, s, a in raised]}')
+    return raised
+
+
 # The face's crown, painted whole, reaches up under the back hair over the
 # skull. Front hair that does not reach the back of the head leaves it to come
 # out as skin when the head turns (Myriad paints the face under hair as plain
@@ -1958,6 +2005,7 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
     cut_garment_under_face(front, log)
     if drawn:
         cut_by_picture(front, drawn['front'][0], log, lift=True)
+        raise_hair_over_eyes(front, drawn['front'][0], log)
         # Not the pieces the import recovers on their own.
         keep = np.zeros((front.H, front.W), np.uint8)
         for mask in recovered:
