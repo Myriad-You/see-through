@@ -654,6 +654,57 @@ def raise_buried_accessories(front, picture, log):
         log(f'raised {int(part.sum())} px of {name} over the layers that covered it')
 
 
+# A decomposition redraws an ornament: a choker's star comes out smaller,
+# with a smudge for a facet. Near an ornament (RESTORE_REACH px around it) the
+# picture says what the ornament is at rest: where it differs from what the
+# other layers show there (by RESTORE_DIFFERENT, or RESTORE_DIFFERENT_DRAWN
+# where the decomposition drew the ornament), it is the ornament, taken as
+# the picture has it; where it does not, the ornament has none.
+RESTORE_LAYERS = ('headwear', 'earwear', 'neckwear')
+RESTORE_REACH = 6
+RESTORE_DIFFERENT = 40
+RESTORE_DIFFERENT_DRAWN = 15
+RESTORE_AREA = (0.5, 2.0)
+RESTORE_HOLE = 0.2
+
+
+def restore_ornaments(front, picture, log):
+    """Redraws each ornament layer as the picture shows it at rest."""
+    report = {}
+    for name in list(front.order):
+        if name.split('-')[0] not in RESTORE_LAYERS:
+            continue
+        layer = front.layers[name]
+        drawn = layer[..., 3] > 0.3
+        if drawn.sum() < 50:
+            continue
+        k = 2 * RESTORE_REACH + 1
+        near = cv2.dilate(drawn.astype(np.uint8), np.ones((k, k), np.uint8)) > 0
+        under = np.ones((front.H, front.W, 3), np.float32)
+        for other in front.order:
+            if other != name:
+                a = front.layers[other][..., 3:4]
+                under = under * (1 - a) + front.layers[other][..., :3] * a
+        differs = np.linalg.norm(picture - under, axis=-1) * 255
+        # Where the decomposition drew it, slight evidence will do (a pale gold on pale skin).
+        art = near & ((differs > RESTORE_DIFFERENT) | (drawn & (differs > RESTORE_DIFFERENT_DRAWN)))
+        art = cv2.morphologyEx(art.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)) > 0
+        # What the ornament encloses is the ornament (a highlight as pale as the skin under it).
+        n, gaps, stats, _ = cv2.connectedComponentsWithStats((~art).astype(np.uint8))
+        border = set(np.unique(np.concatenate([gaps[0], gaps[-1], gaps[:, 0], gaps[:, -1]])))
+        enclosed = [g for g in range(1, n) if g not in border and stats[g, 4] < RESTORE_HOLE * art.sum()]
+        art |= np.isin(gaps, enclosed)
+        ratio = art.sum() / drawn.sum()
+        if not RESTORE_AREA[0] <= ratio <= RESTORE_AREA[1]:
+            continue
+        layer[art, :3] = picture[art]
+        layer[art, 3] = 1.0
+        layer[near & ~art, 3] = 0.0
+        report[name] = round(float(ratio), 2)
+    log(f'ornaments redrawn from the picture {report}')
+    return report
+
+
 def fill_under_piece(front, mask, family, log):
     """Fills the hair a piece riding `family` sits on where it has a hole under the piece."""
     names = [n for n in front.order if (family_of(n) or '').split(':')[0] == family]
@@ -1155,11 +1206,60 @@ def turned_position(key, qx, qy):
 # says what is on top: where such a part is on top, the picture is far from it
 # (RGB distance over CUT_DIFFERENT) and close to what lies under it (under
 # CUT_MATCH, and nearer by CUT_GAIN), the part is cut away.
-PAINTED_OVER = ('face', 'neck', 'ears-r', 'ears-l', 'ears')
+PAINTED_OVER = ('face', 'neck', 'ears-r', 'ears-l', 'ears', 'topwear')
 CUT_DIFFERENT = 35
 CUT_MATCH = 30
 CUT_GAIN = 20
-CUT_MIN_AREA = 200
+CUT_MIN_AREA = 30
+CUT_RIM = 4
+
+
+# A decomposition redraws what it separates: a clip's star comes out soft and
+# off-colour. What shows of a layer at rest is the picture itself, so its
+# interior there (opaque, nothing over it, PICTURE_INSET px in from where
+# another layer begins, which keeps the edges' blend) takes the picture's
+# colours, where it is the same art redrawn (within PICTURE_MATCH). Other art
+# (an earring the decomposition drew as hair) is left for the import to
+# recover as its own piece, and so are the pieces found missing (`keep`).
+PICTURE_INSET = 2
+PICTURE_MATCH = 60
+
+
+def paint_from_picture(front, picture, log, keep=None):
+    """Gives each layer's interior that shows at rest the picture's colours where it is the same art."""
+    over = np.zeros((front.H, front.W), np.float32)
+    report = {}
+    for name in reversed(front.order):
+        layer = front.layers[name]
+        same = np.linalg.norm(layer[..., :3] - picture, axis=-1) * 255 < PICTURE_MATCH
+        shows = (layer[..., 3] > 0.95) & (over < 0.05) & same
+        if keep is not None:
+            shows &= ~keep
+        shows = cv2.erode(shows.astype(np.uint8), np.ones((2 * PICTURE_INSET + 1, 2 * PICTURE_INSET + 1), np.uint8)) > 0
+        if shows.any():
+            layer[shows, :3] = picture[shows]
+            report[name] = int(shows.sum())
+        over = np.maximum(over, layer[..., 3])
+    log(f'painted from the picture {sum(report.values())} px')
+    return report
+
+
+def cut_garment_under_face(front, log):
+    """
+    The garment a decomposition guesses under the chin (a collar's edge the
+    face hides at rest) comes out when the chin rises, over the neck's faded
+    top: no garment reaches up behind the face, so it goes.
+    """
+    face = front.layers.get('face')
+    if face is None or 'topwear' not in front.layers:
+        return 0
+    li = front.order.index('face')
+    if front.order.index('topwear') > li:
+        return 0
+    hidden = (face[..., 3] > 0.5) & (front.layers['topwear'][..., 3] > 0)
+    front.layers['topwear'][..., 3] *= ~hidden
+    log(f'cut the garment under the face: {int(hidden.sum())} px')
+    return int(hidden.sum())
 
 
 def cut_by_picture(front, picture, log):
@@ -1177,10 +1277,15 @@ def cut_by_picture(front, picture, log):
         now = np.linalg.norm(front.composite() - picture, axis=-1) * 255
         then = np.linalg.norm(under - picture, axis=-1) * 255
         cut = on_top & (now > CUT_DIFFERENT) & (then < CUT_MATCH) & (now - then > CUT_GAIN)
-        cut = cv2.morphologyEx(cut.astype(np.uint8), cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+        # Thin strokes too (a guessed edge under the chin): the picture shows what lies under them.
+        cut = cv2.morphologyEx(cut.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
         n, lab, stats, _ = cv2.connectedComponentsWithStats(cut)
         cut = np.isin(lab, [k for k in range(1, n) if stats[k, 4] >= CUT_MIN_AREA])
         if cut.any():
+            # The cut's rim, the two drawings blended, goes too where the picture is nearer what lies under.
+            k = 2 * CUT_RIM + 1
+            rim = (cv2.dilate(cut.astype(np.uint8), np.ones((k, k), np.uint8)) > 0) & ~cut & (front.layers[name][..., 3] > 0)
+            cut |= rim & (then < now)
             soft = cv2.GaussianBlur(cv2.dilate(cut.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(np.float32), (5, 5), 0)
             front.layers[name][..., 3] *= 1 - np.clip(soft, 0, 1)
             report[name] = int(cut.sum())
@@ -1287,6 +1392,45 @@ def cut_crown(front, keys, log):
     face[..., 3] *= 1 - cut
     log(f'cut the crown above y {hairline} and the temples: {int(cut.sum())} px')
     return int(cut.sum())
+
+
+# The light on a part changes as the head turns: a neck the raised chin no
+# longer shades is lighter, one the lowered chin shades darker. Each key of
+# such a part holds a multiply colour (as Cubism keys one): the mean colour of
+# the part where the turned picture shows it, over the mean of the part drawn
+# at that key there, relative to the same at rest.
+MULTIPLY_FAMILIES = ('neck',)
+MULTIPLY_MIN_PIXELS = 400
+MULTIPLY_RANGE = (0.6, 1.4)
+
+
+def key_multiply(front, turned, keys, front_picture, pictures, log):
+    """Sets each MULTIPLY_FAMILIES key's 'multiply' colour from the pictures."""
+    report = {}
+    front_owner = front.owner()
+    for family in MULTIPLY_FAMILIES:
+        names = [n for n in FAMILIES[family] if n in front.layers]
+        if not names or family not in keys:
+            continue
+        layer = front.family(names)
+        shows = cv2.erode(np.isin(front_owner, names).astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
+        # Hidden at rest (a high collar to the chin), the part is as the decomposition drew it.
+        at_rest = (front_picture[shows].mean(0) / np.maximum(layer[..., :3][shows].mean(0), 1e-3)
+                   if shows.sum() >= MULTIPLY_MIN_PIXELS else np.ones(3))
+        for side, t in turned.items():
+            key = keys[family].get(side)
+            if key is None or side not in pictures:
+                continue
+            drawn = remap(layer, *lattice_maps(key, front.W, front.H))
+            seen = np.isin(t.owner(), names) & (drawn[..., 3] > 0.9)
+            seen = cv2.erode(seen.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
+            if seen.sum() < MULTIPLY_MIN_PIXELS:
+                continue
+            gain = pictures[side][seen].mean(0) / np.maximum(drawn[..., :3][seen].mean(0), 1e-3) / at_rest
+            key['multiply'] = [round(float(v), 3) for v in np.clip(gain, *MULTIPLY_RANGE)]
+            report[f'{family} {side}'] = key['multiply']
+    log(f'multiply {report}')
+    return report
 
 
 def bake(front, turned, keys, log, pictures=None):
@@ -1585,6 +1729,7 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
     if pictures:
         drawn = {side: placed_illustration(path, front.W, front.H) for side, path in pictures.items()}
         raise_buried_accessories(front, drawn['front'][0], log)
+        restore_ornaments(front, drawn['front'][0], log)
     pieces = [(mask, name.startswith('earwear')) for mask, name in accessory_pieces(front)]
     clips = []
     if pictures:
@@ -1653,8 +1798,14 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
                         complete[family][side] = key
     for mask in clips:
         fill_under_piece(front, mask, 'front-hair', log)
+    cut_garment_under_face(front, log)
     if drawn:
         cut_by_picture(front, drawn['front'][0], log)
+        # Not the pieces the import recovers on their own.
+        keep = np.zeros((front.H, front.W), np.uint8)
+        for mask in recovered:
+            keep |= mask.astype(np.uint8)
+        paint_from_picture(front, drawn['front'][0], log, cv2.dilate(keep, np.ones((9, 9), np.uint8)) > 0)
     turned_pictures = {side: drawn[side][0] for side in turned if side in drawn} if drawn else None
     if turned_pictures:
         # The turned decompositions paint over alike; their pictures say what is on top there.
@@ -1682,6 +1833,7 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
                         complete[family][side] = key
                     result['picture'][side] = change
         result['baked'] = bake(front, turned, complete, log, turned_pictures)
+        key_multiply(front, turned, complete, drawn['front'][0], turned_pictures, log)
     return front, result
 
 
