@@ -1262,18 +1262,25 @@ def cut_garment_under_face(front, log):
     return int(hidden.sum())
 
 
-def cut_by_picture(front, picture, log):
-    """Cuts each of PAINTED_OVER where the picture shows what lies under it instead."""
+def cut_by_picture(front, picture, log, lift=False):
+    """
+    Cuts each of PAINTED_OVER where the picture shows what lies under it instead.
+    With `lift`, an ornament under it the picture shows on top is not uncovered
+    by a hole that would open as it moves: it goes over the part, which is
+    filled from around under it.
+    """
     report = {}
     for name in PAINTED_OVER:
         if name not in front.layers:
             continue
         on_top = front.owner() == name
         under = np.ones((front.H, front.W, 3), np.float32)
-        for other in front.order:
+        below = np.full((front.H, front.W), -1, np.int32)
+        for i, other in enumerate(front.order):
             if other != name:
                 a = front.layers[other][..., 3:4]
                 under = under * (1 - a) + front.layers[other][..., :3] * a
+                below[a[..., 0] > 0.5] = i
         now = np.linalg.norm(front.composite() - picture, axis=-1) * 255
         then = np.linalg.norm(under - picture, axis=-1) * 255
         cut = on_top & (now > CUT_DIFFERENT) & (then < CUT_MATCH) & (now - then > CUT_GAIN)
@@ -1281,6 +1288,8 @@ def cut_by_picture(front, picture, log):
         cut = cv2.morphologyEx(cut.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
         n, lab, stats, _ = cv2.connectedComponentsWithStats(cut)
         cut = np.isin(lab, [k for k in range(1, n) if stats[k, 4] >= CUT_MIN_AREA])
+        if lift and cut.any():
+            cut = lift_ornaments(front, name, cut, below, log)
         if cut.any():
             # The cut's rim, the two drawings blended, goes too where the picture is nearer what lies under.
             k = 2 * CUT_RIM + 1
@@ -1291,6 +1300,48 @@ def cut_by_picture(front, picture, log):
             report[name] = int(cut.sum())
     log(f'cut by the picture {report}')
     return report
+
+
+# An ornament the decomposition put under a part (a choker under the chest's
+# skin) shows through where the part is cut, and the hole opens as soon as the
+# ornament moves on its own key. The picture shows it on top: it goes over the
+# part, and the part is filled from around under it (LIFT_RADIUS). Where the
+# part covers it more than the picture shows it on top (LIFT_SHOWN), the
+# ornament does pass under the part (a pendant under a shirt): neither moves,
+# and the part is not cut there.
+LIFT_RADIUS = 6
+LIFT_SHOWN = 0.5
+
+
+def lift_ornaments(front, name, cut, below, log):
+    """Takes out of `cut` what uncovers an ornament, lifting the ornament over `name` where the picture says so."""
+    layer = front.layers[name]
+    for i in sorted(set(np.unique(below[cut])) - {-1}):
+        other = front.order[i]
+        if other.split('-')[0] not in RESTORE_LAYERS or i > front.order.index(name):
+            continue
+        shown = cut & (below == i)
+        cut &= ~shown
+        if shown.sum() < CUT_MIN_AREA:
+            continue
+        overlap = (front.layers[other][..., 3] > 0.5) & (layer[..., 3] > 0.5)
+        if shown.sum() < LIFT_SHOWN * overlap.sum():
+            log(f'{other} stays under {name}: the picture shows {int(shown.sum())} of {int(overlap.sum())} px on top')
+            continue
+        hidden = cv2.dilate((overlap | shown).astype(np.uint8), np.ones((2 * CUT_RIM + 1, 2 * CUT_RIM + 1), np.uint8)) > 0
+        # The part's own holes under it (where only the ornament was drawn) close too.
+        k = 4 * LIFT_RADIUS + 1
+        closed = cv2.morphologyEx(layer[..., 3], cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+        layer[..., 3] = np.where(hidden, np.maximum(layer[..., 3], closed), layer[..., 3])
+        inside = hidden & (layer[..., 3] > 0)
+        rgb = (np.clip(layer[..., :3], 0, 1) * 255).astype(np.uint8)
+        filled = cv2.inpaint(rgb, inside.astype(np.uint8), LIFT_RADIUS, cv2.INPAINT_TELEA)
+        layer[inside, :3] = filled[inside].astype(np.float32) / 255
+        cut &= ~hidden
+        front.order.remove(other)
+        front.order.insert(front.order.index(name) + 1, other)
+        log(f'lifted {other} over {name} ({int(shown.sum())} px shown on top), filled {int(inside.sum())} px under it')
+    return cut
 
 
 # The face's crown, painted whole, reaches up under the back hair over the
@@ -1800,7 +1851,7 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
         fill_under_piece(front, mask, 'front-hair', log)
     cut_garment_under_face(front, log)
     if drawn:
-        cut_by_picture(front, drawn['front'][0], log)
+        cut_by_picture(front, drawn['front'][0], log, lift=True)
         # Not the pieces the import recovers on their own.
         keep = np.zeros((front.H, front.W), np.uint8)
         for mask in recovered:
