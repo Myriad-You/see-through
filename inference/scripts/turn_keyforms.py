@@ -513,11 +513,21 @@ def missing_pieces(front, rgb, art):
         return []
     ys, xs = np.nonzero(head)
     zone = (xs.min() - 40, ys.min() - 40, xs.max() + 40, ys.max() + 40)
+    # What hangs from the hair reaches out of that (a bow with its ribbons):
+    # it is the head's too when it touches the head or the back hair above the
+    # chin and is mostly above the chin (Myriad's import mounts it so).
+    face = front.layers.get('face')
+    chin = np.nonzero(face[..., 3] > 0.5)[0].max() if face is not None and (face[..., 3] > 0.5).any() else front.H
+    held = head.copy()
+    if 'back hair' in front.layers:
+        held[:chin] |= front.layers['back hair'][:chin, :, 3] > 0.3
+    held = cv2.dilate(held.astype(np.uint8), np.ones((15, 15), np.uint8)) > 0
     n, lab, stats, cents = cv2.connectedComponentsWithStats(cv2.dilate(miss, np.ones((9, 9), np.uint8)))
     pieces = []
     for k in range(1, n):
         cx, cy = cents[k]
-        if not (zone[0] <= cx <= zone[2] and zone[1] <= cy <= zone[3]):
+        inside = zone[0] <= cx <= zone[2] and zone[1] <= cy <= zone[3]
+        if not inside and not (cy < chin and (held & (lab == k)).any()):
             continue
         mask = (lab == k) & (miss > 0)
         if mask.sum() >= MIN_MISSING_AREA:
