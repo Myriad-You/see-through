@@ -761,7 +761,12 @@ def restore_ornaments(front, picture, log):
 
 
 def fill_under_piece(front, mask, family, log):
-    """Fills the hair a piece riding `family` sits on where it has a hole under the piece."""
+    """
+    Fills the hair a piece riding `family` sits on where it has a hole under
+    the piece. Under a clip on the back hair the decomposition paints the
+    scalp's flat guess, not a hole: all of it is hidden at rest, so all of it
+    is drawn again from the hair around.
+    """
     names = [n for n in front.order if (family_of(n) or '').split(':')[0] == family]
     if not names or family not in ('front-hair', 'back-hair'):
         return 0
@@ -769,13 +774,13 @@ def fill_under_piece(front, mask, family, log):
     ring = (cv2.dilate(mask.astype(np.uint8), np.ones((15, 15), np.uint8)) > 0) & ~mask
     name = max(names, key=lambda n: (front.layers[n][..., 3][ring] > 0.5).sum())
     layer = front.layers[name]
-    hole = mask & (layer[..., 3] < 0.5)
+    hole = mask & (layer[..., 3] < 0.5) if family == 'front-hair' else mask.copy()
     if hole.sum() < 50 or (layer[..., 3][ring] > 0.5).mean() < 0.5:
         return 0
     rgb = (np.clip(layer[..., :3], 0, 1) * 255).astype(np.uint8)
     # Every transparent pixel near the piece is unknown, so only the hair itself is read.
     k = 4 * UNDER_PIECE_RADIUS + 1
-    unknown = (layer[..., 3] < 0.5) & (cv2.dilate(mask.astype(np.uint8), np.ones((k, k), np.uint8)) > 0)
+    unknown = ((layer[..., 3] < 0.5) | hole) & (cv2.dilate(mask.astype(np.uint8), np.ones((k, k), np.uint8)) > 0)
     filled = cv2.inpaint(rgb, unknown.astype(np.uint8), UNDER_PIECE_RADIUS, cv2.INPAINT_TELEA)
     layer[hole, :3] = filled[hole].astype(np.float32) / 255
     layer[hole, 3] = 1.0
@@ -1618,6 +1623,7 @@ def bake(front, turned, keys, log, pictures=None):
         hidden = (layer[..., 3] > 0.25) & (cover > 0.9)
         qy, qx = np.nonzero(hidden)
         filled = np.zeros((front.H, front.W), bool)
+        revealed = np.zeros(len(qx), bool)
         out = layer.copy()
         taken = {}
         for side, t in turned.items():
@@ -1633,6 +1639,7 @@ def bake(front, turned, keys, log, pictures=None):
                 # the scalp there: whatever hair the turn has on top.
                 names = names + ['front hair']
                 exposed = keyed_alpha(front, front.order[li + 1:], keys, side)[iy, ix] < 0.5
+                revealed |= exposed
                 mine |= exposed & np.isin(owners[side][iy, ix], names)
             mine &= ~filled[qy, qx]
             src = t.family(names)
@@ -1650,6 +1657,20 @@ def bake(front, turned, keys, log, pictures=None):
             taken[side] = int(use.sum())
         weight = cv2.GaussianBlur(filled.astype(np.float32), (7, 7), 0) * filled
         layer[..., :3] = layer[..., :3] * (1 - weight[..., None]) + out[..., :3] * weight[..., None]
+        if family == 'back-hair':
+            # What a turn shows of the scalp that no turned drawing has as hair (a
+            # clip or a lock on top there) keeps the decomposition's flat guess, a
+            # patch duller than the hair: it is drawn from the hair around instead.
+            guess = np.zeros((front.H, front.W), bool)
+            guess[qy[revealed], qx[revealed]] = True
+            guess &= ~filled
+            if guess.sum() >= MIN_MISSING_AREA:
+                rgb = (np.clip(layer[..., :3], 0, 1) * 255).astype(np.uint8)
+                # Only hair that shows at rest or was taken from a turn is read.
+                unknown = ((hidden & ~filled) | (layer[..., 3] < 0.25)).astype(np.uint8)
+                drawn = cv2.inpaint(rgb, unknown, UNDER_PIECE_RADIUS, cv2.INPAINT_TELEA)
+                layer[guess, :3] = drawn[guess].astype(np.float32) / 255
+                taken['drawn'] = int(guess.sum())
         report[name] = dict(hidden=int(hidden.sum()), **taken)
     log(f'baked {report}')
     return report
@@ -1956,10 +1977,11 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
     if pieces:
         pieces, hosts = group_pieces(front, pieces)
         log(f'accessory hosts {hosts}')
-        # A clip on the front hair (not what hangs in front of the back hair: an
-        # openwork earring shows what is behind it, which a fill would change) has
-        # the hair under it filled, once the front hair is cut into locks.
-        clips = [mask for (mask, _), host in zip(pieces, hosts) if host == 'front-hair']
+        # A clip on the hair (not an earring hanging in front of the back hair: an
+        # openwork one shows what is behind it, which a fill would change) has the
+        # hair under it filled, once the front hair is cut into locks.
+        clips = [(mask, host) for (mask, earring), host in zip(pieces, hosts)
+                 if host == 'front-hair' or (host == 'back-hair' and earring is False)]
     if pieces:
         for side, t in turned.items():
             turned_rgb = drawn[side][0] if side in drawn else t.composite()
@@ -2010,8 +2032,8 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
                         log(line)
                     for family, key in moved.items():
                         complete[family][side] = key
-    for mask in clips:
-        fill_under_piece(front, mask, 'front-hair', log)
+    for mask, host in clips:
+        fill_under_piece(front, mask, host, log)
     cut_garment_under_face(front, log)
     if drawn:
         cut_by_picture(front, drawn['front'][0], log, lift=True)
