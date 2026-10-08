@@ -455,6 +455,29 @@ def fit_family(front, turned, names, family, log):
 
 # ---------------------------------------------------------------- accessories
 
+def picture_distance(rgb, picture):
+    """Per pixel, how far a drawing is from the picture (RGB distance, 0..441)."""
+    return np.linalg.norm(rgb - picture, axis=-1) * 255
+
+
+def composite_of(front, names):
+    """
+    The given layers drawn back to front over white: RGB, which of them is on
+    top (its index in front.order, -1 where none), and their alpha together.
+    """
+    names = set(names)
+    rgb = np.ones((front.H, front.W, 3), np.float32)
+    top = np.full((front.H, front.W), -1, np.int32)
+    alpha = np.zeros((front.H, front.W), np.float32)
+    for i, name in enumerate(front.order):
+        if name in names:
+            a = front.layers[name][..., 3:4]
+            rgb = rgb * (1 - a) + front.layers[name][..., :3] * a
+            top[a[..., 0] > 0.5] = i
+            alpha = np.maximum(alpha, a[..., 0])
+    return rgb, top, alpha
+
+
 # The importer's own thresholds (Myriad psdReconciliation): art is this far
 # (RGB distance) from a flat background; a layer showing art this far from the
 # illustration's holds different art; pieces smaller than this are fringe.
@@ -680,8 +703,8 @@ def raise_buried_accessories(front, picture, log):
         if name.split('-')[0] not in ACCESSORIES:
             continue
         layer = front.layers[name]
-        own = np.linalg.norm(layer[..., :3] - picture, axis=-1) * 255 < BURIED_MATCH
-        off = np.linalg.norm(composite - picture, axis=-1) * 255 > MISMATCH_DISTANCE
+        own = picture_distance(layer[..., :3], picture) < BURIED_MATCH
+        off = picture_distance(composite, picture) > MISMATCH_DISTANCE
         buried = (layer[..., 3] > 0.5) & (owner != name) & own & off
         buried = cv2.morphologyEx(buried.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
         n, lab, stats, _ = cv2.connectedComponentsWithStats(cv2.dilate(buried, np.ones((9, 9), np.uint8)))
@@ -735,12 +758,8 @@ def restore_ornaments(front, picture, log):
             continue
         k = 2 * RESTORE_REACH + 1
         near = cv2.dilate(drawn.astype(np.uint8), np.ones((k, k), np.uint8)) > 0
-        under = np.ones((front.H, front.W, 3), np.float32)
-        for other in front.order:
-            if other != name:
-                a = front.layers[other][..., 3:4]
-                under = under * (1 - a) + front.layers[other][..., :3] * a
-        differs = np.linalg.norm(picture - under, axis=-1) * 255
+        under, _, _ = composite_of(front, [n for n in front.order if n != name])
+        differs = picture_distance(under, picture)
         # Where the decomposition drew it, slight evidence will do (a pale gold on pale skin).
         art = near & ((differs > RESTORE_DIFFERENT) | (drawn & (differs > RESTORE_DIFFERENT_DRAWN)))
         art = cv2.morphologyEx(art.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)) > 0
@@ -1303,7 +1322,7 @@ def paint_from_picture(front, picture, log, keep=None):
     report = {}
     for name in reversed(front.order):
         layer = front.layers[name]
-        same = np.linalg.norm(layer[..., :3] - picture, axis=-1) * 255 < PICTURE_MATCH
+        same = picture_distance(layer[..., :3], picture) < PICTURE_MATCH
         shows = (layer[..., 3] > 0.95) & (over < 0.05) & same
         if keep is not None:
             shows &= ~keep
@@ -1346,15 +1365,9 @@ def cut_by_picture(front, picture, log, lift=False):
         if name not in front.layers:
             continue
         on_top = front.owner() == name
-        under = np.ones((front.H, front.W, 3), np.float32)
-        below = np.full((front.H, front.W), -1, np.int32)
-        for i, other in enumerate(front.order):
-            if other != name:
-                a = front.layers[other][..., 3:4]
-                under = under * (1 - a) + front.layers[other][..., :3] * a
-                below[a[..., 0] > 0.5] = i
-        now = np.linalg.norm(front.composite() - picture, axis=-1) * 255
-        then = np.linalg.norm(under - picture, axis=-1) * 255
+        under, below, _ = composite_of(front, [n for n in front.order if n != name])
+        now = picture_distance(front.composite(), picture)
+        then = picture_distance(under, picture)
         cut = on_top & (now > CUT_DIFFERENT) & (then < CUT_MATCH) & (now - then > CUT_GAIN)
         # Thin strokes too (a guessed edge under the chin): the picture shows what lies under them.
         cut = cv2.morphologyEx(cut.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
@@ -1432,12 +1445,7 @@ def raise_hair_over_eyes(front, picture, log):
     locks = [n for n in front.order if n == 'front hair' or LOCK_LAYER.match(n)]
     if not eyes or not locks:
         return []
-    eye_rgb = np.ones((front.H, front.W, 3), np.float32)
-    eye_a = np.zeros((front.H, front.W), np.float32)
-    for n in eyes:
-        a = front.layers[n][..., 3:4]
-        eye_rgb = eye_rgb * (1 - a) + front.layers[n][..., :3] * a
-        eye_a = np.maximum(eye_a, a[..., 0])
+    eye_rgb, _, eye_a = composite_of(front, eyes)
     top = max(front.order.index(n) for n in eyes)
     raised = []
     for name in locks:
@@ -1447,8 +1455,8 @@ def raise_hair_over_eyes(front, picture, log):
         overlap = (lock[..., 3] > 0.5) & (eye_a > 0.5)
         if overlap.sum() < MIN_MISSING_AREA:
             continue
-        to_lock = np.linalg.norm(lock[..., :3] - picture, axis=-1)[overlap] * 255
-        to_eyes = np.linalg.norm(eye_rgb - picture, axis=-1)[overlap] * 255
+        to_lock = picture_distance(lock[..., :3], picture)[overlap]
+        to_eyes = picture_distance(eye_rgb, picture)[overlap]
         shown = float((to_lock + HAIR_OVER_EYES_MARGIN < to_eyes).mean())
         if shown >= HAIR_OVER_EYES:
             raised.append((name, shown, int(overlap.sum())))
@@ -1645,7 +1653,7 @@ def bake(front, turned, keys, log, pictures=None):
             src = t.family(names)
             if pictures and side in pictures:
                 # The picture where the decomposition's part is what it shows (not other art it took in).
-                agrees = np.linalg.norm(src[..., :3] - pictures[side], axis=-1) * 255 < BURIED_MATCH
+                agrees = picture_distance(src[..., :3], pictures[side]) < BURIED_MATCH
                 src = np.concatenate([np.where(agrees[..., None], pictures[side], src[..., :3]), src[..., 3:4]], 2)
             x0 = np.clip(np.floor(tx).astype(int), 0, front.W - 2); y0 = np.clip(np.floor(ty).astype(int), 0, front.H - 2)
             fx = np.clip(tx - x0, 0, 1)[:, None]; fy = np.clip(ty - y0, 0, 1)[:, None]
