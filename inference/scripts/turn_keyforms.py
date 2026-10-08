@@ -1895,6 +1895,53 @@ def check_decomposition(path):
                 face_spread=round(spread, 3))
 
 
+# ---------------------------------------------------------------- checking a turned picture
+
+# A generated turn can redraw the character (the bangs restyled, a clip moved,
+# the framing changed) where keys of the front drawing cannot follow. How far
+# a smooth warp of the front picture explains it says so before anything is
+# decomposed: the front picture warped onto it by optical flow smoothed over
+# REFERENCE_SMOOTH px, outline distance over the head. A redraw left vs right
+# or up vs down is the same work, so a picture REFERENCE_RATIO times as far as
+# its opposite, by REFERENCE_MARGIN px at least, is a bad draw worth drawing
+# again (measured: the bad one 4.30 vs 2.09; good pairs within 1.6x).
+REFERENCE_SMOOTH = 24
+REFERENCE_RATIO = 1.6
+REFERENCE_MARGIN = 1.0
+OPPOSITE = {'plus': 'minus', 'minus': 'plus', 'up': 'down', 'down': 'up'}
+
+
+def reference_residual(front, front_picture, picture):
+    """How far the front picture, smoothly warped, stays from a turned one over the head."""
+    head = np.zeros((front.H, front.W), bool)
+    for name in front.order:
+        family = family_of(name)
+        if family and family not in ('neck', 'neckwear', 'topwear'):
+            head |= front.layers[name][..., 3] > 0.3
+    ys, xs = np.nonzero(head)
+    region = np.zeros_like(head)
+    region[max(0, ys.min() - 60):ys.max() + 60, max(0, xs.min() - 60):xs.max() + 60] = True
+    flow, _ = picture_flow(front_picture, picture)
+    flow = cv2.GaussianBlur(flow, (0, 0), REFERENCE_SMOOTH)
+    yy, xx = np.mgrid[0:front.H, 0:front.W].astype(np.float32)
+    warped = cv2.remap(front_picture, xx + flow[..., 0], yy + flow[..., 1], cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    return edge_distance(warped, picture, region)
+
+
+def check_turned_pictures(front_path, picture_paths):
+    """
+    picture_paths: 'front' and the sides -> the drawings. Each side's residual
+    and the sides drawn badly enough to draw again: {residual: {side: px}, bad: [side]}.
+    """
+    front = Decomposition(front_path)
+    front_picture = placed_illustration(picture_paths['front'], front.W, front.H)[0]
+    residual = {side: round(reference_residual(front, front_picture, placed_illustration(path, front.W, front.H)[0]), 2)
+                for side, path in picture_paths.items() if side != 'front'}
+    bad = [side for side, r in residual.items() if OPPOSITE[side] in residual
+           and r >= REFERENCE_RATIO * residual[OPPOSITE[side]] and r - residual[OPPOSITE[side]] >= REFERENCE_MARGIN]
+    return dict(residual=residual, bad=bad)
+
+
 def host_report():
     """What the machine offers the fit: the host's CPUs, this process's, the container's quota."""
     try:

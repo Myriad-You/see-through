@@ -282,6 +282,22 @@ def check(psd):
     return turn_keyforms.check_decomposition(psd if isinstance(psd, str) else psd.name)
 
 
+def check_turns(front_psd, front_png, right_png, left_png, up_png, down_png):
+    """
+    Whether the turned drawings can be keyed from the front one
+    (turn_keyforms.check_turned_pictures): {residual: {side: px}, bad: [side]}.
+    A caller draws a bad one again before decomposing it. CPU only.
+    """
+    import turn_keyforms
+
+    files = [front_psd, front_png, right_png, left_png, up_png, down_png]
+    if any(f is None for f in files):
+        raise gr.Error("The front PSD and all five pictures are needed.")
+    path = lambda f: f if isinstance(f, str) else f.name
+    return turn_keyforms.check_turned_pictures(path(front_psd), dict(
+        front=path(front_png), plus=path(right_png), minus=path(left_png), up=path(up_png), down=path(down_png)))
+
+
 def keyforms(front_psd, right_psd, left_psd, up_psd, down_psd,
              front_png=None, right_png=None, left_png=None, up_png=None, down_png=None):
     """
@@ -471,6 +487,14 @@ with gr.Blocks(title="See-through: Layer Decomposition") as demo:
             check_json = gr.JSON(label="Check")
         check_btn = gr.Button("Check")
         check_btn.click(fn=check, inputs=[check_psd], outputs=[check_json], api_name="check")
+        turns_json = gr.JSON(label="Turned pictures")
+        turns_btn = gr.Button("Check the turned pictures (front PSD and pictures above)")
+        turns_btn.click(
+            fn=check_turns,
+            inputs=[key_front, pic_front, pic_right, pic_left, pic_up, pic_down],
+            outputs=[turns_json],
+            api_name="check_turns",
+        )
 
 if __name__ == "__main__":
     demo.launch()
