@@ -1887,6 +1887,19 @@ def check_decomposition(path):
                 face_spread=round(spread, 3))
 
 
+def host_report():
+    """What the machine offers the fit: the host's CPUs, this process's, the container's quota."""
+    try:
+        affinity = len(os.sched_getaffinity(0))
+    except AttributeError:
+        affinity = None
+    try:
+        quota = open('/sys/fs/cgroup/cpu.max').read().strip()
+    except OSError:
+        quota = None
+    return dict(cpu_count=os.cpu_count(), affinity=affinity, cpu_max=quota)
+
+
 def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
     """
     Keys and baked front decomposition. turned_paths: {'plus','minus','up','down'}
@@ -1897,6 +1910,8 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
     for side, t in turned.items():
         if (t.W, t.H) != (front.W, front.H):
             raise ValueError(f'{side}: canvas {t.W}x{t.H} is not the front canvas {front.W}x{front.H}')
+    started = time.time()
+    seconds = {}
     spreads = {side: face_spread(d) for side, d in [('front', front), *turned.items()]}
     log(f'face spread {({side: None if v is None else round(v, 2) for side, v in spreads.items()})}')
     keys = {}
@@ -1910,6 +1925,7 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
                 log(f'{side:5s} {line}')
             for family, fit in fits.items():
                 keys.setdefault(family, {})[side] = fit
+    seconds['directions'] = round(time.time() - started)
     # Big headwear is a part of its own: where its decomposition failed it, it starts from the head's move.
     if big_headwear(front) and 'face' in keys:
         ys, xs = np.nonzero(front.layers['headwear'][..., 3] > 0.3)
@@ -2032,6 +2048,7 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
                         log(line)
                     for family, key in moved.items():
                         complete[family][side] = key
+    seconds['locks'] = round(time.time() - started)
     for mask, host in clips:
         fill_under_piece(front, mask, host, log)
     cut_garment_under_face(front, log)
@@ -2050,7 +2067,10 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
             cut_by_picture(turned[side], picture, lambda line, side=side: log(f'{side:5s} {line}'))
     cut_crown(front, complete, log)
     baked = bake(front, turned, complete, log, turned_pictures)
-    result = dict(canvas=[front.W, front.H], keyforms=complete, fit=report, baked=baked, locks=locks)
+    seconds['baked'] = round(time.time() - started)
+    # How the time went, to size the work to the machine it runs on.
+    result = dict(canvas=[front.W, front.H], keyforms=complete, fit=report, baked=baked, locks=locks,
+                  host=dict(host_report(), seconds=seconds))
     if drawn:
         # Drawn together with what they uncover, as the runtime draws them, the
         # keys move to where the pictures have the parts; then what they
@@ -2071,6 +2091,7 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
                     result['picture'][side] = change
         result['baked'] = bake(front, turned, complete, log, turned_pictures)
         key_multiply(front, turned, complete, drawn['front'][0], turned_pictures, log)
+    seconds['total'] = round(time.time() - started)
     return front, result
 
 
