@@ -42,29 +42,6 @@ from psd_tools import PSDImage
 
 SIDES = ('plus', 'minus', 'up', 'down')
 
-
-def available_cpus():
-    """
-    The CPUs this process may use: a container's quota (cgroup cpu.max) and
-    affinity, not the host's count (which oversubscribes a 2-CPU Space many
-    times over).
-    """
-    try:
-        n = len(os.sched_getaffinity(0))
-    except AttributeError:
-        n = os.cpu_count() or 1
-    try:
-        quota, period = open('/sys/fs/cgroup/cpu.max').read().split()
-        if quota != 'max':
-            n = min(n, max(1, int(int(quota) / int(period))))
-    except (OSError, ValueError):
-        pass
-    return max(1, n)
-
-
-def _limit_threads(threads):
-    cv2.setNumThreads(threads)
-
 # Myriad part families by See-through layer name. A See-through "-r" part is
 # the character's right, drawn on the image's left: Myriad's side "L".
 FAMILIES = {
@@ -1939,13 +1916,8 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
     log(f'face spread {({side: None if v is None else round(v, 2) for side, v in spreads.items()})}')
     keys = {}
     # The four directions fit apart, one process each where the machine has them.
-    cpus = available_cpus()
-    workers = max(1, min(len(turned_paths), cpus))
-    cv2.setNumThreads(cpus)
-    # Each process takes its share of the CPUs, its OpenCV threads too.
-    pool_args = dict(max_workers=workers, initializer=_limit_threads, initargs=(max(1, cpus // workers),))
-    log(f'{cpus} CPUs, {workers} processes')
-    with ProcessPoolExecutor(**pool_args) as pool:
+    workers = max(1, min(len(turned_paths), (os.cpu_count() or 1)))
+    with ProcessPoolExecutor(max_workers=workers) as pool:
         jobs = {side: pool.submit(_fit_direction, front_path, path) for side, path in turned_paths.items()}
         for side, job in jobs.items():
             fits, lines = job.result()
@@ -2066,7 +2038,7 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
         with tempfile.TemporaryDirectory() as tmp:
             split_path = os.path.join(tmp, 'split.psd')
             save_psd(front, split_path)
-            with ProcessPoolExecutor(**pool_args) as pool:
+            with ProcessPoolExecutor(max_workers=workers) as pool:
                 jobs = {side: pool.submit(_fit_locks_direction, split_path, complete, side, path,
                                           pictures.get(side) if pictures else None)
                         for side, path in turned_paths.items()}
@@ -2106,7 +2078,7 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
         with tempfile.TemporaryDirectory() as tmp:
             baked_path = os.path.join(tmp, 'baked.psd')
             save_psd(front, baked_path)
-            with ProcessPoolExecutor(**pool_args) as pool:
+            with ProcessPoolExecutor(max_workers=workers) as pool:
                 jobs = {side: pool.submit(_refine_direction, baked_path, complete, side, pictures['front'], pictures[side], recovered, own)
                         for side in turned if side in pictures}
                 result['picture'] = {}
