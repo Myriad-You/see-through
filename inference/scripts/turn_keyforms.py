@@ -46,6 +46,15 @@ SIDES = ('plus', 'minus', 'up', 'down')
 # the character's right, drawn on the image's left: Myriad's side "L".
 FAMILIES = {
     'face': ['face'],
+    # The iris moves inside the white as the head turns: an eye kept on the
+    # viewer sits toward the far corner, which one lattice over the whole eye
+    # cannot draw (it squeezes the iris against the near corner instead). The
+    # iris has a key of its own; the eye's is fitted on the whole eye, iris
+    # too, as a decomposition can split white and iris badly in one turn
+    # (white and lashes alone then fit at IoU 0.37 where the whole eye does 0.88).
+    # Listed first, an iris layer turns by its own key (family_of).
+    'iris:L': ['irides-r'],
+    'iris:R': ['irides-l'],
     'eye:L': ['eyewhite-r', 'irides-r', 'eyelash-r'],
     'eye:R': ['eyewhite-l', 'irides-l', 'eyelash-l'],
     'brow:L': ['eyebrow-r'],
@@ -75,6 +84,13 @@ BIG_HEADWEAR_RATIO = (0.5, 2.0)
 # starts from the head's own move (the face key's affine part, over the
 # headwear's box and HEAD_KEY_PAD around it) and is fitted on the pictures.
 BIG_HEADWEAR_IOU = 0.8
+# An iris fitted under IRIS_FIT_IOU (0.98-0.99 on every set so far) rides its
+# eye: the eye's key, refined on the whole eye. So does one whose eye fits
+# under EYE_SPLIT_IOU (0.94-0.98 on clean turns), the turned decomposition
+# having split white and iris wrong: the white then rests on the iris's
+# place in the picture (0.86-0.88 where a turn dropped half the white).
+IRIS_FIT_IOU = 0.9
+EYE_SPLIT_IOU = 0.9
 HEAD_KEY_PAD = 60
 
 
@@ -987,6 +1003,20 @@ def refit_lattice(key, px, py, target):
     return dict(key, back=[float(v) for v in out.reshape(-1)])
 
 
+def riding_iris(keys, family, side):
+    """The iris family that rides `family` (an eye) at `side` with the eye's own key, else None."""
+    if not family.startswith('eye:'):
+        return None
+    iris = 'iris:' + family[4:]
+    return iris if keys.get(iris, {}).get(side, {}).get('rides') == 'eye' else None
+
+
+def members_of(keys, family, side):
+    """The families whose drawings a key is refined on: an eye's takes in an iris riding it."""
+    iris = riding_iris(keys, family, side)
+    return (family, iris) if iris else (family,)
+
+
 def refine_on_picture(front, keys, side, picture, extra, log, own=()):
     """
     Moves each keyed part toward where the turned picture has it. extra:
@@ -1017,7 +1047,9 @@ def refine_on_picture(front, keys, side, picture, extra, log, own=()):
         for family in {f for _, f, _ in layers if f and f in keys and side in keys[f]}:
             if family in ACCESSORIES and family not in own:
                 continue
-            mine = np.array([i for i, (_, f, _) in enumerate(layers) if f == family])
+            if keys[family][side].get('rides'):
+                continue
+            mine = np.array([i for i, (_, f, _) in enumerate(layers) if f in members_of(keys, family, side)])
             sel = ok & np.isin(shown, mine)
             if sel.sum() < 200:
                 continue
@@ -1032,16 +1064,22 @@ def refine_on_picture(front, keys, side, picture, extra, log, own=()):
             if inside.sum() < 200:
                 continue
             trial[family] = dict(keys[family], **{side: refit_lattice(key, px[inside], py[inside], target[inside])})
+            iris = riding_iris(keys, family, side)
+            if iris:
+                trial[iris] = dict(keys[iris], **{side: dict(trial[family][side], rides='eye')})
         new_rgb, new_top = render_keys(layers, trial, side, W, H)
         # Each part keeps its change only if its own outline draws closer.
         accepted = []
-        for family in [f for f in trial if trial[f] is not keys[f]]:
-            mine = np.array([i for i, (_, f, _) in enumerate(layers) if f == family])
+        for family in [f for f in trial if trial[f] is not keys[f] and not trial[f][side].get('rides')]:
+            iris = riding_iris(keys, family, side)
+            mine = np.array([i for i, (_, f, _) in enumerate(layers) if f in members_of(keys, family, side)])
             near = cv2.dilate((np.isin(top, mine) | np.isin(new_top, mine)).astype(np.uint8), np.ones((9, 9), np.uint8)) > 0
             old_d = edge_distance(rgb, picture, region & near)
             new_d = edge_distance(new_rgb, picture, region & near)
             if new_d < old_d - 0.02:
                 keys[family] = trial[family]
+                if iris:
+                    keys[iris] = trial[iris]
                 accepted.append(f'{family} {old_d:.2f}->{new_d:.2f}')
         if not accepted:
             break
@@ -1804,6 +1842,15 @@ def _fit_direction(front_path, turned_path):
                 fit = dict(key, fit=None)
         if fit:
             fits[family] = fit
+    for side in ('L', 'R'):
+        iris, eye = fits.get(f'iris:{side}'), fits.get(f'eye:{side}')
+        if not eye:
+            continue
+        if iris and iris['fit']['iou'] >= IRIS_FIT_IOU and eye['fit']['iou'] >= EYE_SPLIT_IOU:
+            continue
+        if iris:
+            lines.append(f'iris:{side}      IoU {iris["fit"]["iou"]:.2f}, eye {eye["fit"]["iou"]:.2f}: it rides the eye')
+        fits[f'iris:{side}'] = dict(eye, rides='eye')
     front_area, turned_area = big_headwear(front), big_headwear(turned)
     if front_area and turned_area and BIG_HEADWEAR_RATIO[0] <= turned_area / front_area <= BIG_HEADWEAR_RATIO[1]:
         fit = fit_family(front, turned, ['headwear'], 'headwear', lines.append)
@@ -2146,6 +2193,10 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
                     result['picture'][side] = change
         result['baked'] = bake(front, turned, complete, log, turned_pictures)
         key_multiply(front, turned, complete, drawn['front'][0], turned_pictures, log)
+    # An iris riding its eye carries the eye's key as its own.
+    for sides in complete.values():
+        for lattice in sides.values():
+            lattice.pop('rides', None)
     seconds['total'] = round(time.time() - started)
     return front, result
 
