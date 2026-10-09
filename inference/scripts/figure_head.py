@@ -1,46 +1,31 @@
 """
-A standing figure's head, decomposed again as a bust is framed.
+A standing figure's head, keyed as a bust.
 
-Decomposed whole, a full figure's head is a couple of hundred pixels tall: the
-body pass finds its hair, neck and choker at that size, and the head pass's
-parts are drawn back at it too. A choker comes out a blurred band, an earring
-darkened, clips sunk under the bangs. Cut out at a bust's framing and
-decomposed again, the head comes out as a bust's does; its parts go back into
-the whole figure's canvas, scaled down, and the body's parts stay the whole
-decomposition's.
+Decomposed whole, a full figure's head is a couple of hundred pixels tall, too
+small to fit turn keys well. head_crop frames the head as a bust is framed;
+that crop is drawn turned, decomposed and keyed as a bust (turn_keyforms), and
+place_keys puts the keys back onto the figure's canvas, where they move the
+figure's own head parts. The figure keeps its own decomposition at rest:
+merging the head decomposition's parts in instead was tried and lost what
+only the figure's had (a pendant), and gained nothing at rest.
 
-    python figure_head.py image.png full.psd head.psd out.psd    (merge only;
-    the head crop to decompose is head_crop(full.psd, image))
+    python figure_head.py image.png figure.psd keyforms.json out.json   (box from head_crop)
 """
 import sys
 
-import cv2
 import numpy as np
 from PIL import Image
 
-from turn_keyforms import Decomposition, save_psd
 
-# What the head decomposition gives: See-through's layer names, by the part
-# before any '-l'/'-r'/'-N' suffix.
-HEAD_PARTS = ('face', 'eyewhite', 'irides', 'eyelash', 'eyebrow', 'eyewear', 'nose', 'mouth',
-              'ears', 'earwear', 'headwear', 'front hair', 'back hair', 'neck', 'neckwear')
 # A bust's framing (contract: close full head through lower chest, 3:4): the
 # crown at the top, the chin at BUST_CHIN of the height (0.47-0.52 on six
 # generated busts), the face's middle at the middle.
 BUST_CHIN = 0.49
 BUST_TOP = 0.015
 BUST_ASPECT = 0.75
-# Inside the crop the head's parts are the head decomposition's; they fade to
-# the whole decomposition's over this many canvas pixels at its edge (long
-# hair running past the crop).
-FEATHER = 6
 # Not worth a second decomposition: a head this big already (canvas px, crown
 # to chin) is a bust's.
 HEAD_ENOUGH = 520
-
-
-def is_head_part(name):
-    return name.split('-')[0] in HEAD_PARTS
 
 
 def placement(src_hw, canvas_hw):
@@ -97,29 +82,6 @@ def crop_image(image, box, size=BUST_PIXELS):
     return out.resize(size, Image.LANCZOS)
 
 
-def _scaled(layer, factor, out_hw, offset):
-    """A canvas layer scaled by `factor` and moved by `offset` onto out_hw, premultiplied so edges do not darken."""
-    h, w = layer.shape[:2]
-    pre = layer.copy()
-    pre[..., :3] *= pre[..., 3:4]
-    size = (max(1, int(round(w * factor))), max(1, int(round(h * factor))))
-    small = cv2.resize(pre, size, interpolation=cv2.INTER_AREA if factor < 1 else cv2.INTER_LINEAR)
-    out = np.zeros(out_hw + (4,), np.float32)
-    dx, dy = int(round(offset[0])), int(round(offset[1]))
-    y0, x0 = max(0, dy), max(0, dx)
-    y1, x1 = min(out_hw[0], dy + small.shape[0]), min(out_hw[1], dx + small.shape[1])
-    if y1 > y0 and x1 > x0:
-        out[y0:y1, x0:x1] = small[y0 - dy:y1 - dy, x0 - dx:x1 - dx]
-    return out
-
-
-def _unpremultiply(pre):
-    out = pre.copy()
-    a = out[..., 3:4]
-    out[..., :3] = np.where(a > 1e-4, out[..., :3] / np.maximum(a, 1e-4), 0)
-    return np.clip(out, 0, 1)
-
-
 def head_to_full(full, head, box, image_hw, head_hw=BUST_PIXELS[::-1]):
     """
     The head canvas onto the whole canvas: p_full = p_head * factor + offset.
@@ -133,48 +95,6 @@ def head_to_full(full, head, box, image_hw, head_hw=BUST_PIXELS[::-1]):
     to_image = (x1 - x0) / head_hw[1]
     factor = fs * to_image / hs
     return factor, (fx + fs * (x0 - hx * to_image / hs), fy + fs * (y0 - hy * to_image / hs))
-
-
-def merge(full, head, box, image_hw, head_hw=BUST_PIXELS[::-1]):
-    """The whole decomposition with its head parts the head decomposition's (box, head_hw: head_to_full)."""
-    x0, y0, x1, y1 = box
-    fs, fx, fy = placement(image_hw, (full.H, full.W))
-    factor, offset = head_to_full(full, head, box, image_hw, head_hw)
-    # Where the crop lies on the whole canvas, and how much of each pixel the head decomposition owns there.
-    rx0, ry0 = fx + fs * x0, fy + fs * y0
-    rx1, ry1 = fx + fs * x1, fy + fs * y1
-    yy, xx = np.mgrid[0:full.H, 0:full.W].astype(np.float32)
-    ih, iw = image_hw
-    # A side of the crop at the image's own edge is no seam: nothing lies past it.
-    far = np.float32(1e6)
-    sides = [xx - rx0 if x0 > 0 else far + 0 * xx, rx1 - 1 - xx if x1 < iw else far + 0 * xx,
-             yy - ry0 if y0 > 0 else far + 0 * yy, ry1 - 1 - yy if y1 < ih else far + 0 * yy]
-    inside = np.minimum.reduce(sides)
-    # Outside the crop (past an image edge too) the head decomposition has nothing.
-    inside = np.where((xx >= rx0 - 0.5) & (xx <= rx1 - 0.5) & (yy >= ry0 - 0.5) & (yy <= ry1 - 0.5), inside, -1)
-    weight = np.clip(inside / FEATHER, 0, 1)[..., None]
-
-    taken = [name for name in head.order if is_head_part(name)]
-    out = Decomposition.__new__(Decomposition)
-    out.psd, out.W, out.H = None, full.W, full.H
-    out.layers = dict(full.layers)
-    # A part the head decomposition draws in other layers (the front hair cut
-    # into locks) keeps the whole decomposition's drawing of it only outside the crop.
-    bases = {name.split('-')[0] for name in taken}
-    for name in full.order:
-        if name.split('-')[0] in bases and name not in taken:
-            outside = full.layers[name].copy()
-            outside[..., 3:4] *= 1 - weight
-            out.layers[name] = outside
-    for name in taken:
-        mine = _scaled(head.layers[name], factor, (full.H, full.W), offset) * weight
-        if name in full.layers:
-            theirs = full.layers[name].copy()
-            theirs[..., :3] *= theirs[..., 3:4]
-            mine = mine + theirs * (1 - weight)
-        out.layers[name] = _unpremultiply(mine)
-    out.order = merged_order(full.order, head.order, set(taken))
-    return out
 
 
 def place_keys(keys, full, factor, offset):
@@ -194,31 +114,29 @@ def place_keys(keys, full, factor, offset):
     return out
 
 
-def merged_order(full_order, head_order, taken):
-    """
-    The whole decomposition's order, with the head parts it has put in its
-    head parts' places in the head decomposition's order among themselves,
-    and those only the head decomposition has put after their predecessor there.
-    """
-    slots = [i for i, name in enumerate(full_order) if name in taken]
-    ordered = [name for name in head_order if name in taken and name in full_order]
-    out = list(full_order)
-    for i, name in zip(slots, ordered):
-        out[i] = name
-    for name in head_order:
-        if name not in taken or name in out:
-            continue
-        before = [n for n in head_order[:head_order.index(name)] if n in out]
-        out.insert(out.index(before[-1]) + 1 if before else (slots[0] if slots else len(out)), name)
-    return out
+class _Canvas:
+    """A decomposition's canvas size, all head_to_full and place_keys need of it."""
+    def __init__(self, W, H):
+        self.W, self.H = W, H
+
+
+def figure_keys(keys, figure_hw, box, image_hw, head_hw=BUST_PIXELS[::-1]):
+    """The head's keys (canvas in keys['canvas']) on a figure canvas of figure_hw (h, w)."""
+    figure = _Canvas(figure_hw[1], figure_hw[0])
+    head = _Canvas(*keys['canvas'])
+    factor, offset = head_to_full(figure, head, box, image_hw, head_hw)
+    return place_keys(keys, figure, factor, offset)
 
 
 if __name__ == '__main__':
-    image_path, full_path, head_path, out_path = sys.argv[1:5]
-    image = Image.open(image_path).convert('RGB')
-    full = Decomposition(full_path)
-    box = [int(v) for v in sys.argv[5].split(',')] if len(sys.argv) > 5 else head_crop(full, (image.height, image.width))
+    import json
+    from turn_keyforms import Decomposition
+    image_path, figure_path, keys_path, out_path = sys.argv[1:5]
+    image = Image.open(image_path)
+    figure = Decomposition(figure_path)
+    box = head_crop(figure, (image.height, image.width))
     print('box', box)
-    merged = merge(full, Decomposition(head_path), box, (image.height, image.width))
-    save_psd(merged, out_path)
-    print('order', merged.order)
+    with open(keys_path) as f:
+        keys = figure_keys(json.load(f), (figure.H, figure.W), box, (image.height, image.width))
+    with open(out_path, 'w') as f:
+        json.dump(keys, f)
