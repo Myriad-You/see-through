@@ -28,8 +28,10 @@ Run as a process of its own (it sets turn_keyforms' part tables):
     python body_turn.py figure.psd right.psd left.psd right.png left.png H W out.json
 """
 import json
+import multiprocessing
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor
 
 import cv2
 import numpy as np
@@ -135,6 +137,20 @@ def fit_side(figure, turned, picture, log):
     return {family: key['side'] for family, key in keys.items()}
 
 
+def fit_turned(figure_path, psd, png):
+    """One turned drawing fitted, in a process of its own: (keys, log lines)."""
+    use_body_tables()
+    figure = split_limbs(tk.Decomposition(figure_path))
+    knees = knees_of(figure)
+    split_knees(figure, knees)
+    turned = split_knees(split_limbs(tk.Decomposition(psd)), knees)
+    if (turned.W, turned.H) != (figure.W, figure.H):
+        raise ValueError(f'canvas {turned.W}x{turned.H} is not the figure canvas {figure.W}x{figure.H}')
+    picture = tk.placed_illustration(png, figure.W, figure.H)[0]
+    lines = []
+    return fit_side(figure, turned, picture, lines.append), lines
+
+
 def forward_field(key, X, Y):
     """Forward offset (turned - rest) at rest points: t with t + back(t) = q."""
     x0, y0, x1, y1 = key['box']
@@ -194,14 +210,16 @@ def body_turn(figure_path, right_path, left_path, right_png, left_png, image_hw,
     use_body_tables()
     figure = split_limbs(tk.Decomposition(figure_path))
     knees = knees_of(figure)
-    split_knees(figure, knees)
+    # The two turns fit apart, a process each, started afresh (spawn): forked
+    # with OpenCV's threads running, a child can hang.
     fits = {}
-    for side, psd, png in (('right', right_path, right_png), ('left', left_path, left_png)):
-        turned = split_knees(split_limbs(tk.Decomposition(psd)), knees)
-        if (turned.W, turned.H) != (figure.W, figure.H):
-            raise ValueError(f'{side}: canvas {turned.W}x{turned.H} is not the figure canvas {figure.W}x{figure.H}')
-        picture = tk.placed_illustration(png, figure.W, figure.H)[0]
-        fits[side] = fit_side(figure, turned, picture, lambda line, side=side: log(f'{side:5s} {line}'))
+    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context('spawn')) as pool:
+        jobs = {side: pool.submit(fit_turned, figure_path, psd, png)
+                for side, psd, png in (('right', right_path, right_png), ('left', left_path, left_png))}
+        for side, job in jobs.items():
+            fits[side], lines = job.result()
+            for line in lines:
+                log(f'{side:5s} {line}')
     scale, ox, oy = placement(image_hw, (figure.H, figure.W))
     keyforms, drift = {}, {}
     for family in BODY:
