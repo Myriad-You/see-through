@@ -1139,7 +1139,9 @@ def split_front_hair(front, keys, log):
     at = front.order.index('front hair')
     del front.layers['front hair']
     front.order.pop(at)
-    whole = keys.pop('front-hair')
+    # The whole front hair's key stays: a figure keyed by its head (figure_head)
+    # keeps its own front hair whole.
+    whole = keys['front-hair']
     for n, k in enumerate(ids, 1):
         name = f'front hair-{n}'
         layer = L.copy()
