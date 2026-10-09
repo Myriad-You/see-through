@@ -392,6 +392,86 @@ def figure_keys(image, figure_psd, head_keyforms, box):
     return json_path
 
 
+def upscale(image):
+    """
+    A standing figure's picture enlarged to 4096 px tall by anime
+    super-resolution (upscale.py), or as it is when it is near that already.
+    Run in a process of its own: the network's threads are never started in
+    this one, which forks for the GPU. CPU only.
+    """
+    import subprocess
+
+    if image is None:
+        raise gr.Error("A picture is needed.")
+    path = image if isinstance(image, str) else image.name
+    out = os.path.join(tempfile.mkdtemp(prefix="seethrough_upscale_"), "upscaled.png")
+    script = os.path.join(_root, "upscale.py")
+    env = dict(os.environ)
+    t0 = time.time()
+    done = subprocess.run([sys.executable, script, path, out], env=env, capture_output=True, text=True, timeout=1800)
+    if done.returncode != 0:
+        _log(done.stderr[-2000:])
+        raise gr.Error("Super-resolution failed.")
+    _log(f"Upscale: {done.stdout.strip()} ({time.time() - t0:.1f}s)")
+    return out
+
+
+def figure_plan(whole_psd, image):
+    """
+    A standing figure's tiles (figure_tiles.plan): {tiles: {upper, middle,
+    lower: [x0, y0, x1, y1]}} in the picture's pixels, or {tiles: null} when
+    its head is big enough already; and each tile's picture to decompose (the
+    upper one a bust's, also the head to key). CPU only.
+    """
+    import figure_tiles
+    import turn_keyforms
+    from PIL import Image as PILImage
+
+    if whole_psd is None or image is None:
+        raise gr.Error("The figure's decomposition and its picture are needed.")
+    path = lambda f: f if isinstance(f, str) else f.name
+    picture = PILImage.open(path(image)).convert("RGB")
+    tiles = figure_tiles.plan(turn_keyforms.Decomposition(path(whole_psd)), (picture.height, picture.width))
+    if tiles is None:
+        return {"tiles": None}, None, None, None
+    out_dir = tempfile.mkdtemp(prefix="seethrough_tiles_")
+    files = []
+    for name, crop in figure_tiles.crops(picture, tiles).items():
+        crop_path = os.path.join(out_dir, f"{name}.png")
+        crop.save(crop_path)
+        files.append(crop_path)
+    return {"tiles": tiles}, *files
+
+
+def figure_stitch(image, whole_psd, upper_psd, middle_psd, lower_psd, tiles):
+    """
+    The figure's PSD at the picture's size, stitched from its tiles'
+    decompositions on its whole one (figure_tiles.stitch). tiles: the JSON
+    figure_plan gave. CPU only.
+    """
+    import figure_tiles
+    from PIL import Image as PILImage
+
+    files = (image, whole_psd, upper_psd, middle_psd, lower_psd)
+    if any(f is None for f in files) or not tiles:
+        raise gr.Error("The picture, the whole decomposition, the three tiles' and the plan are needed.")
+    path = lambda f: f if isinstance(f, str) else f.name
+    try:
+        plan = json.loads(tiles) if isinstance(tiles, str) else tiles
+        plan = plan.get("tiles", plan)
+        assert all(len(plan[name]) == 4 for name in ("upper", "middle", "lower"))
+    except Exception:
+        raise gr.Error("The plan must be figure_plan's JSON.")
+    picture = PILImage.open(path(image))
+    out = os.path.join(tempfile.mkdtemp(prefix="seethrough_stitch_"), "figure.psd")
+    t0 = time.time()
+    figure_tiles.stitch_files(
+        (picture.height, picture.width), path(whole_psd),
+        dict(upper=path(upper_psd), middle=path(middle_psd), lower=path(lower_psd)), plan, out, log=_log)
+    _log(f"Stitch done ({time.time() - t0:.1f}s)")
+    return out
+
+
 with gr.Blocks(title="See-through: Layer Decomposition") as demo:
     gr.Markdown(
         "# See-through: Single-image Layer Decomposition for Anime Characters\n\n"
@@ -573,6 +653,36 @@ with gr.Blocks(title="See-through: Layer Decomposition") as demo:
             outputs=[fig_out_json],
             api_name="figure_keys",
         )
+
+    with gr.Tab("Figure tiles"):
+        gr.Markdown(
+            "A standing figure decomposed in tiles: its picture enlarged, its whole decomposition "
+            "planned into three tiles (head and chest as a bust, waist, legs), each tile decomposed on "
+            "its own canvas, and the tiles stitched on the whole. CPU only."
+        )
+        with gr.Row():
+            with gr.Column(scale=1):
+                up_in = gr.File(label="Figure picture")
+                up_btn = gr.Button("Enlarge")
+                plan_psd = gr.File(label="Whole decomposition PSD")
+                plan_btn = gr.Button("Plan the tiles")
+                st_upper = gr.File(label="Upper tile PSD")
+                st_middle = gr.File(label="Middle tile PSD")
+                st_lower = gr.File(label="Lower tile PSD")
+                st_plan = gr.Textbox(label="Plan JSON")
+                st_btn = gr.Button("Stitch", variant="primary")
+            with gr.Column(scale=2):
+                up_out = gr.File(label="Enlarged picture")
+                plan_json = gr.JSON(label="Tiles")
+                plan_upper = gr.File(label="Upper tile picture")
+                plan_middle = gr.File(label="Middle tile picture")
+                plan_lower = gr.File(label="Lower tile picture")
+                st_out = gr.File(label="Figure PSD")
+        up_btn.click(fn=upscale, inputs=[up_in], outputs=[up_out], api_name="upscale")
+        plan_btn.click(fn=figure_plan, inputs=[plan_psd, up_in], outputs=[plan_json, plan_upper, plan_middle, plan_lower],
+                       api_name="figure_plan")
+        st_btn.click(fn=figure_stitch, inputs=[up_in, plan_psd, st_upper, st_middle, st_lower, st_plan], outputs=[st_out],
+                     api_name="figure_stitch")
 
 if __name__ == "__main__":
     demo.launch()

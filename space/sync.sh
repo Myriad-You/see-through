@@ -19,6 +19,8 @@ cp "$repo/inference/scripts/refine_hidden.py" "$space/refine_hidden.py"
 cp "$repo/inference/scripts/turn_keyforms.py" "$space/turn_keyforms.py"
 cp "$repo/inference/scripts/hair_locks.py" "$space/hair_locks.py"
 cp "$repo/inference/scripts/figure_head.py" "$space/figure_head.py"
+cp "$repo/inference/scripts/figure_tiles.py" "$space/figure_tiles.py"
+cp "$repo/inference/scripts/upscale.py" "$space/upscale.py"
 cp "$repo/space/app.py" "$space/app.py"
 cp "$repo/space/requirements.txt" "$space/requirements.txt"
 git -C "$space" status --short
