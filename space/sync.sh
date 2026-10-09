@@ -21,6 +21,7 @@ cp "$repo/inference/scripts/hair_locks.py" "$space/hair_locks.py"
 cp "$repo/inference/scripts/figure_head.py" "$space/figure_head.py"
 cp "$repo/inference/scripts/figure_tiles.py" "$space/figure_tiles.py"
 cp "$repo/inference/scripts/upscale.py" "$space/upscale.py"
+cp "$repo/inference/scripts/body_turn.py" "$space/body_turn.py"
 cp "$repo/space/app.py" "$space/app.py"
 cp "$repo/space/requirements.txt" "$space/requirements.txt"
 git -C "$space" status --short

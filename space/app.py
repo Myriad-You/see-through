@@ -416,6 +416,37 @@ def upscale(image):
     return out
 
 
+def body_keys(figure_psd, right_psd, left_psd, right_png, left_png, image):
+    """
+    A standing figure's body turn keys (body_turn.py): each body part of the
+    figure's decomposition fitted onto decompositions of the figure drawn
+    turned toward image right and left (same canvas, feet lined up), refined
+    on those two pictures, keeping only what moves opposite ways in the two,
+    and placed on `image`, the picture the figure's decomposition was made of.
+    Returns the keys as JSON ({canvas, keyforms, drift, knees}). Run in a
+    process of its own (it sets the part tables turn_keyforms reads). CPU only.
+    """
+    import subprocess
+    from PIL import Image as PILImage
+
+    files = [figure_psd, right_psd, left_psd, right_png, left_png, image]
+    if any(f is None for f in files):
+        raise gr.Error("The figure's decomposition, both turned decompositions, both turned pictures and the figure's picture are needed.")
+    path = lambda f: f if isinstance(f, str) else f.name
+    width, height = PILImage.open(path(image)).size
+    out = os.path.join(tempfile.mkdtemp(prefix="seethrough_body_"), "body_keys.json")
+    script = os.path.join(_root, "body_turn.py")
+    t0 = time.time()
+    done = subprocess.run([sys.executable, script, path(figure_psd), path(right_psd), path(left_psd),
+                           path(right_png), path(left_png), str(height), str(width), out],
+                          capture_output=True, text=True, timeout=1800)
+    if done.returncode != 0:
+        _log(done.stderr[-2000:])
+        raise gr.Error("The body turn could not be keyed.")
+    _log(f"Body keys: {done.stdout.strip().splitlines()[-1] if done.stdout.strip() else ''} ({time.time() - t0:.1f}s)")
+    return out
+
+
 def figure_plan(whole_psd, image):
     """
     A standing figure's tiles (figure_tiles.plan): {tiles: {upper, middle,
@@ -683,6 +714,25 @@ with gr.Blocks(title="See-through: Layer Decomposition") as demo:
                        api_name="figure_plan")
         st_btn.click(fn=figure_stitch, inputs=[up_in, plan_psd, st_upper, st_middle, st_lower, st_plan], outputs=[st_out],
                      api_name="figure_stitch")
+
+    with gr.Tab("Body turn"):
+        gr.Markdown(
+            "A standing figure's body turn keys: its decomposition fitted onto decompositions of it drawn "
+            "turned about 20 degrees toward image right and left, feet where they stood. CPU only."
+        )
+        with gr.Row():
+            with gr.Column(scale=1):
+                bt_figure = gr.File(label="Figure decomposition PSD")
+                bt_image = gr.File(label="Figure picture (that decomposition's)")
+                bt_right_psd = gr.File(label="Turned right PSD")
+                bt_left_psd = gr.File(label="Turned left PSD")
+                bt_right_png = gr.File(label="Turned right picture")
+                bt_left_png = gr.File(label="Turned left picture")
+                bt_btn = gr.Button("Key the body turn", variant="primary")
+            with gr.Column(scale=2):
+                bt_out = gr.File(label="Body turn keys JSON")
+        bt_btn.click(fn=body_keys, inputs=[bt_figure, bt_right_psd, bt_left_psd, bt_right_png, bt_left_png, bt_image],
+                     outputs=[bt_out], api_name="body_keys")
 
 if __name__ == "__main__":
     demo.launch()
