@@ -348,7 +348,17 @@ def _apply_layerdiff_canvas(pipeline, imgp, saved, seed, num_inference_steps, ta
             Image.fromarray(np.zeros(tuple(canvas_hw) + (4,), np.uint8)).save(osp.join(saved, f'{tag}.png'))
 
     head_mask = (images[body.index('head')][..., -1] > 15).astype(np.uint8)
+
+    def no_head():
+        '''A picture without a head (a figure decomposed in tiles: its legs) has empty head parts.'''
+        for tag in HEAD_TAGS_V3:
+            Image.fromarray(np.zeros(tuple(canvas_hw) + (4,), np.uint8)).save(osp.join(saved, f'{tag}.png'))
+            if output_scale > 1:
+                big = tuple(v * output_scale for v in canvas_hw) + (4,)
+                Image.fromarray(np.zeros(big, np.uint8)).save(osp.join(hires, f'{tag}.png'))
+
     if not head_mask.any():
+        no_head()
         return
     scale, ox, oy, _, _ = placement
     sh, sw = input_img.shape[:2]
@@ -364,6 +374,7 @@ def _apply_layerdiff_canvas(pipeline, imgp, saved, seed, num_inference_steps, ta
 
     head_box = source_box(head_mask)
     if head_box is None:
+        no_head()
         return
     if hair_pass == 'head':
         hair_mask = head_mask.copy()
