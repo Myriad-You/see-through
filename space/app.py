@@ -339,6 +339,66 @@ def keyforms(front_psd, right_psd, left_psd, up_psd, down_psd,
     return json_path, psd_path
 
 
+def figure_head(full_psd, image):
+    """
+    Where a standing figure's head is, framed as a bust (figure_head.head_crop):
+    {box: [x0, y0, x1, y1] in image pixels, or null when the head is big
+    enough already}, and that box of the image at a bust's size, white past its
+    edges, to draw turns of and decompose as a bust. CPU only.
+    """
+    import figure_head
+    import turn_keyforms
+    from PIL import Image as PILImage
+
+    if full_psd is None or image is None:
+        raise gr.Error("The figure's decomposition and its picture are needed.")
+    path = lambda f: f if isinstance(f, str) else f.name
+    picture = PILImage.open(path(image)).convert("RGB")
+    box = figure_head.head_crop(turn_keyforms.Decomposition(path(full_psd)), (picture.height, picture.width))
+    if box is None:
+        return {"box": None}, None
+    out = os.path.join(tempfile.mkdtemp(prefix="seethrough_figure_"), "head.png")
+    figure_head.crop_image(picture, box).save(out)
+    return {"box": box}, out
+
+
+def figure_merge(image, full_psd, head_psd, head_keyforms, box):
+    """
+    The figure's decomposition with its head parts from the head's (a bust's
+    decomposition of figure_head's crop, baked by keyforms), and those keys
+    placed on the figure's canvas (figure_head.merge, place_keys). box:
+    "x0,y0,x1,y1" as figure_head gave it. CPU only.
+    """
+    import figure_head
+    import turn_keyforms
+    from PIL import Image as PILImage
+
+    if any(f is None for f in (image, full_psd, head_psd, head_keyforms)) or not box:
+        raise gr.Error("The picture, both decompositions, the keys and the box are needed.")
+    path = lambda f: f if isinstance(f, str) else f.name
+    try:
+        crop = [int(v) for v in str(box).split(",")]
+    except ValueError:
+        raise gr.Error("The box must look like x0,y0,x1,y1.")
+    if len(crop) != 4 or crop[2] <= crop[0] or crop[3] <= crop[1]:
+        raise gr.Error("The box must look like x0,y0,x1,y1.")
+    picture = PILImage.open(path(image))
+    image_hw = (picture.height, picture.width)
+    full = turn_keyforms.Decomposition(path(full_psd))
+    head = turn_keyforms.Decomposition(path(head_psd))
+    merged = figure_head.merge(full, head, crop, image_hw)
+    factor, offset = figure_head.head_to_full(full, head, crop, image_hw)
+    with open(path(head_keyforms)) as f:
+        keys = figure_head.place_keys(json.load(f), full, factor, offset)
+    out_dir = tempfile.mkdtemp(prefix="seethrough_figure_")
+    psd_path = os.path.join(out_dir, "figure.psd")
+    turn_keyforms.save_psd(merged, psd_path)
+    json_path = os.path.join(out_dir, "keyforms.json")
+    with open(json_path, "w") as f:
+        json.dump(keys, f)
+    return json_path, psd_path
+
+
 with gr.Blocks(title="See-through: Layer Decomposition") as demo:
     gr.Markdown(
         "# See-through: Single-image Layer Decomposition for Anime Characters\n\n"
@@ -494,6 +554,33 @@ with gr.Blocks(title="See-through: Layer Decomposition") as demo:
             inputs=[key_front, pic_front, pic_right, pic_left, pic_up, pic_down],
             outputs=[turns_json],
             api_name="check_turns",
+        )
+
+    with gr.Tab("Figure head"):
+        gr.Markdown(
+            "A standing figure's head, framed as a bust to decompose and key on its own, then put "
+            "back into the figure's decomposition with its keys. CPU only."
+        )
+        with gr.Row():
+            with gr.Column(scale=1):
+                fig_image = gr.File(label="Figure picture")
+                fig_psd = gr.File(label="Figure decomposition PSD")
+                fig_btn = gr.Button("Find the head")
+                fig_head_psd = gr.File(label="Head PSD (baked)")
+                fig_keys = gr.File(label="Head keyforms JSON")
+                fig_box = gr.Textbox(label="Box (x0,y0,x1,y1)")
+                merge_btn = gr.Button("Merge", variant="primary")
+            with gr.Column(scale=2):
+                fig_found = gr.JSON(label="Head box")
+                fig_crop = gr.File(label="Head picture")
+                fig_out_json = gr.File(label="Keyforms on the figure")
+                fig_out_psd = gr.File(label="Figure PSD")
+        fig_btn.click(fn=figure_head, inputs=[fig_psd, fig_image], outputs=[fig_found, fig_crop], api_name="figure_head")
+        merge_btn.click(
+            fn=figure_merge,
+            inputs=[fig_image, fig_psd, fig_head_psd, fig_keys, fig_box],
+            outputs=[fig_out_json, fig_out_psd],
+            api_name="figure_merge",
         )
 
 if __name__ == "__main__":
