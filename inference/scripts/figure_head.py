@@ -11,8 +11,10 @@ only the figure's had (a pendant), and gained nothing at rest.
 
     python figure_head.py image.png figure.psd keyforms.json out.json   (box from head_crop)
 """
+import re
 import sys
 
+import cv2
 import numpy as np
 from PIL import Image
 
@@ -112,6 +114,58 @@ def place_keys(keys, full, factor, offset):
     out['keyforms'] = placed
     out['figure'] = dict(factor=factor, offset=list(offset))
     return out
+
+
+# The head's decomposition and the figure's split the hair differently: the
+# figure's often gives the locks falling beside the face to the back hair,
+# under the face, where the head's (whose keys move them) has them in the
+# front hair. Turned, the face then slides over them. And the head's front hair
+# is cut into locks (turn_keyforms, hair_locks), each with a key fitted well;
+# a whole front hair's single key cannot follow locks the turned drawings
+# redraw (IoU ~0.75 against ~0.95). So the figure takes its hair from the head,
+# placed on its canvas: the head's locks and back hair (baked where turns
+# uncover it) in place of its own front and back hair. All else stays the
+# figure's own (what only it has, like a pendant, is kept).
+FRONT_LOCK = re.compile(r'front hair-\d+$')
+
+
+def take_hair(figure, head, factor, offset):
+    """
+    Replaces the figure's front hair (whole, or locks taken before) and back
+    hair with the head's front hair locks and back hair placed on the figure's
+    canvas (p_figure = p_head * factor + offset). Returns the names taken, or []
+    when the head has no locks or back hair (the figure keeps its own hair).
+    """
+    locks = [name for name in head.order if FRONT_LOCK.match(name)]
+    if not locks or 'back hair' not in head.layers:
+        return []
+    front = [name for name in figure.order if name == 'front hair' or FRONT_LOCK.match(name)]
+    if not front:
+        return []
+    place = np.float32([[factor, 0, offset[0]], [0, factor, offset[1]]])
+
+    def placed(name):
+        layer = head.layers[name]
+        # Premultiplied while resampled, so edges keep their colour.
+        rgb = layer[..., :3] * layer[..., 3:4]
+        out = cv2.warpAffine(np.concatenate([rgb, layer[..., 3:4]], 2), place, (figure.W, figure.H),
+                             flags=cv2.INTER_AREA if factor < 1 else cv2.INTER_LINEAR)
+        alpha = np.clip(out[..., 3:4], 0, 1)
+        out[..., :3] = np.where(alpha > 1e-4, out[..., :3] / np.maximum(alpha, 1e-4), 0)
+        out[..., 3:4] = alpha
+        return np.clip(out, 0, 1).astype(np.float32)
+
+    at = figure.order.index(front[0])
+    for name in front:
+        figure.order.remove(name)
+        del figure.layers[name]
+    figure.order[at:at] = locks
+    for name in locks:
+        figure.layers[name] = placed(name)
+    if 'back hair' not in figure.layers:
+        figure.order.insert(0, 'back hair')
+    figure.layers['back hair'] = placed('back hair')
+    return locks + ['back hair']
 
 
 class _Canvas:

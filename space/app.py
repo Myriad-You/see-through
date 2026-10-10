@@ -392,6 +392,34 @@ def figure_keys(image, figure_psd, head_keyforms, box):
     return json_path
 
 
+def figure_hair(figure_psd, head_psd, keyforms):
+    """
+    A standing figure's decomposition with its hair taken from its head's
+    (figure_head.take_hair): the head's front hair locks and back hair, baked,
+    placed on the figure's canvas where the figure's own front and back hair
+    were. The keys placed by figure_keys (their "figure" factor and offset)
+    were fitted on the head's hair, split as the head's decomposition split
+    it. Returns the figure's PSD; unchanged when the head has no locks. CPU only.
+    """
+    import figure_head
+    from turn_keyforms import Decomposition, save_psd
+
+    if any(f is None for f in (figure_psd, head_psd, keyforms)):
+        raise gr.Error("The figure's decomposition, the head's and the placed keys are needed.")
+    path = lambda f: f if isinstance(f, str) else f.name
+    with open(path(keyforms)) as f:
+        placed = json.load(f).get("figure")
+    if not placed:
+        raise gr.Error("The keys were not placed on a figure (figure_keys).")
+    figure = Decomposition(path(figure_psd))
+    head = Decomposition(path(head_psd))
+    taken = figure_head.take_hair(figure, head, placed["factor"], placed["offset"])
+    _log(f"Figure hair: {taken or 'kept its own'}")
+    out = os.path.join(tempfile.mkdtemp(prefix="seethrough_figure_"), "figure.psd")
+    save_psd(figure, out)
+    return out
+
+
 def upscale(image):
     """
     A standing figure's picture enlarged to 4096 px tall by anime
@@ -687,6 +715,12 @@ with gr.Blocks(title="See-through: Layer Decomposition") as demo:
             outputs=[fig_out_json],
             api_name="figure_keys",
         )
+        with gr.Row():
+            hair_head = gr.File(label="Head's decomposition (baked, front hair in locks)", file_types=[".psd"])
+            hair_keys = gr.File(label="Keys placed on the figure", file_types=[".json"])
+            hair_btn = gr.Button("Take the head's hair")
+            hair_out = gr.File(label="Figure with the head's hair")
+        hair_btn.click(fn=figure_hair, inputs=[fig_psd, hair_head, hair_keys], outputs=[hair_out], api_name="figure_hair")
 
     with gr.Tab("Figure tiles"):
         gr.Markdown(
