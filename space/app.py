@@ -298,6 +298,22 @@ def check_turns(front_psd, front_png, right_png, left_png, up_png, down_png):
         front=path(front_png), plus=path(right_png), minus=path(left_png), up=path(up_png), down=path(down_png)))
 
 
+def judge_turn(front_psd, turned_psd, front_png, turned_png, side):
+    """
+    Whether one turned drawing keeps what a turn keeps (turn_judge.py): its
+    fringe, its head's size and the body as the front drawing has them,
+    measured on the decompositions and pictures. {fringe, head, body, faults,
+    badness}; a caller draws a faulty one again before fitting. CPU only.
+    """
+    import turn_judge
+
+    if any(f is None for f in (front_psd, turned_psd)) or side not in turn_judge.SIDES:
+        raise gr.Error("The front and turned decompositions and the side are needed.")
+    path = lambda f: None if f is None else (f if isinstance(f, str) else f.name)
+    return turn_judge.judge(path(front_psd), {side: path(turned_psd)}, path(front_png),
+                            {side: path(turned_png)})[side]
+
+
 def keyforms(front_psd, right_psd, left_psd, up_psd, down_psd,
              front_png=None, right_png=None, left_png=None, up_png=None, down_png=None):
     """
@@ -689,6 +705,18 @@ with gr.Blocks(title="See-through: Layer Decomposition") as demo:
             inputs=[key_front, pic_front, pic_right, pic_left, pic_up, pic_down],
             outputs=[turns_json],
             api_name="check_turns",
+        )
+        with gr.Row():
+            judge_psd = gr.File(label="One turned decomposition", file_types=[".psd"])
+            judge_png = gr.File(label="Its picture")
+            judge_side = gr.Dropdown(["plus", "minus", "up", "down"], value="plus", label="Side")
+            judge_json = gr.JSON(label="Judged")
+        judge_btn = gr.Button("Judge it against the front (front PSD and picture above)")
+        judge_btn.click(
+            fn=judge_turn,
+            inputs=[key_front, judge_psd, pic_front, judge_png, judge_side],
+            outputs=[judge_json],
+            api_name="judge_turn",
         )
 
     with gr.Tab("Figure head"):
