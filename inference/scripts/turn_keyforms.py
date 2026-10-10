@@ -812,13 +812,19 @@ def fill_under_piece(front, mask, family, log):
     hole = mask & (layer[..., 3] < 0.5) if family == 'front-hair' else mask.copy()
     if hole.sum() < 50 or (layer[..., 3][ring] > 0.5).mean() < 0.5:
         return 0
-    rgb = (np.clip(layer[..., :3], 0, 1) * 255).astype(np.uint8)
-    # Every transparent pixel near the piece is unknown, so only the hair itself is read.
-    k = 4 * UNDER_PIECE_RADIUS + 1
-    unknown = ((layer[..., 3] < 0.5) | hole) & (cv2.dilate(mask.astype(np.uint8), np.ones((k, k), np.uint8)) > 0)
+    # Around the piece, every transparent pixel is unknown, so only the hair itself
+    # is read (a transparent pixel's colour is black: read, it darkens the fill).
+    ys, xs = np.nonzero(mask)
+    pad = 8 * UNDER_PIECE_RADIUS
+    y0, y1 = max(0, ys.min() - pad), min(front.H, ys.max() + 1 + pad)
+    x0, x1 = max(0, xs.min() - pad), min(front.W, xs.max() + 1 + pad)
+    part = layer[y0:y1, x0:x1]
+    rgb = (np.clip(part[..., :3], 0, 1) * 255).astype(np.uint8)
+    unknown = (part[..., 3] < 0.5) | hole[y0:y1, x0:x1]
     filled = cv2.inpaint(rgb, unknown.astype(np.uint8), UNDER_PIECE_RADIUS, cv2.INPAINT_TELEA)
-    layer[hole, :3] = filled[hole].astype(np.float32) / 255
-    layer[hole, 3] = 1.0
+    inside = hole[y0:y1, x0:x1]
+    part[inside, :3] = filled[inside].astype(np.float32) / 255
+    part[inside, 3] = 1.0
     log(f'filled {hole.sum()} px of {name} under a piece')
     return int(hole.sum())
 

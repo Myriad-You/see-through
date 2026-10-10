@@ -124,16 +124,16 @@ def place_keys(keys, full, factor, offset):
 # a whole front hair's single key cannot follow locks the turned drawings
 # redraw (IoU ~0.75 against ~0.95). So the figure takes its hair from the head,
 # placed on its canvas: the head's locks and back hair (baked where turns
-# uncover it) in place of its own front and back hair. All else stays the
+# uncover it) and the clips on it in place of its own. All else stays the
 # figure's own (what only it has, like a pendant, is kept).
 FRONT_LOCK = re.compile(r'front hair-\d+$')
+CLIP = re.compile(r'headwear(-\d+)?$')
 
 
 def take_hair(figure, head, factor, offset):
     """
-    Replaces the figure's front hair (whole, or locks taken before) and back
-    hair with the head's front hair locks and back hair placed on the figure's
-    canvas (p_figure = p_head * factor + offset). Returns the names taken, or []
+    Replaces the figure's front hair (whole, or locks taken before), back hair
+    and hair clips (headwear) with the head's, placed on the figure's canvas (p_figure = p_head * factor + offset). Returns the names taken, or []
     when the head has no locks or back hair (the figure keeps its own hair).
     """
     locks = [name for name in head.order if FRONT_LOCK.match(name)]
@@ -165,7 +165,20 @@ def take_hair(figure, head, factor, offset):
     if 'back hair' not in figure.layers:
         figure.order.insert(0, 'back hair')
     figure.layers['back hair'] = placed('back hair')
-    return locks + ['back hair']
+    # The clips on that hair go with it: the head's hair was cut and filled
+    # around its own clips (their shading baked next to them), which the
+    # figure's, drawn a few pixels off, leave showing.
+    clips = [name for name in head.order if CLIP.match(name)]
+    if clips:
+        own = [name for name in figure.order if CLIP.match(name)]
+        at = figure.order.index(own[0]) if own else figure.order.index(locks[0])
+        for name in own:
+            figure.order.remove(name)
+            del figure.layers[name]
+        figure.order[at:at] = clips
+        for name in clips:
+            figure.layers[name] = placed(name)
+    return locks + ['back hair'] + clips
 
 
 class _Canvas:
