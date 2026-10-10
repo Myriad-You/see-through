@@ -1886,6 +1886,12 @@ HEADWEAR_BELOW_CHIN_LIMIT = 0.5
 # Or the ears take in the head: the ears over the face's area (cat ears 0.18;
 # 0.94 when they did).
 EARS_LIMIT = 0.5
+# Or an eye loses its white: its iris there and its white under this share of
+# the iris's area. A turned drawing once lost both, and the fit bent those eyes
+# out of shape. Each eye lost counts this far past the limit; closed eyes have
+# no iris and are not counted.
+EYE_WHITE_SHARE = 0.2
+EYE_WHITE_LOST = 1.5
 
 
 def face_spread(dec):
@@ -1923,6 +1929,21 @@ def part_shares(dec):
     return shares
 
 
+def eyes_without_white(dec):
+    """How many eyes have their iris but next to no white."""
+    lost = 0
+    for side in ('l', 'r'):
+        iris = dec.layers.get(f'irides-{side}')
+        if iris is None:
+            continue
+        iris = (iris[..., 3] > 0.5).sum()
+        white = dec.layers.get(f'eyewhite-{side}')
+        white = 0 if white is None else (white[..., 3] > 0.5).sum()
+        if iris > 0 and white < EYE_WHITE_SHARE * iris:
+            lost += 1
+    return lost
+
+
 def check_decomposition(path):
     """
     Whether a decomposition can be keyed from: its faults, and how far past
@@ -1938,6 +1959,7 @@ def check_decomposition(path):
         'face takes in the hair': spread / FACE_SPREAD_LIMIT,
         'headwear takes in the outfit': shares['headwear'] / HEADWEAR_BELOW_CHIN_LIMIT,
         'ears take in the head': shares['ears'] / EARS_LIMIT,
+        'eyes lose their whites': eyes_without_white(dec) * EYE_WHITE_LOST,
     }
     faults = [fault for fault, over in measures.items() if over > 1]
     return dict(ok=not faults, faults=faults, badness=round(float(max(measures.values())), 3),
