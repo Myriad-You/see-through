@@ -897,6 +897,55 @@ def accessory_lattice(found, grid=25):
     return dict(box=[float(x0), float(y0), float(x1), float(y1)], grid=grid, back=back)
 
 
+# A closed mouth is a short line in a turned drawing: no fit of its shape holds
+# (IoU ~0.2), and without a key it rides the face's surface, which carries it
+# 20-35 px short of where the turned drawings put it at 30 degrees. It lies
+# deeper than the face's surface and less deep than the nose's tip: halfway
+# between where their keys carry it is where the drawings have it (within 2-11
+# px on the 2026-10-10 figure). Its width shrinks as the drawings have it.
+MOUTH_FIT_IOU = 0.6
+MOUTH_TRUST = 25          # px: a turned decomposition's mouth this near the midpoint is believed
+MOUTH_MIN_PIXELS = 30
+MOUTH_SQUEEZE = (0.7, 1.1)
+
+
+def place_mouth(front, turned, keys, log):
+    """Keys the mouth by where it goes on each side its shape could not be fitted."""
+    if 'mouth' not in front.layers or 'face' not in keys or 'nose' not in keys:
+        return
+    alpha = front.layers['mouth'][..., 3] > 0.5
+    if alpha.sum() < MOUTH_MIN_PIXELS:
+        return
+    ys, xs = np.nonzero(alpha)
+    box = (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+    cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+    width = box[2] - box[0]
+    placed = {}
+    for side, t in turned.items():
+        own = keys.get('mouth', {}).get(side)
+        if own is not None and (own.get('fit') or {}).get('iou', 0) >= MOUTH_FIT_IOU:
+            continue
+        face, nose = keys['face'].get(side), keys['nose'].get(side)
+        if face is None or nose is None:
+            continue
+        fx, fy = turned_position(face, np.float32([cx]), np.float32([cy]))
+        nx, ny = turned_position(nose, np.float32([cx]), np.float32([cy]))
+        target = ((float(fx[0]) + float(nx[0])) / 2, (float(fy[0]) + float(ny[0])) / 2)
+        squeeze = 1.0
+        drawn = t.layers.get('mouth')
+        if drawn is not None and (drawn[..., 3] > 0.5).sum() >= MOUTH_MIN_PIXELS:
+            ty_, tx_ = np.nonzero(drawn[..., 3] > 0.5)
+            seen = ((tx_.min() + tx_.max() + 1) / 2, (ty_.min() + ty_.max() + 1) / 2)
+            if np.hypot(seen[0] - target[0], seen[1] - target[1]) <= MOUTH_TRUST:
+                target = (float(seen[0]), float(seen[1]))
+                squeeze = float(np.clip((tx_.max() - tx_.min() + 1) / width, *MOUTH_SQUEEZE))
+        key = accessory_lattice([dict(source=(cx, cy), target=target, scale=1.0, squeeze=squeeze, box=box, matched=True)])
+        keys.setdefault('mouth', {})[side] = key
+        placed[side] = (round(target[0]), round(target[1]), round(squeeze, 2))
+    if placed:
+        log(f'mouth placed {placed}')
+
+
 # ---------------------------------------------------------------- the picture itself
 
 # The decompositions say which part is which; the turned picture says where it
@@ -2154,6 +2203,7 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
                 if family not in own:
                     keys.setdefault(family, {})[side] = lattice
             log(f'{side:5s} accessories {[(round(f["target"][0]), round(f["target"][1]), round(f["squeeze"], 2), "m" if f["matched"] else "h") for f in found]}')
+    place_mouth(front, turned, keys, log)
     # A family is keyed only with both turn keys; nod keys only as a pair.
     complete = {}
     for family, sides in keys.items():
