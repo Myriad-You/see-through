@@ -416,15 +416,17 @@ def upscale(image):
     return out
 
 
-def body_keys(figure_psd, right_psd, left_psd, right_png, left_png, image):
+def body_keys(figure_psd, right_psd, left_psd, right_png, left_png, image, mode="turn"):
     """
     A standing figure's body turn keys (body_turn.py): each body part of the
     figure's decomposition fitted onto decompositions of the figure drawn
     turned toward image right and left (same canvas, feet lined up), refined
     on those two pictures, keeping only what moves opposite ways in the two,
     and placed on `image`, the picture the figure's decomposition was made of.
-    Returns the keys as JSON ({canvas, keyforms, drift, knees}). Run in a
-    process of its own (it sets the part tables turn_keyforms reads). CPU only.
+    Returns the keys as JSON ({canvas, keyforms, drift, knees}). mode 'weight':
+    the two drawings are the figure's weight on the leg on the right of the
+    picture and on the left (each leg keeps its own fit). Run in a process of
+    its own (it sets the part tables turn_keyforms reads). CPU only.
     """
     import subprocess
     from PIL import Image as PILImage
@@ -438,7 +440,8 @@ def body_keys(figure_psd, right_psd, left_psd, right_png, left_png, image):
     script = os.path.join(_root, "body_turn.py")
     t0 = time.time()
     done = subprocess.run([sys.executable, script, path(figure_psd), path(right_psd), path(left_psd),
-                           path(right_png), path(left_png), str(height), str(width), out],
+                           path(right_png), path(left_png), str(height), str(width), out,
+                           "weight" if mode == "weight" else "turn"],
                           capture_output=True, text=True, timeout=1800)
     if done.returncode != 0:
         _log(done.stderr[-2000:])
@@ -728,10 +731,11 @@ with gr.Blocks(title="See-through: Layer Decomposition") as demo:
                 bt_left_psd = gr.File(label="Turned left PSD")
                 bt_right_png = gr.File(label="Turned right picture")
                 bt_left_png = gr.File(label="Turned left picture")
+                bt_mode = gr.Radio(["turn", "weight"], value="turn", label="Turned (right/left) or weight shift (onto right/left leg)")
                 bt_btn = gr.Button("Key the body turn", variant="primary")
             with gr.Column(scale=2):
                 bt_out = gr.File(label="Body turn keys JSON")
-        bt_btn.click(fn=body_keys, inputs=[bt_figure, bt_right_psd, bt_left_psd, bt_right_png, bt_left_png, bt_image],
+        bt_btn.click(fn=body_keys, inputs=[bt_figure, bt_right_psd, bt_left_psd, bt_right_png, bt_left_png, bt_image, bt_mode],
                      outputs=[bt_out], api_name="body_keys")
 
 if __name__ == "__main__":

@@ -23,9 +23,16 @@ placed from the canvas onto the figure's picture, `image_hw`, whose
 decomposition the figure's is. Myriad's sides are the picture's: See-through's
 "-r" layers are on its left.
 
+The same fit keys a weight shift (mode 'weight'): the figure drawn with its
+weight on the leg on the right of the picture ('plus') and on the left. There
+the legs are not mirror images of each other: the free leg bends, the one under
+the weight stays straight, so each thigh, shin and shoe keeps its own fit in
+each drawing; the rest (hips, skirt, torso, arms, the head's carry) keeps what
+moves opposite ways, as in a turn.
+
 Run as a process of its own (it sets turn_keyforms' part tables):
 
-    python body_turn.py figure.psd right.psd left.psd right.png left.png H W out.json
+    python body_turn.py figure.psd right.psd left.psd right.png left.png H W out.json [turn|weight]
 """
 import json
 import multiprocessing
@@ -62,6 +69,8 @@ GRID = 7
 HEAD_GRID = 9
 # Points of the forward field a symmetric key is measured at, canvas px apart.
 STRIDE = 4
+# In a weight shift these are one-sided, each drawing's own fit (see above).
+ONE_SIDED = {'thigh:L', 'thigh:R', 'shin:L', 'shin:R', 'footwear:L', 'footwear:R'}
 
 
 def split_limbs(dec):
@@ -202,7 +211,7 @@ def placed(lattice, scale, ox, oy):
                 back=[v / scale for v in lattice['back']])
 
 
-def body_turn(figure_path, right_path, left_path, right_png, left_png, image_hw, log=print):
+def body_turn(figure_path, right_path, left_path, right_png, left_png, image_hw, log=print, mode='turn'):
     """
     {canvas: [W, H] of the picture, keyforms: {family: {plus, minus}}, and what was found:
     drift: {family: [dx, dy]} dropped, knees: {side: y} cut at}, in the picture's pixels.
@@ -225,19 +234,25 @@ def body_turn(figure_path, right_path, left_path, right_png, left_png, image_hw,
     for family in BODY:
         if family not in fits['right'] or family not in fits['left']:
             continue
-        plus, minus, shared = opposite_keys(fits['right'][family], fits['left'][family])
+        if mode == 'weight' and family in ONE_SIDED:
+            plus, minus = fits['right'][family], fits['left'][family]
+        else:
+            plus, minus, shared = opposite_keys(fits['right'][family], fits['left'][family])
+            drift[family] = [round(shared[0] / scale, 1), round(shared[1] / scale, 1)]
+            log(f'{family:11s} drift dropped ({drift[family][0]:+.1f}, {drift[family][1]:+.1f}) px')
         keyforms[family] = {'plus': placed(plus, scale, ox, oy), 'minus': placed(minus, scale, ox, oy)}
-        drift[family] = [round(shared[0] / scale, 1), round(shared[1] / scale, 1)]
-        log(f'{family:11s} drift dropped ({drift[family][0]:+.1f}, {drift[family][1]:+.1f}) px')
     knees = {side: round((y - oy) / scale, 1) for side, y in knees.items()}
     return dict(canvas=[image_hw[1], image_hw[0]], keyforms=keyforms, drift=drift, knees=knees)
 
 
 if __name__ == '__main__':
     figure_psd, right_psd, left_psd, right_png, left_png, height, width, out = sys.argv[1:9]
+    mode = sys.argv[9] if len(sys.argv) > 9 else 'turn'
+    if mode not in ('turn', 'weight'):
+        sys.exit(f'mode must be turn or weight, not {mode}')
     t0 = time.time()
     result = body_turn(figure_psd, right_psd, left_psd, right_png, left_png, (int(height), int(width)),
-                       log=lambda line: print(line, flush=True))
+                       log=lambda line: print(line, flush=True), mode=mode)
     with open(out, 'w') as f:
         json.dump(result, f)
     print(f'body turn keys in {time.time() - t0:.0f}s', flush=True)
