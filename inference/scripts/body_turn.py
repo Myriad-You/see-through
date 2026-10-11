@@ -37,8 +37,10 @@ over each part (`flow`), sets each key's travel; the fit keeps its shape.
 The trunk and what hangs over it (top, skirt, neck, sleeves) lie on one
 another, and fitted apart they part at every edge where they meet: they go
 as one, each row of the canvas across by the trunk's median travel at that
-height, nothing else. What a turn does across a row (it narrows the figure)
-is the same either way and drops out of what moves opposite ways anyway.
+height, nothing else, on one lattice over all of them (TRUNK_GRID rows):
+the same travel sampled on lattices of their own boxes would part them by a
+few px where the travel bends. What a turn does across a row (it narrows the
+figure) is the same either way and drops out of what moves opposite ways anyway.
 A part keyed to go against the trunk's turn (a small, hidden neck fitted to
 something else) is not keyed by its own fit: the neck and arms, which hang
 from the torso, take the top's key; a leg goes unkeyed.
@@ -104,6 +106,8 @@ FLOW_WIDTH = 420
 TRUNK_ROWS = ('topwear', 'bottomwear', 'neck')
 # What goes as the trunk does, row by row: the trunk and the sleeves lying over its sides.
 AS_TRUNK = ('topwear', 'bottomwear', 'neck', 'arm:L', 'arm:R')
+# The trunk's one lattice: only rows move, so a fine one holds the drawing.
+TRUNK_GRID = 13
 # The trunk's travel by height is smoothed over this share of its height either way.
 TRUNK_SMOOTH = 0.04
 # Where a part is sampled to measure its key's travel, canvas px apart.
@@ -449,6 +453,13 @@ def keyed(fits, figure, image_hw, log=print, mode='turn', flows=None):
         yi = np.clip(Y.astype(int), 0, figure.H - 1)
         return profile[yi], np.zeros_like(ay)
 
+    shared = None
+    if mode == 'turn' and profile is not None:
+        boxes = [fits[side][f]['box'] for side in ('right', 'left') for f in AS_TRUNK if f in fits[side]]
+        if boxes:
+            box = [min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes)]
+            still = dict(box=box, grid=TRUNK_GRID, back=[0.0] * (TRUNK_GRID * TRUNK_GRID * 2))
+            shared = opposite_keys(still, still, as_trunk)[:2]
     keyforms, drift, plus_way = {}, {}, {}
     for family in BODY:
         if family not in fits['right'] or family not in fits['left']:
@@ -458,9 +469,11 @@ def keyed(fits, figure, image_hw, log=print, mode='turn', flows=None):
         else:
             trunk_row = family in AS_TRUNK and profile is not None
             across = as_trunk if trunk_row else None
-            plus, minus, shared = opposite_keys(fits['right'][family], fits['left'][family], across)
-            drift[family] = [round(shared[0] / scale, 1), round(shared[1] / scale, 1)]
+            plus, minus, common = opposite_keys(fits['right'][family], fits['left'][family], across)
+            drift[family] = [round(common[0] / scale, 1), round(common[1] / scale, 1)]
             log(f'{family:11s} drift dropped ({drift[family][0]:+.1f}, {drift[family][1]:+.1f}) px')
+            if trunk_row and shared:
+                plus, minus = shared
             if trunk_row:
                 points = part_points(figure, family)
                 log(f'{family:11s} travels {part_way(plus, points) / scale:+.1f} px as the trunk is drawn, by height')
