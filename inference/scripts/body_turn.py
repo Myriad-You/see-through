@@ -28,6 +28,12 @@ way is not used: the other's fit, mirrored about the trunk, keys its turn
 either way; what was drawn differently on one side is lost to the other. One
 drawing alone does not tell its turn from where the generator moved the whole
 figure, but the feet were to stay: how far the shoes went is taken off first.
+How far each part goes across is read off the pictures, not the fit: a
+lattice fitted to a big garment follows its outline, which a 20 degree turn
+barely moves, more than its prints and seams; the same pair fitted twice
+keyed the top -4 and +17 px, the skirt +145 and +38, while the drawing moved
+them +80 and +55. The optical flow from the figure to each drawing, its median
+over each part (`flow`), sets each key's travel; the fit keeps its shape.
 A part keyed to go against the trunk's turn (a small, hidden neck fitted to
 something else) is not keyed by its own fit: the neck and arms, which hang
 from the torso, take the top's key; a leg goes unkeyed.
@@ -87,6 +93,14 @@ STRIDE = 4
 TRUNK = ('topwear', 'bottomwear')
 # A drawing whose trunk went less than this (picture px) its own way drew the wrong turn.
 TURNED_AT_LEAST = 10.0
+# The optical flow is measured at this width, where a turn is a few dozen px.
+FLOW_WIDTH = 420
+# The trunk's layers, whose travel goes by height so that top and skirt meet at the waist.
+TRUNK_ROWS = ('topwear', 'bottomwear', 'neck')
+# The trunk's travel by height is smoothed over this share of its height either way.
+TRUNK_SMOOTH = 0.04
+# Where a part is sampled to measure its key's travel, canvas px apart.
+PART_STRIDE = 8
 # What hangs from the torso, and takes its key when its own went astray.
 ON_TORSO = ('neck', 'arm:L', 'arm:R')
 # What a mirror makes of each part: a limb becomes the other one.
@@ -169,8 +183,59 @@ def fit_side(figure, turned, picture, log):
     return {family: key['side'] for family, key in keys.items()}
 
 
+def part_flows(figure, picture):
+    """
+    Each body part's median travel across (canvas px) from the figure to a turned
+    picture (RGB 0..1, on its canvas), and the trunk's by height: 'rows', the
+    median of each canvas row of the trunk, smoothed (NaN off the trunk).
+    """
+    front = figure.family(figure.order)
+    k = FLOW_WIDTH / figure.W
+
+    def gray(rgb):
+        small = cv2.resize((np.clip(rgb, 0, 1) * 255).astype(np.uint8), None, fx=k, fy=k, interpolation=cv2.INTER_AREA)
+        return cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
+
+    f0 = gray(front[..., :3] * front[..., 3:4] + (1 - front[..., 3:4]))
+    f1 = gray(picture)
+    flow = cv2.calcOpticalFlowFarneback(f0, f1, None, 0.5, 5, 25, 5, 7, 1.5, 0)[..., 0] / k
+    out = {}
+    for family, names in BODY.items():
+        use = [n for n in names if n in figure.layers]
+        if not use:
+            continue
+        alpha = sum(figure.layers[n][..., 3] for n in use)
+        mask = cv2.resize(alpha, (f0.shape[1], f0.shape[0]), interpolation=cv2.INTER_AREA) > 0.5
+        if mask.sum() >= 20:
+            out[family] = float(np.median(flow[mask]))
+    trunk = sum(figure.layers[n][..., 3] for n in TRUNK_ROWS if n in figure.layers)
+    mask = cv2.resize(np.asarray(trunk, np.float32), (f0.shape[1], f0.shape[0]), interpolation=cv2.INTER_AREA) > 0.5
+    rows = np.array([np.median(flow[r][mask[r]]) if mask[r].sum() >= 3 else np.nan for r in range(len(mask))])
+    known = np.nonzero(~np.isnan(rows))[0]
+    if len(known):
+        half = max(1, int(TRUNK_SMOOTH * len(known)))
+        smooth = np.array([np.median(rows[known[max(0, i - half):i + half + 1]]) for i in range(len(known))])
+        rows[known] = smooth
+    out['rows'] = np.interp(np.arange(figure.H), np.arange(len(rows)) / k, rows, left=np.nan, right=np.nan).tolist()
+    return out
+
+
+def part_points(figure, family):
+    """Points on a part of the figure, canvas px: (xs, ys)."""
+    use = [n for n in BODY[family] if n in figure.layers]
+    alpha = sum(figure.layers[n][..., 3] for n in use) if use else np.zeros((figure.H, figure.W), np.float32)
+    ys, xs = np.nonzero(alpha[::PART_STRIDE, ::PART_STRIDE] > 0.5)
+    return (xs * PART_STRIDE).astype(np.float32), (ys * PART_STRIDE).astype(np.float32)
+
+
+def part_way(key, points):
+    """How far a key carries the part at `points` across, canvas px (its median)."""
+    dx, _ = forward_field(key, *points)
+    return float(np.median(dx))
+
+
 def fit_turned(figure_path, psd, png):
-    """One turned drawing fitted, in a process of its own: (keys, log lines)."""
+    """One turned drawing fitted, in a process of its own: (keys, each part's flow, log lines)."""
     use_body_tables()
     figure = split_limbs(tk.Decomposition(figure_path))
     knees = knees_of(figure)
@@ -180,7 +245,7 @@ def fit_turned(figure_path, psd, png):
         raise ValueError(f'canvas {turned.W}x{turned.H} is not the figure canvas {figure.W}x{figure.H}')
     picture = tk.placed_illustration(png, figure.W, figure.H)[0]
     lines = []
-    return fit_side(figure, turned, picture, lines.append), lines
+    return fit_side(figure, turned, picture, lines.append), part_flows(figure, picture), lines
 
 
 def forward_field(key, X, Y):
@@ -249,8 +314,12 @@ def mirrored_fit(fit, axis):
     return {MIRRORED.get(family, family): mirrored_key(key, axis) for family, key in fit.items()}
 
 
-def opposite_keys(right, left):
-    """+key and -key of what moves opposite ways in the two turns, and what both share (the drift dropped)."""
+def opposite_keys(right, left, across=None):
+    """
+    +key and -key of what moves opposite ways in the two turns, and what both
+    share (the drift dropped). `across(ax, X, Y)` may set the +key's travel
+    across (canvas px) at the points X, Y of its field.
+    """
     grid = right['grid']
     x0, y0 = min(right['box'][0], left['box'][0]), min(right['box'][1], left['box'][1])
     x1, y1 = max(right['box'][2], left['box'][2]), max(right['box'][3], left['box'][3])
@@ -260,6 +329,8 @@ def opposite_keys(right, left):
     lx, ly = forward_field(left, X.ravel(), Y.ravel())
     ax = ((rx - lx) / 2).reshape(X.shape).astype(np.float32)
     ay = ((ry - ly) / 2).reshape(X.shape).astype(np.float32)
+    if across is not None:
+        ax = across(ax, X, Y).astype(np.float32)
     drift = (float(np.median((rx + lx) / 2)), float(np.median((ry + ly) / 2)))
     pad = float(np.abs(np.stack([ax, ay])).max()) + 2
 
@@ -298,26 +369,41 @@ def body_turn(figure_path, right_path, left_path, right_png, left_png, image_hw,
     figure = split_limbs(tk.Decomposition(figure_path))
     # The two turns fit apart, a process each, started afresh (spawn): forked
     # with OpenCV's threads running, a child can hang.
-    fits = {}
+    fits, flows = {}, {}
     with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context('spawn')) as pool:
         jobs = {side: pool.submit(fit_turned, figure_path, psd, png)
                 for side, psd, png in (('right', right_path, right_png), ('left', left_path, left_png))}
         for side, job in jobs.items():
-            fits[side], lines = job.result()
+            fits[side], flows[side], lines = job.result()
             for line in lines:
                 log(f'{side:5s} {line}')
-    return keyed(fits, figure, image_hw, log, mode)
+    return keyed(fits, figure, image_hw, log, mode, flows)
 
 
-def keyed(fits, figure, image_hw, log=print, mode='turn'):
-    """body_turn's result from the two drawings' fits ({side: {family: key}}) on the figure's canvas."""
+def keyed(fits, figure, image_hw, log=print, mode='turn', flows=None):
+    """
+    body_turn's result from the two drawings' fits ({side: {family: key}}) on the
+    figure's canvas, and each part's flow in them ({side: {family: dx}}; without
+    them a turn's travel is the fit's own).
+    """
     knees = knees_of(figure)
+    split_knees(figure, knees)
     scale, ox, oy = placement(image_hw, (figure.H, figure.W))
     fits = dict(fits)
     turned, mirrored = {}, None
+    feet = ('footwear:L', 'footwear:R')
+
+    def flowed(side, families):
+        moves = [flows[side][f] for f in families if f in flows[side]]
+        return float(np.mean(moves)) if moves else None
+
     if mode == 'turn':
         for side in ('right', 'left'):
-            way = turned_way(fits[side])
+            if flows:
+                way = flowed(side, TRUNK)
+                way = None if way is None else way - (flowed(side, feet) or 0.0)
+            else:
+                way = turned_way(fits[side])
             turned[side] = None if way is None else round(way / scale, 1)
             log(f'{side:5s} turned {turned[side]} px')
         right_ok = (turned['right'] or 0) >= TURNED_AT_LEAST
@@ -325,13 +411,48 @@ def keyed(fits, figure, image_hw, log=print, mode='turn'):
         if right_ok != left_ok:
             mirrored = 'left' if right_ok else 'right'
             good = 'right' if right_ok else 'left'
-            moved = np.mean([sole_way(fits[good][f]) for f in ('footwear:L', 'footwear:R') if f in fits[good]] or [0.0])
+            moved = np.mean([sole_way(fits[good][f]) for f in feet if f in fits[good]] or [0.0])
             fits[good] = {family: shifted_key(key, -moved) for family, key in fits[good].items()}
             fits[mirrored] = mirrored_fit(fits[good], trunk_axis(figure))
             log(f'{mirrored} drew the wrong turn; keyed as the {good} turn mirrored '
                 f'(the figure moved {moved / scale:+.1f} px, taken off)')
         elif not right_ok:
             raise ValueError(f'neither drawing turned its own way: {turned}')
+    # Each part's travel in the turn to the right, from the pictures; the trunk's by height.
+    travel, profile = {}, None
+    if mode == 'turn' and flows:
+        if mirrored:
+            good = 'left' if mirrored == 'right' else 'right'
+            sign = 1 if good == 'right' else -1
+            still = flowed(good, feet) or 0.0
+            for family in BODY:
+                pair = [f for f in {family, MIRRORED.get(family, family)} if f in flows[good]]
+                # A mirrored turn is the same either way: a limb goes as both limbs do.
+                if pair:
+                    travel[family] = sign * (np.mean([flows[good][f] for f in pair]) - still)
+            profile = sign * (np.asarray(flows[good]['rows']) - still)
+        else:
+            travel = {f: (flows['right'][f] - flows['left'][f]) / 2 for f in BODY if f in flows['right'] and f in flows['left']}
+            profile = (np.asarray(flows['right']['rows']) - np.asarray(flows['left']['rows'])) / 2
+        known = np.nonzero(~np.isnan(profile))[0]
+        profile = np.interp(np.arange(len(profile)), known, profile[known]) if len(known) else None
+
+    def by_height(family):
+        """The trunk part's field set to go across as the trunk does at its height, its shape kept."""
+        use = [n for n in BODY[family] if n in figure.layers]
+        alpha = sum(figure.layers[n][..., 3] for n in use)
+
+        def across(ax, X, Y):
+            xi = np.clip(X.astype(int), 0, figure.W - 1)
+            yi = np.clip(Y.astype(int), 0, figure.H - 1)
+            on = alpha[yi, xi] > 0.5
+            out = ax.copy()
+            for i in range(ax.shape[0]):
+                row = on[i] if on[i].any() else np.ones_like(on[i])
+                out[i] = ax[i] - ax[i][row].mean() + profile[yi[i, 0]]
+            return out
+        return across
+
     keyforms, drift, plus_way = {}, {}, {}
     for family in BODY:
         if family not in fits['right'] or family not in fits['left']:
@@ -339,16 +460,30 @@ def keyed(fits, figure, image_hw, log=print, mode='turn'):
         if mode == 'weight' and family in ONE_SIDED:
             plus, minus = fits['right'][family], fits['left'][family]
         else:
-            plus, minus, shared = opposite_keys(fits['right'][family], fits['left'][family])
+            trunk_row = family in TRUNK_ROWS and profile is not None
+            across = by_height(family) if trunk_row else None
+            plus, minus, shared = opposite_keys(fits['right'][family], fits['left'][family], across)
             drift[family] = [round(shared[0] / scale, 1), round(shared[1] / scale, 1)]
             log(f'{family:11s} drift dropped ({drift[family][0]:+.1f}, {drift[family][1]:+.1f}) px')
+            if trunk_row:
+                points = part_points(figure, family)
+                log(f'{family:11s} travels {part_way(plus, points) / scale:+.1f} px as the trunk is drawn, by height')
+            elif family in travel:
+                points = part_points(figure, family)
+                if len(points[0]):
+                    fitted = part_way(plus, points)
+                    plus = shifted_key(plus, travel[family] - fitted)
+                    minus = shifted_key(minus, -travel[family] - part_way(minus, points))
+                    log(f'{family:11s} travels {travel[family] / scale:+.1f} px as drawn (fitted {fitted / scale:+.1f})')
         keyforms[family] = {'plus': placed(plus, scale, ox, oy), 'minus': placed(minus, scale, ox, oy)}
         plus_way[family] = key_way(plus)
     if mode == 'turn' and (trunk := [plus_way[f] for f in TRUNK if f in plus_way]):
         # Keyed against the trunk only by a fit gone astray.
         way = np.sign(np.mean(trunk))
         for family, moves in plus_way.items():
-            if family not in TRUNK and moves * way < -TURNED_AT_LEAST * scale:
+            # A part whose travel was read off the pictures goes as drawn.
+            measured = family in travel or (family in TRUNK_ROWS and profile is not None)
+            if family not in TRUNK and not measured and moves * way < -TURNED_AT_LEAST * scale:
                 if family in ON_TORSO and 'topwear' in keyforms:
                     keyforms[family] = keyforms['topwear']
                     log(f'{family:11s} keyed against the turn ({moves / scale:+.1f} px); takes the top\'s key')
