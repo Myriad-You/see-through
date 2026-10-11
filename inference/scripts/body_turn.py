@@ -34,6 +34,11 @@ barely moves, more than its prints and seams; the same pair fitted twice
 keyed the top -4 and +17 px, the skirt +145 and +38, while the drawing moved
 them +80 and +55. The optical flow from the figure to each drawing, its median
 over each part (`flow`), sets each key's travel; the fit keeps its shape.
+The trunk and what hangs over it (top, skirt, neck, sleeves) lie on one
+another, and fitted apart they part at every edge where they meet: they go
+as one, each row of the canvas across by the trunk's median travel at that
+height, nothing else. What a turn does across a row (it narrows the figure)
+is the same either way and drops out of what moves opposite ways anyway.
 A part keyed to go against the trunk's turn (a small, hidden neck fitted to
 something else) is not keyed by its own fit: the neck and arms, which hang
 from the torso, take the top's key; a leg goes unkeyed.
@@ -97,6 +102,8 @@ TURNED_AT_LEAST = 10.0
 FLOW_WIDTH = 420
 # The trunk's layers, whose travel goes by height so that top and skirt meet at the waist.
 TRUNK_ROWS = ('topwear', 'bottomwear', 'neck')
+# What goes as the trunk does, row by row: the trunk and the sleeves lying over its sides.
+AS_TRUNK = ('topwear', 'bottomwear', 'neck', 'arm:L', 'arm:R')
 # The trunk's travel by height is smoothed over this share of its height either way.
 TRUNK_SMOOTH = 0.04
 # Where a part is sampled to measure its key's travel, canvas px apart.
@@ -317,8 +324,8 @@ def mirrored_fit(fit, axis):
 def opposite_keys(right, left, across=None):
     """
     +key and -key of what moves opposite ways in the two turns, and what both
-    share (the drift dropped). `across(ax, X, Y)` may set the +key's travel
-    across (canvas px) at the points X, Y of its field.
+    share (the drift dropped). `across(ax, ay, X, Y)` may set the +key's
+    field (canvas px) at the points X, Y: (ax, ay).
     """
     grid = right['grid']
     x0, y0 = min(right['box'][0], left['box'][0]), min(right['box'][1], left['box'][1])
@@ -330,7 +337,7 @@ def opposite_keys(right, left, across=None):
     ax = ((rx - lx) / 2).reshape(X.shape).astype(np.float32)
     ay = ((ry - ly) / 2).reshape(X.shape).astype(np.float32)
     if across is not None:
-        ax = across(ax, X, Y).astype(np.float32)
+        ax, ay = (np.asarray(v, np.float32) for v in across(ax, ay, X, Y))
     drift = (float(np.median((rx + lx) / 2)), float(np.median((ry + ly) / 2)))
     pad = float(np.abs(np.stack([ax, ay])).max()) + 2
 
@@ -437,21 +444,10 @@ def keyed(fits, figure, image_hw, log=print, mode='turn', flows=None):
         known = np.nonzero(~np.isnan(profile))[0]
         profile = np.interp(np.arange(len(profile)), known, profile[known]) if len(known) else None
 
-    def by_height(family):
-        """The trunk part's field set to go across as the trunk does at its height, its shape kept."""
-        use = [n for n in BODY[family] if n in figure.layers]
-        alpha = sum(figure.layers[n][..., 3] for n in use)
-
-        def across(ax, X, Y):
-            xi = np.clip(X.astype(int), 0, figure.W - 1)
-            yi = np.clip(Y.astype(int), 0, figure.H - 1)
-            on = alpha[yi, xi] > 0.5
-            out = ax.copy()
-            for i in range(ax.shape[0]):
-                row = on[i] if on[i].any() else np.ones_like(on[i])
-                out[i] = ax[i] - ax[i][row].mean() + profile[yi[i, 0]]
-            return out
-        return across
+    def as_trunk(ax, ay, X, Y):
+        """Every row across by the trunk's travel at its height, and no more."""
+        yi = np.clip(Y.astype(int), 0, figure.H - 1)
+        return profile[yi], np.zeros_like(ay)
 
     keyforms, drift, plus_way = {}, {}, {}
     for family in BODY:
@@ -460,8 +456,8 @@ def keyed(fits, figure, image_hw, log=print, mode='turn', flows=None):
         if mode == 'weight' and family in ONE_SIDED:
             plus, minus = fits['right'][family], fits['left'][family]
         else:
-            trunk_row = family in TRUNK_ROWS and profile is not None
-            across = by_height(family) if trunk_row else None
+            trunk_row = family in AS_TRUNK and profile is not None
+            across = as_trunk if trunk_row else None
             plus, minus, shared = opposite_keys(fits['right'][family], fits['left'][family], across)
             drift[family] = [round(shared[0] / scale, 1), round(shared[1] / scale, 1)]
             log(f'{family:11s} drift dropped ({drift[family][0]:+.1f}, {drift[family][1]:+.1f}) px')
@@ -482,7 +478,7 @@ def keyed(fits, figure, image_hw, log=print, mode='turn', flows=None):
         way = np.sign(np.mean(trunk))
         for family, moves in plus_way.items():
             # A part whose travel was read off the pictures goes as drawn.
-            measured = family in travel or (family in TRUNK_ROWS and profile is not None)
+            measured = family in travel or (family in AS_TRUNK and profile is not None)
             if family not in TRUNK and not measured and moves * way < -TURNED_AT_LEAST * scale:
                 if family in ON_TORSO and 'topwear' in keyforms:
                     keyforms[family] = keyforms['topwear']
