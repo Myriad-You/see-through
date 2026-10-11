@@ -297,15 +297,26 @@ def stitch(whole, tiles, out_hw, path, log=print):
             names = owners or [name]
             stack = np.stack([paste(box, whole.placed(n))[..., 3] for n in names])
             keep = cv2.dilate((stack.max(0) > 0.3).astype(np.uint8), kernel) > 0
+            under = None
             if owners:
                 # Each pixel to the topmost of them drawn there, else the one most drawn.
                 topmost = np.full(stack.shape[1:], -1)
                 for i in sorted(range(len(names)), key=lambda i: order.index(names[i])):
                     topmost = np.where(stack[i] > 0.5, i, topmost)
                 topmost = np.where(topmost < 0, stack.argmax(0), topmost)
+                # Where a layer drawn over this one took the pixel, this one lies under it and the
+                # tile drew none of it there: the whole's own pixels stand (a sleeve goes on under
+                # the cardigan that hides it, so a turn opens no gap between them).
+                # Short of their outline by REACH, so no edge of it shows past the layer over it; up to
+                # the part of this layer the tile drew, so the two meet without a seam.
+                above = np.array([order.index(n) > order.index(name) for n in names])
+                inside = cv2.erode((stack.max(0) > 0.5).astype(np.uint8), kernel) > 0
+                under = keep & above[topmost] & inside
                 keep = keep & (topmost == names.index(name))
             mine *= keep[..., None]
             w = tile_weight(tile, box, out_hw)
+            if under is not None:
+                w = w * ~under[..., None]
             num += mine * w
             den += w
             used.append(f'{tile.name}{"" if tname == name else "(" + tname + ")"}')
