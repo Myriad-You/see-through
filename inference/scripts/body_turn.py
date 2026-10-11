@@ -18,6 +18,11 @@ to the other). That is not the turn, and keyed it pulls neck and collar apart
 as the figure turns: each part keeps only what moves opposite ways in the two
 turns, half their difference, as +key and -key.
 
+Each drawing must turn the way it was asked to: a generator asked for the
+other way sometimes draws the same turn again, and then what moves opposite
+ways is only what the two drawings got differently. The trunk's front says
+which way a drawing turned (`turned`, picture px, + toward image right).
+
 Keys are lattices as turn_keyforms makes them ('plus' toward image right),
 placed from the canvas onto the figure's picture, `image_hw`, whose
 decomposition the figure's is. Myriad's sides are the picture's: See-through's
@@ -69,6 +74,8 @@ GRID = 7
 HEAD_GRID = 9
 # Points of the forward field a symmetric key is measured at, canvas px apart.
 STRIDE = 4
+# Which way a turned drawing went is read from these, whose fronts turn plainly.
+TRUNK = ('topwear', 'bottomwear', 'neck')
 # In a weight shift these are one-sided, each drawing's own fit (see above).
 ONE_SIDED = {'thigh:L', 'thigh:R', 'shin:L', 'shin:R', 'footwear:L', 'footwear:R'}
 
@@ -173,6 +180,20 @@ def forward_field(key, X, Y):
     return tx - X, ty - Y
 
 
+def turned_way(fit):
+    """How far a turned drawing carried the trunk's front, canvas px (+ toward image right), or None."""
+    moves = []
+    for family in TRUNK:
+        key = fit.get(family)
+        if not key:
+            continue
+        x0, y0, x1, y1 = key['box']
+        X, Y = np.meshgrid(np.linspace(x0, x1, 9, dtype=np.float32), np.linspace(y0, y1, 9, dtype=np.float32))
+        dx, _ = forward_field(key, X.ravel(), Y.ravel())
+        moves.append(float(np.median(dx)))
+    return float(np.mean(moves)) if moves else None
+
+
 def opposite_keys(right, left):
     """+key and -key of what moves opposite ways in the two turns, and what both share (the drift dropped)."""
     grid = right['grid']
@@ -214,7 +235,8 @@ def placed(lattice, scale, ox, oy):
 def body_turn(figure_path, right_path, left_path, right_png, left_png, image_hw, log=print, mode='turn'):
     """
     {canvas: [W, H] of the picture, keyforms: {family: {plus, minus}}, and what was found:
-    drift: {family: [dx, dy]} dropped, knees: {side: y} cut at}, in the picture's pixels.
+    drift: {family: [dx, dy]} dropped, knees: {side: y} cut at, turned: {side: dx} which
+    way each drawing turned (a turn's only)}, in the picture's pixels.
     """
     use_body_tables()
     figure = split_limbs(tk.Decomposition(figure_path))
@@ -242,7 +264,14 @@ def body_turn(figure_path, right_path, left_path, right_png, left_png, image_hw,
             log(f'{family:11s} drift dropped ({drift[family][0]:+.1f}, {drift[family][1]:+.1f}) px')
         keyforms[family] = {'plus': placed(plus, scale, ox, oy), 'minus': placed(minus, scale, ox, oy)}
     knees = {side: round((y - oy) / scale, 1) for side, y in knees.items()}
-    return dict(canvas=[image_hw[1], image_hw[0]], keyforms=keyforms, drift=drift, knees=knees)
+    result = dict(canvas=[image_hw[1], image_hw[0]], keyforms=keyforms, drift=drift, knees=knees)
+    if mode == 'turn':
+        result['turned'] = {}
+        for side in ('right', 'left'):
+            way = turned_way(fits[side])
+            result['turned'][side] = None if way is None else round(way / scale, 1)
+            log(f'{side:5s} turned {result["turned"][side]} px')
+    return result
 
 
 if __name__ == '__main__':
