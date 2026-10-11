@@ -19,9 +19,18 @@ as the figure turns: each part keeps only what moves opposite ways in the two
 turns, half their difference, as +key and -key.
 
 Each drawing must turn the way it was asked to: a generator asked for the
-other way sometimes draws the same turn again, and then what moves opposite
-ways is only what the two drawings got differently. The trunk's front says
-which way a drawing turned (`turned`, picture px, + toward image right).
+other way often draws the same turn again (mirroring the figure for it does
+not help), and then what moves opposite ways is only what the two drawings
+got differently. The trunk's front says which way a drawing turned
+(`turned`, picture px, + toward image right). A drawing that turned the wrong
+way is not used: the other's fit, mirrored about the trunk, keys its turn
+(`mirrored`), each limb's from the other limb's. A body turns about alike
+either way; what was drawn differently on one side is lost to the other. One
+drawing alone does not tell its turn from where the generator moved the whole
+figure, but the feet were to stay: how far the shoes went is taken off first.
+A part keyed to go against the trunk's turn (a small, hidden neck fitted to
+something else) is not keyed by its own fit: the neck and arms, which hang
+from the torso, take the top's key; a leg goes unkeyed.
 
 Keys are lattices as turn_keyforms makes them ('plus' toward image right),
 placed from the canvas onto the figure's picture, `image_hw`, whose
@@ -75,7 +84,14 @@ HEAD_GRID = 9
 # Points of the forward field a symmetric key is measured at, canvas px apart.
 STRIDE = 4
 # Which way a turned drawing went is read from these, whose fronts turn plainly.
-TRUNK = ('topwear', 'bottomwear', 'neck')
+TRUNK = ('topwear', 'bottomwear')
+# A drawing whose trunk went less than this (picture px) its own way drew the wrong turn.
+TURNED_AT_LEAST = 10.0
+# What hangs from the torso, and takes its key when its own went astray.
+ON_TORSO = ('neck', 'arm:L', 'arm:R')
+# What a mirror makes of each part: a limb becomes the other one.
+MIRRORED = {'thigh:L': 'thigh:R', 'thigh:R': 'thigh:L', 'shin:L': 'shin:R', 'shin:R': 'shin:L',
+            'footwear:L': 'footwear:R', 'footwear:R': 'footwear:L', 'arm:L': 'arm:R', 'arm:R': 'arm:L'}
 # In a weight shift these are one-sided, each drawing's own fit (see above).
 ONE_SIDED = {'thigh:L', 'thigh:R', 'shin:L', 'shin:R', 'footwear:L', 'footwear:R'}
 
@@ -180,18 +196,57 @@ def forward_field(key, X, Y):
     return tx - X, ty - Y
 
 
-def turned_way(fit):
-    """How far a turned drawing carried the trunk's front, canvas px (+ toward image right), or None."""
-    moves = []
-    for family in TRUNK:
-        key = fit.get(family)
-        if not key:
-            continue
-        x0, y0, x1, y1 = key['box']
-        X, Y = np.meshgrid(np.linspace(x0, x1, 9, dtype=np.float32), np.linspace(y0, y1, 9, dtype=np.float32))
-        dx, _ = forward_field(key, X.ravel(), Y.ravel())
-        moves.append(float(np.median(dx)))
+def key_way(key):
+    """How far a key carries its part across, canvas px (+ toward image right)."""
+    x0, y0, x1, y1 = key['box']
+    X, Y = np.meshgrid(np.linspace(x0, x1, 9, dtype=np.float32), np.linspace(y0, y1, 9, dtype=np.float32))
+    dx, _ = forward_field(key, X.ravel(), Y.ravel())
+    return float(np.median(dx))
+
+
+def sole_way(key):
+    """How far a shoe's key carries its sole across, canvas px: its bottom rows, which stay put as it turns."""
+    x0, y0, x1, y1 = key['box']
+    X, Y = np.meshgrid(np.linspace(x0, x1, 9, dtype=np.float32), np.linspace(y1 - 0.15 * (y1 - y0), y1, 3, dtype=np.float32))
+    dx, _ = forward_field(key, X.ravel(), Y.ravel())
+    return float(np.median(dx))
+
+
+def turned_way(fit, families=TRUNK):
+    """How far a turned drawing carried these parts (the trunk's front), canvas px, or None."""
+    moves = [key_way(fit[family]) for family in families if fit.get(family)]
     return float(np.mean(moves)) if moves else None
+
+
+def shifted_key(key, dx):
+    """A lattice key whose turned part lies dx further across."""
+    x0, y0, x1, y1 = key['box']
+    back = np.asarray(key['back'], np.float32).reshape(-1, 2).copy()
+    back[:, 0] -= dx
+    return dict(key, box=[float(x0 + dx), float(y0), float(x1 + dx), float(y1)],
+                back=[float(v) for v in back.reshape(-1)])
+
+
+def trunk_axis(figure):
+    """The figure's middle, canvas x: halfway across its trunk."""
+    alpha = sum(figure.layers[n][..., 3] for n in TRUNK if n in figure.layers)
+    xs = np.nonzero((np.asarray(alpha) > 0.5).any(0))[0]
+    return float(xs[0] + xs[-1] + 1) / 2 if len(xs) else figure.W / 2
+
+
+def mirrored_key(key, axis):
+    """A lattice key reflected about x = axis: what its part does turned the other way."""
+    x0, y0, x1, y1 = key['box']
+    g = key['grid']
+    back = np.asarray(key['back'], np.float32).reshape(g, g, 2)[:, ::-1].copy()
+    back[..., 0] *= -1
+    return dict(key, box=[float(2 * axis - x1), float(y0), float(2 * axis - x0), float(y1)],
+                back=[float(v) for v in back.reshape(-1)])
+
+
+def mirrored_fit(fit, axis):
+    """A turned drawing's fit reflected: every part's key as the other turn's, limbs swapped."""
+    return {MIRRORED.get(family, family): mirrored_key(key, axis) for family, key in fit.items()}
 
 
 def opposite_keys(right, left):
@@ -235,12 +290,12 @@ def placed(lattice, scale, ox, oy):
 def body_turn(figure_path, right_path, left_path, right_png, left_png, image_hw, log=print, mode='turn'):
     """
     {canvas: [W, H] of the picture, keyforms: {family: {plus, minus}}, and what was found:
-    drift: {family: [dx, dy]} dropped, knees: {side: y} cut at, turned: {side: dx} which
-    way each drawing turned (a turn's only)}, in the picture's pixels.
+    drift: {family: [dx, dy]} dropped, knees: {side: y} cut at, and for a turn turned:
+    {side: dx} which way each drawing turned, mirrored: the side keyed from the other's
+    mirror or None}, in the picture's pixels. Neither drawing turned its own way: ValueError.
     """
     use_body_tables()
     figure = split_limbs(tk.Decomposition(figure_path))
-    knees = knees_of(figure)
     # The two turns fit apart, a process each, started afresh (spawn): forked
     # with OpenCV's threads running, a child can hang.
     fits = {}
@@ -251,8 +306,33 @@ def body_turn(figure_path, right_path, left_path, right_png, left_png, image_hw,
             fits[side], lines = job.result()
             for line in lines:
                 log(f'{side:5s} {line}')
+    return keyed(fits, figure, image_hw, log, mode)
+
+
+def keyed(fits, figure, image_hw, log=print, mode='turn'):
+    """body_turn's result from the two drawings' fits ({side: {family: key}}) on the figure's canvas."""
+    knees = knees_of(figure)
     scale, ox, oy = placement(image_hw, (figure.H, figure.W))
-    keyforms, drift = {}, {}
+    fits = dict(fits)
+    turned, mirrored = {}, None
+    if mode == 'turn':
+        for side in ('right', 'left'):
+            way = turned_way(fits[side])
+            turned[side] = None if way is None else round(way / scale, 1)
+            log(f'{side:5s} turned {turned[side]} px')
+        right_ok = (turned['right'] or 0) >= TURNED_AT_LEAST
+        left_ok = (turned['left'] or 0) <= -TURNED_AT_LEAST
+        if right_ok != left_ok:
+            mirrored = 'left' if right_ok else 'right'
+            good = 'right' if right_ok else 'left'
+            moved = np.mean([sole_way(fits[good][f]) for f in ('footwear:L', 'footwear:R') if f in fits[good]] or [0.0])
+            fits[good] = {family: shifted_key(key, -moved) for family, key in fits[good].items()}
+            fits[mirrored] = mirrored_fit(fits[good], trunk_axis(figure))
+            log(f'{mirrored} drew the wrong turn; keyed as the {good} turn mirrored '
+                f'(the figure moved {moved / scale:+.1f} px, taken off)')
+        elif not right_ok:
+            raise ValueError(f'neither drawing turned its own way: {turned}')
+    keyforms, drift, plus_way = {}, {}, {}
     for family in BODY:
         if family not in fits['right'] or family not in fits['left']:
             continue
@@ -263,16 +343,23 @@ def body_turn(figure_path, right_path, left_path, right_png, left_png, image_hw,
             drift[family] = [round(shared[0] / scale, 1), round(shared[1] / scale, 1)]
             log(f'{family:11s} drift dropped ({drift[family][0]:+.1f}, {drift[family][1]:+.1f}) px')
         keyforms[family] = {'plus': placed(plus, scale, ox, oy), 'minus': placed(minus, scale, ox, oy)}
+        plus_way[family] = key_way(plus)
+    if mode == 'turn' and (trunk := [plus_way[f] for f in TRUNK if f in plus_way]):
+        # Keyed against the trunk only by a fit gone astray.
+        way = np.sign(np.mean(trunk))
+        for family, moves in plus_way.items():
+            if family not in TRUNK and moves * way < -TURNED_AT_LEAST * scale:
+                if family in ON_TORSO and 'topwear' in keyforms:
+                    keyforms[family] = keyforms['topwear']
+                    log(f'{family:11s} keyed against the turn ({moves / scale:+.1f} px); takes the top\'s key')
+                else:
+                    del keyforms[family]
+                    log(f'{family:11s} keyed against the turn ({moves / scale:+.1f} px); left unkeyed')
     knees = {side: round((y - oy) / scale, 1) for side, y in knees.items()}
     result = dict(canvas=[image_hw[1], image_hw[0]], keyforms=keyforms, drift=drift, knees=knees)
     if mode == 'turn':
-        result['turned'] = {}
-        for side in ('right', 'left'):
-            way = turned_way(fits[side])
-            result['turned'][side] = None if way is None else round(way / scale, 1)
-            log(f'{side:5s} turned {result["turned"][side]} px')
+        result.update(turned=turned, mirrored=mirrored)
     return result
-
 
 if __name__ == '__main__':
     figure_psd, right_psd, left_psd, right_png, left_png, height, width, out = sys.argv[1:9]
