@@ -155,12 +155,17 @@ def _decompose(image, resolution, seed, tblr_split, output_scale=1, size_conditi
 
         psd_path = saved + ".psd"
         if os.path.exists(psd_path):
-            output_path = os.path.join(
-                tempfile.mkdtemp(prefix="seethrough_out_"), "seethrough_output.psd"
-            )
+            out_dir = tempfile.mkdtemp(prefix="seethrough_out_")
+            output_path = os.path.join(out_dir, "seethrough_output.psd")
             shutil.copy2(psd_path, output_path)
+            # The PSD's twin, written beside it: each layer's depth from the
+            # joint depth pass (0 near, 255 far), same names and placement.
+            depth_path = None
+            if os.path.exists(saved + "_depth.psd"):
+                depth_path = os.path.join(out_dir, "seethrough_depth.psd")
+                shutil.copy2(saved + "_depth.psd", depth_path)
             _log(f"Total inference time: {time.time() - t_start:.1f}s")
-            return output_path, gallery
+            return output_path, gallery, depth_path
 
         raise gr.Error("PSD generation failed — no output file produced.")
     finally:
@@ -177,7 +182,7 @@ def inference(image: Image.Image, resolution: int = 768, seed: int = 42, tblr_sp
     resolution = max(64, min(resolution, 1280))
     # Snap to nearest multiple of 64 for clean latent dimensions
     resolution = round(resolution / 64) * 64
-    return _decompose(image, resolution, seed, tblr_split)
+    return _decompose(image, resolution, seed, tblr_split)[:2]
 
 
 @spaces.GPU(duration=240)
@@ -613,10 +618,11 @@ with gr.Blocks(title="See-through: Layer Decomposition") as demo:
             with gr.Column(scale=2):
                 canvas_psd = gr.File(label="Download layered PSD")
                 canvas_gallery = gr.Gallery(label="Separated layers", columns=4, height="auto")
+                canvas_depth = gr.File(label="Depth PSD (each layer's depth, 0 near)")
         canvas_btn.click(
             fn=decompose,
             inputs=[canvas_image, canvas_size, canvas_seed, canvas_split, canvas_scale, canvas_condition],
-            outputs=[canvas_psd, canvas_gallery],
+            outputs=[canvas_psd, canvas_gallery, canvas_depth],
             api_name="decompose",
         )
         lean_tags = gr.Textbox(value="front hair,back hair,head,neck,neckwear", label="Body tags (lean)")
@@ -625,7 +631,7 @@ with gr.Blocks(title="See-through: Layer Decomposition") as demo:
         lean_btn.click(
             fn=decompose_lean,
             inputs=[canvas_image, canvas_size, canvas_seed, canvas_split, lean_tags, lean_steps],
-            outputs=[canvas_psd, canvas_gallery],
+            outputs=[canvas_psd, canvas_gallery, canvas_depth],
             api_name="decompose_lean",
         )
         canvas_hair = gr.Radio(choices=["canvas", "head"], value="head", label="Hair pass")
@@ -633,7 +639,7 @@ with gr.Blocks(title="See-through: Layer Decomposition") as demo:
         canvas_hair_btn.click(
             fn=decompose_hair,
             inputs=[canvas_image, canvas_size, canvas_seed, canvas_split, canvas_hair],
-            outputs=[canvas_psd, canvas_gallery],
+            outputs=[canvas_psd, canvas_gallery, canvas_depth],
             api_name="decompose_hair",
         )
 
