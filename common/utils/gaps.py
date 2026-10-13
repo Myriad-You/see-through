@@ -139,3 +139,60 @@ def fill_from_source(part: np.ndarray, page: np.ndarray, gap: np.ndarray, figure
     out = part.copy()
     out[over] = page[over]
     return out
+
+
+# What hangs in front of a part where it was hidden at rest: the sleeves over
+# a skirt, locks over anything. Parts behind it (back hair behind a skirt,
+# legs under it) are left as they show.
+IN_FRONT_OF = {
+    'bottomwear': {'handwear', 'front hair', 'objects'},
+    'legwear': {'handwear', 'front hair', 'bottomwear', 'objects'},
+    'objects': {'handwear', 'front hair'},
+}
+# Smaller pieces of a garment have no outline worth completing.
+HIDDEN_MIN_PIECE = 400
+
+
+def hidden_side(garment: np.ndarray, tag: str, page: np.ndarray, parts: dict) -> np.ndarray:
+    '''
+    Where a garment lifted from the source lies hidden at rest: inside the
+    outline of each of its pieces (their convex hulls), where a part that
+    hangs in front of it (IN_FRONT_OF) draws the source's colour.
+    '''
+    shown = garment[..., 3] > 128
+    hull = np.zeros(shown.shape, np.uint8)
+    contours, _ = cv2.findContours(shown.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for contour in contours:
+        if cv2.contourArea(contour) >= HIDDEN_MIN_PIECE:
+            cv2.fillPoly(hull, [cv2.convexHull(contour)], 1)
+    source = page[..., :3].astype(np.float32)
+    front = np.zeros(shown.shape, bool)
+    for name, part in parts.items():
+        if name not in IN_FRONT_OF.get(tag, ()):
+            continue
+        drawn = part[..., 3] > DRAWN
+        front |= drawn & (np.linalg.norm(part[..., :3].astype(np.float32) - source, axis=-1) <= MATCH_DISTANCE)
+    return (hull > 0) & front & ~shown
+
+
+def complete_hidden(garment: np.ndarray, hidden: np.ndarray, inpaint) -> np.ndarray:
+    '''
+    garment (RGBA) with its hidden side drawn in by inpaint(rgb, mask255)
+    from what of it shows alone: the parts in front of it, and the backdrop,
+    do not colour the fill.
+    '''
+    if not hidden.any():
+        return garment
+    shown = garment[..., 3] > 128
+    ys, xs = np.nonzero(hidden | shown)
+    h, w = hidden.shape
+    y0, y1 = max(0, ys.min() - 16), min(h, ys.max() + 17)
+    x0, x1 = max(0, xs.min() - 16), min(w, xs.max() + 17)
+    rgb = np.ascontiguousarray(garment[y0: y1, x0: x1, :3])
+    mask = np.where(shown[y0: y1, x0: x1], 0, 255).astype(np.uint8)
+    filled = inpaint(rgb, mask)
+    out = garment.copy()
+    region = hidden[y0: y1, x0: x1]
+    out[y0: y1, x0: x1][region, :3] = filled[region]
+    out[y0: y1, x0: x1][region, 3] = 255
+    return out

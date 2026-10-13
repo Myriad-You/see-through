@@ -105,6 +105,25 @@ def test_below_the_lower_garment_a_gap_is_the_legs():
     assert gaps.place_tag(picture([(0, 0, 5, 5, (1, 1, 1, 255))])[..., 3] > 0, {'topwear': picture([TOP])}) == 'objects'
 
 
+def test_a_lifted_skirt_is_drawn_in_behind_the_sleeve_over_it_not_behind_the_hair_behind_it():
+    import cv2
+    skirt = (30, 110, 60, 50, (120, 60, 160, 255))
+    # The sleeve hangs over the skirt's side above its hem, which shows below it.
+    sleeve = (30, 120, 12, 30, (240, 200, 230, 255))
+    hair = (80, 120, 10, 40, (200, 220, 250, 255))
+    page = source([HEAD, TOP, skirt, sleeve, hair])
+    # Lifted from the source: the skirt but where the sleeve and the hair show.
+    garment = picture([skirt])
+    garment[120:150, 30:42] = 0
+    garment[120:160, 80:90] = 0
+    parts = {'handwear': picture([sleeve]), 'back hair': picture([hair])}
+    behind = gaps.hidden_side(garment, 'bottomwear', page, parts)
+    assert behind[140, 35] and not behind[140, 85], 'under the sleeve, not under the back hair'
+    done = gaps.complete_hidden(garment, behind, lambda rgb, mask: cv2.inpaint(rgb, mask, 3, cv2.INPAINT_TELEA))
+    assert done[140, 35, 3] == 255 and np.linalg.norm(done[140, 35, :3].astype(float) - (120, 60, 160)) < 40
+    assert done[140, 85, 3] == 0 and done[5, 5, 3] == 0
+
+
 def kept(psd_path, master_path, expected):
     '''A kept front decomposition against its master, fitted as the canvas path fits it.'''
     import cv2

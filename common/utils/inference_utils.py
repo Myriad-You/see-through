@@ -461,11 +461,25 @@ def _cover_gaps(run, pipeline, input_img, fullpage, placement, canvas_hw, saved,
                 parts[tag] = gaps.take(parts[tag], drawn, gap)
             drew = f"its {tag} pass drew {share:.0%}{', taken' if taken else ''} ({time.time() - started - at:.0f}s)"
         left = gap & (parts[tag][..., 3] <= 128)
+        hidden = 0
         if left.any():
             parts[tag] = gaps.fill_from_source(parts[tag], fullpage, left, figure)
+            # What the source shows of it ends where something hangs in front: drawn in behind that.
+            behind = gaps.hidden_side(parts[tag], tag, fullpage, parts)
+            try:
+                parts[tag] = gaps.complete_hidden(parts[tag], behind, _inpaint)
+                hidden = int(behind.sum())
+            except Exception as error:  # the inpainter is a nicety; the garment stands without it
+                print(f'[gaps] hidden side not drawn: {error!r}', flush=True)
         Image.fromarray(parts[tag]).save(osp.join(saved, f'{tag}.png'))
         print(f'[gaps] {int(gap.sum())} px no part had, at {at:.0f}s, -> {tag}: {drew}; '
-              f'{int(left.sum())} px from the source', flush=True)
+              f'{int(left.sum())} px from the source, {hidden} px drawn in behind what hangs in front', flush=True)
+
+
+def _inpaint(rgb, mask):
+    '''LaMa (anime, large) on the GPU when there is one.'''
+    from annotators.lama_inpainter import apply_inpaint
+    return apply_inpaint(rgb, mask, device='cuda' if torch.cuda.is_available() else 'cpu')
 
 
 def promote_output_scale(saved: str, imgp: str):
