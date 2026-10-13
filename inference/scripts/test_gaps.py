@@ -78,15 +78,17 @@ def test_the_back_hair_drawn_behind_a_dropped_skirt_does_not_hide_it():
     assert len(found) == 1 and found[0][130, 60]
 
 
-def test_a_part_hidden_behind_does_not_count_as_drawing_what_shows():
+def test_a_part_drawn_behind_what_covers_it_is_buried_not_a_gap():
     # The skirt's colour drawn in a part behind the top shows nowhere: no gap there.
     page = source([HEAD, TOP, SKIRT])
     figure = gaps.figure_mask(page, PLACEMENT)
     behind = picture([(30, 110, 60, 50, (120, 60, 160, 255))])
     assert gaps.find_gaps(figure, page, [behind, picture([HEAD]), picture([TOP])], HEAD_BOX) == []
     covered = picture([(30, 110, 60, 50, (240, 240, 240, 255))])
-    assert len(gaps.find_gaps(figure, page, [behind, picture([HEAD]), picture([TOP]), covered], HEAD_BOX)) == 1, \
-        'what a part in front paints over it is what shows'
+    assert gaps.find_gaps(figure, page, [behind, picture([HEAD]), picture([TOP]), covered], HEAD_BOX) == [], \
+        'drawn behind what covers it, it is buried, not left out: the importer reveals it'
+    assert len(gaps.find_gaps(figure, page, [picture([HEAD]), picture([TOP]), covered], HEAD_BOX)) == 1, \
+        'drawn by no part, what covers it shows something else: a gap'
 
 
 def test_nothing_is_a_gap_when_every_part_was_drawn():

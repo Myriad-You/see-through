@@ -80,16 +80,35 @@ def unexplained(figure: np.ndarray, page: np.ndarray, images) -> np.ndarray:
     return figure & ((alpha < 0.5) | (distance > MISMATCH_DISTANCE))
 
 
+# A gap that parts draw as the source has it, under what shows there, for
+# more than this share is buried rather than left out: a cardigan's front
+# panel drawn in the top, under the skirt drawn over it. Myriad's importer
+# reveals buried art, cutting only what covers it; given to a part here it
+# would go with that part.
+BURIED_SHARE = 0.5
+
+
+def drawn_right(page: np.ndarray, images) -> np.ndarray:
+    '''Where some part (canvas RGBA) draws what the source shows, whether or not it shows there.'''
+    out = np.zeros(page.shape[:2], bool)
+    for image in images:
+        distance = np.linalg.norm(image[..., :3].astype(np.float32) - page[..., :3].astype(np.float32), axis=-1)
+        out |= (image[..., 3] > 128) & (distance <= MISMATCH_DISTANCE)
+    return out
+
+
 def find_gaps(figure: np.ndarray, page: np.ndarray, images, head_xyxy=None):
     '''
     The drawing's gaps (unexplained), largest first, each a boolean mask of
     at least GAP_MIN_SHARE of the figure, not centred in the head's box
-    (x1, y1, x2, y2); strands across a gap do not split it.
+    (x1, y1, x2, y2), and not buried (BURIED_SHARE); strands across a gap
+    do not split it.
     '''
     gap = cv2.morphologyEx(unexplained(figure, page, images).astype(np.uint8), cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
     gap = (cv2.morphologyEx(gap, cv2.MORPH_CLOSE, np.ones((STRAND, STRAND), np.uint8)) > 0) & figure
     n, labels, stats, centroids = cv2.connectedComponentsWithStats(gap.astype(np.uint8), connectivity=8)
     floor = GAP_MIN_SHARE * figure.sum()
+    right = None
     found = []
     for k in np.argsort(-stats[1:, cv2.CC_STAT_AREA]) + 1:
         if stats[k, cv2.CC_STAT_AREA] < floor:
@@ -97,7 +116,12 @@ def find_gaps(figure: np.ndarray, page: np.ndarray, images, head_xyxy=None):
         cx, cy = centroids[k]
         if head_xyxy is not None and head_xyxy[0] <= cx < head_xyxy[2] and head_xyxy[1] <= cy < head_xyxy[3]:
             continue
-        found.append(labels == k)
+        if right is None:
+            right = drawn_right(page, images)
+        mask = labels == k
+        if right[mask].mean() > BURIED_SHARE:
+            continue
+        found.append(mask)
     return found
 
 
