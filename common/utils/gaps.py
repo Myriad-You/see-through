@@ -98,6 +98,27 @@ def figure_mask(page: np.ndarray, placement):
     return cv2.morphologyEx(figure.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)) > 0
 
 
+def open_backdrop(page: np.ndarray, placement):
+    '''
+    The backdrop that joins the source's edge: pixels of its colour
+    (backdrop_model) walked in from the edge, 4-connected, and the canvas
+    past the source. White drawn inside an outline (a maid's frill on white)
+    is not reached; the gaps between the frill's scallops are. None without a
+    backdrop.
+    '''
+    _, x, y, w, h = placement
+    model, share = backdrop_model(page[y: y + h, x: x + w])
+    if model is None or share < FLAT_EDGE_SHARE:
+        return None
+    near = np.linalg.norm(page[y: y + h, x: x + w, :3].astype(np.float32) - model, axis=-1) <= BACKDROP_DISTANCE
+    _, labels = cv2.connectedComponents(near.astype(np.uint8), connectivity=4)
+    edge = np.concatenate([labels[0], labels[-1], labels[:, 0], labels[:, -1]])
+    joined = np.unique(edge[edge > 0])
+    out = page[..., 3] <= 128
+    out[y: y + h, x: x + w] |= np.isin(labels, joined)
+    return out
+
+
 def composite(images):
     '''The parts (canvas RGBA, back to front) drawn together: colour, alpha, and the index of the part on top (-1).'''
     h, w = images[0].shape[:2]
@@ -418,6 +439,91 @@ def worse(images, page, figure, before_error) -> int:
     return int((figure & (error > MISMATCH_DISTANCE) & (before_error <= MISMATCH_DISTANCE)).sum())
 
 
+def palette_colours(samples: np.ndarray, page: np.ndarray, clusters: int = 8) -> np.ndarray:
+    '''Where the page is of the samples' colours (RGB rows): as close to one of their clusters as nine in ten of them are.'''
+    data = samples.astype(np.float32)
+    k = min(clusters, len(data))
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
+    _, _, centres = cv2.kmeans(data, k, None, criteria, 2, cv2.KMEANS_PP_CENTERS)
+    def nearest(colours):
+        return np.min(np.linalg.norm(colours[:, None, :] - centres[None, :, :], axis=-1), axis=1)
+    limit = np.percentile(nearest(data), GARMENT_LIKE_SHARE * 100)
+    h, w = page.shape[:2]
+    return (nearest(page[..., :3].reshape(-1, 3).astype(np.float32)) <= limit).reshape(h, w)
+
+
+# The parts the head pass draws, on its own box of the source.
+HEAD_PASS_TAGS = ('headwear', 'face', 'irides', 'eyebrow', 'eyewhite', 'eyelash', 'eyewear', 'ears', 'earwear', 'nose', 'mouth')
+# A head part drawn along this many pixels of an edge of that box is cut there.
+CUT_RUN = 12
+# How far past its box, as a share of the box's height, a cut part goes on.
+CUT_REACH = 0.3
+
+
+def extend_cut(names, images, page, placement, box, log=print):
+    '''
+    The head pass draws its parts on its own box of the source, and a part
+    reaching past it is cut straight across there (a maid's frill above the
+    head, the tails of the bows beside it): it goes on past the box from the
+    source's own pixels, joined to it where it was cut, as far as CUT_REACH
+    of the box, where they are the figure (not the backdrop open to the
+    source's edge: a frill's white inside its outline counts), no other part
+    draws them as the source has them (hair showing through), and they are
+    of its colours there. In place; returns the names of the parts it grew.
+    '''
+    backdrop = open_backdrop(page, placement)
+    if backdrop is None:
+        return []
+    h, w = page.shape[:2]
+    x1, y1, x2, y2 = [int(round(v)) for v in box]
+    x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
+    if x2 - x1 < 2 * CUT_RUN or y2 - y1 < 2 * CUT_RUN:
+        return []
+    inside = np.zeros((h, w), bool)
+    inside[y1: y2, x1: x2] = True
+    reach = int(CUT_REACH * (y2 - y1))
+    near_box = np.zeros((h, w), bool)
+    near_box[max(0, y1 - reach): min(h, y2 + reach), max(0, x1 - reach): min(w, x2 + reach)] = True
+    grown = []
+    for index, name in enumerate(names):
+        if kind(name) not in HEAD_PASS_TAGS:
+            continue
+        drawn = images[index][..., 3] > 128
+        # Where it is drawn along each edge, the pixel just past it seeds what goes on beyond.
+        seeds = np.zeros((h, w), bool)
+        for line, beyond in (((slice(y1, y1 + 1), slice(x1, x2)), (y1 - 1, None)),
+                             ((slice(y2 - 1, y2), slice(x1, x2)), (y2, None)),
+                             ((slice(y1, y2), slice(x1, x1 + 1)), (None, x1 - 1)),
+                             ((slice(y1, y2), slice(x2 - 1, x2)), (None, x2))):
+            along = drawn[line]
+            if along.sum() < CUT_RUN:
+                continue
+            by, bx = beyond
+            if by is not None and 0 <= by < h:
+                seeds[by, x1: x2] |= along[0]
+            if bx is not None and 0 <= bx < w:
+                seeds[y1: y2, bx] |= along[:, 0]
+        if not seeds.any():
+            continue
+        others = [images[i] for i in range(len(images)) if i != index]
+        # Of its colours: as close to the colours it has close to the cut as nine in ten of them are.
+        band = drawn & inside & ~(cv2.erode(inside.astype(np.uint8), np.ones((2 * REACH + 1,) * 2, np.uint8)) > 0)
+        if band.sum() < CUT_RUN:
+            continue
+        like = palette_colours(page[band][:, :3], page)
+        candidate = near_box & ~inside & ~drawn & ~backdrop & ~drawn_right(page, others) & like & (page[..., 3] > 128)
+        _, labels = cv2.connectedComponents((candidate | seeds).astype(np.uint8), connectivity=8)
+        joined = np.unique(labels[seeds & candidate])
+        add = candidate & np.isin(labels, joined[joined > 0])
+        if not add.any():
+            continue
+        images[index] = images[index].copy()
+        images[index][add] = page[add]
+        grown.append(name)
+        log(f'[gaps] {name} was cut at the head pass\'s box: {int(add.sum())} px past it from the source')
+    return grown
+
+
 def cover(names, images, page, placement, head_xyxy=None, inpaint=None, log=print):
     '''
     The parts (names, canvas RGBA images, back to front) with the figure's
@@ -518,13 +624,15 @@ def cover(names, images, page, placement, head_xyxy=None, inpaint=None, log=prin
     return names, images, changes
 
 
-def cover_parts(part_dict_list, page, placement, inpaint=None, log=print):
+def cover_parts(part_dict_list, page, placement, inpaint=None, log=print, head_box=None):
     '''
     cover on the parts as further_extr has them before the PSD (each a dict of
     tag, img cropped to xyxy, its depth (0..255) and depth_median, the PSD
-    drawing them by depth_median, far first), in place: a new part is added,
-    and the parts given a new place get depth_medians between their new
-    neighbours'; the others keep theirs. Returns what changed (cover's).
+    drawing them by depth_median, far first), in place, after the head parts
+    cut at the head pass's box (head_box, canvas x1, y1, x2, y2) are carried
+    on past it (extend_cut): a new part is added, and the parts given a new
+    place get depth_medians between their new neighbours'; the others keep
+    theirs. Returns what changed (cover's).
     '''
     h, w = page.shape[:2]
     order = sorted(part_dict_list, key=lambda part: part['depth_median'], reverse=True)
@@ -535,13 +643,25 @@ def cover_parts(part_dict_list, page, placement, inpaint=None, log=print):
         out[y1: y2, x1: x2] = part['img']
         return out
 
+    names, images = [part['tag'] for part in order], [canvas(part) for part in order]
+    grown = extend_cut(names, images, page, placement, head_box, log) if head_box is not None else []
     face = next((part for part in order if part['tag'] == 'face'), None)
-    covered = cover([part['tag'] for part in order], [canvas(part) for part in order], page, placement,
-                    tuple(face['xyxy']) if face else None, inpaint, log)
-    if covered is None:
+    covered = cover(names, images, page, placement, tuple(face['xyxy']) if face else None, inpaint, log)
+    if covered is None and not grown:
         return []
-    names, images, changes = covered
+    names, images, changes = covered if covered is not None else (names, images, [])
     by_tag = {part['tag']: part for part in part_dict_list}
+    # A part carried on past the head pass's box keeps its depth; its new pixels take its median.
+    for tag in set(grown) - {tag for tag, _, _ in changes}:
+        part = by_tag[tag]
+        image = images[names.index(tag)]
+        x, y, bw, bh = cv2.boundingRect(cv2.findNonZero((image[..., 3] > 10).astype(np.uint8)))
+        depth = np.full((h, w), round(float(part['depth_median']) * 255), np.uint8)
+        x1, y1, x2, y2 = part['xyxy']
+        depth[y1: y2, x1: x2] = part['depth']
+        part.update(img=image[y: y + bh, x: x + bw], xyxy=[x, y, x + bw, y + bh], depth=depth[y: y + bh, x: x + bw])
+    if not changes:
+        return []
     placed = {tag for tag, _, _ in changes} | {name for _, _, moved in changes for name in moved}
     for tag in placed - by_tag.keys():
         part = {'tag': tag, 'depth': np.zeros((0, 0), np.uint8), 'xyxy': [0, 0, 0, 0]}

@@ -395,6 +395,10 @@ def _apply_layerdiff_canvas(pipeline, imgp, saved, seed, num_inference_steps, ta
                 if output_scale > 1:
                     Image.fromarray(_place_on_canvas(region, box, placement, canvas_hw, output_scale)).save(osp.join(hires, f'{tag}.png'))
     input_head, box = _crop_head_box(input_img, head_box)
+    # The head pass's box, whose edges cut what reaches past it (utils/gaps.py extend_cut).
+    canvas_info = json2dict(osp.join(saved, CANVAS_INFO))
+    canvas_info['head_box'] = [int(v) for v in box]
+    dict2json(canvas_info, osp.join(saved, CANVAS_INFO))
     head_page, head_placement = fit_pad_resize(input_head, (head_resolution, head_resolution))
     Image.fromarray(head_page).save(osp.join(saved, 'src_head.png'))
 
@@ -829,9 +833,14 @@ def _cover_gaps(part_dict_list, fullpage, srcd):
     # The page is output_scale times the canvas once promoted; the placement is the canvas's.
     k = fullpage.shape[0] / canvas['canvas'][0]
     scale, x, y, w, h = canvas['placement']
+    head_box = None
+    if canvas.get('head_box'):
+        # The head pass's box, in the source's pixels, on the page.
+        x1, y1, x2, y2 = canvas['head_box']
+        head_box = (x * k + x1 * scale * k, y * k + y1 * scale * k, x * k + x2 * scale * k, y * k + y2 * scale * k)
     gaps.cover_parts(
         part_dict_list, fullpage, (scale * k, round(x * k), round(y * k), round(w * k), round(h * k)),
-        _inpaint if torch.cuda.is_available() else None, lambda line: print(line, flush=True),
+        _inpaint if torch.cuda.is_available() else None, lambda line: print(line, flush=True), head_box,
     )
 
 

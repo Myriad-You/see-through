@@ -155,6 +155,29 @@ def test_a_skirt_drawn_in_part_is_grown_with_the_rest():
     assert tuple(out_images[2][130, 75]) == SKIRT[4]
 
 
+def test_a_head_part_cut_at_the_head_pass_box_goes_on_from_the_source():
+    # A white frill outlined in grey, on white, rising from its band above the box (y 40) the head pass drew.
+    face = (45, 70, 30, 30, (236, 200, 180, 255))
+    page = source([face])
+    page[20: 40, 40: 80, :3] = 252
+    page[40: 56, 40: 80, :3] = (200, 170, 190)
+    page[40: 44, 41: 79, :3] = 252   # the frill's white runs down past the cut
+    page[20, 40: 80, :3] = 90         # outlined above and at its sides, down into the box
+    page[20: 56, 40, :3] = 90
+    page[20: 56, 79, :3] = 90
+    drawn = np.zeros((H, W, 4), np.uint8)
+    drawn[40: 56, 40: 80] = page[40: 56, 40: 80]
+    names, images = ['face', 'headwear'], [picture([face]), drawn]
+    lines = []
+    grown = gaps.extend_cut(names, images, page, PLACEMENT, (20, 40, 100, 120), lines.append)
+    assert grown == ['headwear'], lines
+    assert images[1][30, 60, 3] == 255, 'the white inside the outline goes on above the box'
+    assert images[1][20, 60, 3] == 255, 'up to its outline'
+    assert images[1][10, 60, 3] == 0 and images[1][30, 30, 3] == 0, 'not the backdrop outside it'
+    assert gaps.extend_cut(['face'], [picture([face])], page, PLACEMENT, (20, 40, 100, 120), lines.append) == [], \
+        'a part inside its box is not cut'
+
+
 def test_a_lifted_skirt_is_drawn_in_behind_what_hangs_in_front_only():
     garment = picture([SKIRT])
     garment[120:150, 30:42] = 0   # under a sleeve in front, above its hem, which shows
