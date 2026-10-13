@@ -1,12 +1,14 @@
 '''
 gaps.py on made-up pictures, and on kept decompositions when their paths are
-given: python test_gaps.py [front.psd master.png expected-gaps ...]
+given (their layers back to front, as the PSD has them):
+python test_gaps.py [front.psd master.png expected-gaps ...]
 '''
 import os.path as osp
 import sys
 
 sys.path.insert(0, osp.join(osp.dirname(osp.dirname(osp.dirname(osp.abspath(__file__)))), 'common'))
 
+import cv2
 import numpy as np
 
 from utils import gaps
@@ -35,6 +37,8 @@ def source(boxes):
 HEAD = (40, 10, 40, 40, (236, 200, 180, 255))
 TOP = (30, 50, 60, 60, (60, 110, 70, 255))
 SKIRT = (30, 110, 60, 50, (120, 60, 160, 255))
+HAIR = (20, 40, 80, 130, (200, 220, 250, 255))
+HEAD_BOX = (40, 10, 80, 50)
 
 
 def test_the_figure_is_what_is_not_the_backdrop():
@@ -49,52 +53,44 @@ def test_the_figure_is_what_is_not_the_backdrop():
 def test_a_dropped_skirt_is_the_one_gap_and_goes_below_the_top():
     page = source([HEAD, TOP, SKIRT])
     figure = gaps.figure_mask(page, PLACEMENT)
-    parts = {'head': picture([HEAD]), 'topwear': picture([TOP])}
-    found = gaps.find_gaps(figure, page, parts.values(), head_xyxy=(40, 10, 80, 50))
+    found = gaps.find_gaps(figure, page, [picture([HEAD]), picture([TOP])], HEAD_BOX)
     assert len(found) == 1
     assert found[0][130, 60] and not found[0][80, 60]
-    assert gaps.place_tag(found[0], parts) == 'bottomwear'
+    assert gaps.place_tag(found[0], {'topwear': picture([TOP])}) == 'bottomwear'
     filled = gaps.fill_from_source(np.zeros((H, W, 4), np.uint8), page, found[0], figure)
     assert tuple(filled[130, 60]) == SKIRT[4] and filled[190, 5, 3] == 0, 'the skirt, not the backdrop around it'
 
 
-def test_a_part_drawn_behind_the_missing_one_does_not_hide_the_gap():
+def test_the_back_hair_drawn_behind_a_dropped_skirt_does_not_hide_it():
+    page = source([HAIR, HEAD, TOP, SKIRT])
+    figure = gaps.figure_mask(page, PLACEMENT)
+    found = gaps.find_gaps(figure, page, [picture([HAIR]), picture([HEAD]), picture([TOP])], HEAD_BOX)
+    assert len(found) == 1 and found[0][130, 60]
+
+
+def test_a_part_hidden_behind_does_not_count_as_drawing_what_shows():
+    # The skirt's colour drawn in a part behind the top shows nowhere: no gap there.
     page = source([HEAD, TOP, SKIRT])
     figure = gaps.figure_mask(page, PLACEMENT)
-    hair = (20, 40, 80, 130, (200, 220, 250, 255))
-    parts = [picture([HEAD]), picture([TOP]), picture([hair])]
-    found = gaps.find_gaps(figure, page, parts, head_xyxy=(40, 10, 80, 50))
-    assert len(found) == 1 and found[0][130, 60]
+    behind = picture([(30, 110, 60, 50, (120, 60, 160, 255))])
+    assert gaps.find_gaps(figure, page, [behind, picture([HEAD]), picture([TOP])], HEAD_BOX) == []
+    covered = picture([(30, 110, 60, 50, (240, 240, 240, 255))])
+    assert len(gaps.find_gaps(figure, page, [behind, picture([HEAD]), picture([TOP]), covered], HEAD_BOX)) == 1, \
+        'what a part in front paints over it is what shows'
 
 
 def test_nothing_is_a_gap_when_every_part_was_drawn():
     page = source([HEAD, TOP, SKIRT])
     figure = gaps.figure_mask(page, PLACEMENT)
-    parts = [picture([HEAD]), picture([TOP]), picture([SKIRT])]
-    assert gaps.find_gaps(figure, page, parts) == []
+    assert gaps.find_gaps(figure, page, [picture([HEAD]), picture([TOP]), picture([SKIRT])]) == []
 
 
 def test_a_gap_in_the_head_box_is_the_head_pass_s():
     page = source([HEAD, TOP, SKIRT])
     figure = gaps.figure_mask(page, PLACEMENT)
     parts = [picture([TOP]), picture([SKIRT])]
-    assert gaps.find_gaps(figure, page, parts, head_xyxy=(40, 10, 80, 50)) == []
+    assert gaps.find_gaps(figure, page, parts, HEAD_BOX) == []
     assert len(gaps.find_gaps(figure, page, parts)) == 1
-
-
-def test_the_tag_that_draws_the_gap_takes_it_whole_hidden_parts_too():
-    gap = picture([SKIRT])[..., 3] > 0
-    gap[110:120] = False  # under the top's hem at rest
-    drawn = {
-        'bottomwear': picture([SKIRT, (30, 100, 60, 10, (120, 60, 160, 255))]),
-        'legwear': picture([(40, 150, 40, 10, (236, 200, 180, 255))]),
-        'objects': picture([(0, 0, 10, 10, (0, 0, 0, 255))]),
-    }
-    tag, share = gaps.best_tag(gap, drawn)
-    assert tag == 'bottomwear' and share > 0.9
-    taken = gaps.take(np.zeros((H, W, 4), np.uint8), drawn['bottomwear'], gap)
-    assert taken[105, 60, 3] == 255, 'the part hidden under the top comes with it'
-    assert taken[5, 5, 3] == 0
 
 
 def test_below_the_lower_garment_a_gap_is_the_legs():
@@ -105,28 +101,75 @@ def test_below_the_lower_garment_a_gap_is_the_legs():
     assert gaps.place_tag(picture([(0, 0, 5, 5, (1, 1, 1, 255))])[..., 3] > 0, {'topwear': picture([TOP])}) == 'objects'
 
 
-def test_a_lifted_skirt_is_drawn_in_behind_the_sleeve_over_it_not_behind_the_hair_behind_it():
-    import cv2
-    skirt = (30, 110, 60, 50, (120, 60, 160, 255))
-    # The sleeve hangs over the skirt's side above its hem, which shows below it.
-    sleeve = (30, 120, 12, 30, (240, 200, 230, 255))
-    hair = (80, 120, 10, 40, (200, 220, 250, 255))
-    page = source([HEAD, TOP, skirt, sleeve, hair])
-    # Lifted from the source: the skirt but where the sleeve and the hair show.
-    garment = picture([skirt])
-    garment[120:150, 30:42] = 0
-    garment[120:160, 80:90] = 0
-    parts = {'handwear': picture([sleeve]), 'back hair': picture([hair])}
-    behind = gaps.hidden_side(garment, 'bottomwear', page, parts)
-    assert behind[140, 35] and not behind[140, 85], 'under the sleeve, not under the back hair'
+def test_a_lifted_skirt_is_drawn_in_behind_what_hangs_in_front_only():
+    garment = picture([SKIRT])
+    garment[120:150, 30:42] = 0   # under a sleeve in front, above its hem, which shows
+    garment[120:160, 80:90] = 0   # where a lock behind it shows: not its to draw
+    in_front = picture([(30, 120, 12, 30, (1, 1, 1, 255))])[..., 3] > 0
+    behind = gaps.hidden_side(garment, in_front)
+    assert behind[140, 35] and not behind[140, 85]
     done = gaps.complete_hidden(garment, behind, lambda rgb, mask: cv2.inpaint(rgb, mask, 3, cv2.INPAINT_TELEA))
     assert done[140, 35, 3] == 255 and np.linalg.norm(done[140, 35, :3].astype(float) - (120, 60, 160)) < 40
     assert done[140, 85, 3] == 0 and done[5, 5, 3] == 0
 
 
+def test_cover_gives_the_skirt_a_new_part_and_brings_the_sleeve_in_front_of_it():
+    sleeve = (30, 120, 12, 30, (240, 200, 230, 255))
+    # The skirt's band over the top's hem, as a hakama's over a kimono.
+    page = source([HAIR, HEAD, TOP, (30, 100, 60, 60, SKIRT[4]), sleeve])
+    # As that kimono bust had it: the sleeve put behind the top.
+    names = ['back hair', 'handwear-l', 'face', 'topwear']
+    images = [picture([HAIR]), picture([sleeve]), picture([HEAD]), picture([TOP])]
+    lines = []
+    out_names, out_images, changes = gaps.cover(
+        names, images, page, PLACEMENT, HEAD_BOX,
+        lambda rgb, mask: cv2.inpaint(rgb, mask, 3, cv2.INPAINT_TELEA), lines.append)
+    assert changes == [('bottomwear', 'new, in front of topwear', ['handwear-l'])], lines
+    assert out_names == ['back hair', 'face', 'topwear', 'bottomwear', 'handwear-l']
+    skirt = out_images[3]
+    assert tuple(skirt[130, 60]) == SKIRT[4]
+    assert skirt[135, 35, 3] == 255, 'drawn in under the sleeve now in front of it'
+    color, _, _ = gaps.composite(out_images)
+    assert np.linalg.norm(color[135, 35] - np.array(sleeve[4][:3], np.float32)) < 1, 'the sleeve still shows at rest'
+
+
+def part_dict(tag, image, median):
+    '''A part as further_extr has it before the PSD: cropped to its box, with its depth.'''
+    x, y, w, h = cv2.boundingRect(cv2.findNonZero((image[..., 3] > 10).astype(np.uint8)))
+    return {'tag': tag, 'img': image[y: y + h, x: x + w], 'xyxy': [x, y, x + w, y + h],
+            'depth': np.full((h, w), round(median * 255), np.uint8), 'depth_median': median}
+
+
+def test_cover_parts_gives_the_new_part_and_the_one_brought_before_it_depths_in_that_order():
+    sleeve = (30, 120, 12, 30, (240, 200, 230, 255))
+    page = source([HAIR, HEAD, TOP, (30, 100, 60, 60, SKIRT[4]), sleeve])
+    parts = [part_dict('topwear', picture([TOP]), 0.6), part_dict('back hair', picture([HAIR]), 0.9),
+             part_dict('face', picture([HEAD]), 0.5), part_dict('handwear-l', picture([sleeve]), 0.7)]
+    changes = gaps.cover_parts(parts, page, PLACEMENT, lambda rgb, mask: cv2.inpaint(rgb, mask, 3, cv2.INPAINT_TELEA),
+                               lambda line: None)
+    assert changes == [('bottomwear', 'new, in front of topwear', ['handwear-l'])]
+    order = sorted(parts, key=lambda part: part['depth_median'], reverse=True)
+    assert [part['tag'] for part in order] == ['back hair', 'topwear', 'bottomwear', 'handwear-l', 'face']
+    by = {part['tag']: part for part in parts}
+    assert by['back hair']['depth_median'] == 0.9 and by['face']['depth_median'] == 0.5, 'the others keep theirs'
+    for part in parts:
+        x1, y1, x2, y2 = part['xyxy']
+        assert part['img'].shape == (y2 - y1, x2 - x1, 4) and part['depth'].shape == (y2 - y1, x2 - x1), part['tag']
+    skirt = by['bottomwear']
+    assert tuple(skirt['img'][130 - skirt['xyxy'][1], 60 - skirt['xyxy'][0]]) == SKIRT[4]
+
+
+def test_cover_parts_keeps_the_order_by_rank_between_tied_depths():
+    # The skirt's band over the top's hem: it goes in front of the top, tied with the face.
+    page = source([HEAD, TOP, (30, 100, 60, 60, SKIRT[4])])
+    parts = [part_dict('topwear', picture([TOP]), 0.6), part_dict('face', picture([HEAD]), 0.6)]
+    gaps.cover_parts(parts, page, PLACEMENT, None, lambda line: None)
+    order = [part['tag'] for part in sorted(parts, key=lambda part: part['depth_median'], reverse=True)]
+    assert order == ['topwear', 'bottomwear', 'face'], order
+
+
 def kept(psd_path, master_path, expected):
-    '''A kept front decomposition against its master, fitted as the canvas path fits it.'''
-    import cv2
+    '''A kept front decomposition (back to front) against its master, fitted as the canvas path fits it.'''
     from PIL import Image
     from psd_tools import PSDImage
     psd = PSDImage.open(psd_path)
@@ -137,21 +180,23 @@ def kept(psd_path, master_path, expected):
     x, y = (cw - w) // 2, (ch - h) // 2
     page = np.zeros((ch, cw, 4), np.uint8)
     page[y: y + h, x: x + w] = cv2.resize(master, (w, h), interpolation=cv2.INTER_AREA)
-    parts = {}
+    names, images = [], []
     for layer in psd.descendants():
         if layer.is_group():
             continue
         canvas = np.zeros((ch, cw, 4), np.uint8)
         image = np.array(layer.topil().convert('RGBA'))
         canvas[layer.top: layer.top + image.shape[0], layer.left: layer.left + image.shape[1]] = image
-        parts[layer.name] = canvas
-    figure = gaps.figure_mask(page, (scale, x, y, w, h))
-    face = parts.get('face')
+        names.append(layer.name)
+        images.append(canvas)
+    face = images[names.index('face')] if 'face' in names else None
     head = None
     if face is not None:
         ys, xs = np.nonzero(face[..., 3] > 40)
         head = (xs.min(), ys.min(), xs.max(), ys.max())
-    found = gaps.find_gaps(figure, page, parts.values(), head)
+    figure = gaps.figure_mask(page, (scale, x, y, w, h))
+    found = gaps.find_gaps(figure, page, images, head)
+    parts = dict(zip(names, images))
     tags = [gaps.place_tag(gap, parts) for gap in found]
     print(f'{osp.basename(osp.dirname(psd_path))}: {len(found)} gaps {[int(g.sum()) for g in found]} -> {tags} (figure {int(figure.sum())} px)')
     assert len(found) == expected, f'expected {expected}'

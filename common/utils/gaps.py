@@ -1,32 +1,36 @@
 '''
-A part the body pass leaves out altogether. The hakama under a kimono came
-back with its bottomwear empty (2026-10-13), and nothing downstream noticed:
-a part only drops out when it is empty. What the source shows of the figure
-that no part has is a gap, given to the part its place says. Its box is run
-once more for that part alone, scaled up as the head is; what that pass
-draws of it is taken when it draws most of it, hidden parts included, and
-what is still missing is the source's own pixels.
+A part the decomposition leaves out altogether. The hakama under a kimono came
+back with its bottomwear empty (2026-10-13), and nothing downstream noticed: a
+part only drops out when it is empty. The model cannot be made to see it
+(asked for the bottomwear alone on the hakama's own box it drew nothing), so
+what it misses is taken from the source.
+
+Once the parts have their depth, they are drawn back to front as the PSD
+will have them and compared with the source: where the figure shows
+something the drawing does not (nothing, or a part behind the missing one,
+as the back hair behind a skirt), the drawing has a gap. A garment-sized gap
+is given to the part its place says, from the source's own pixels, and drawn
+in behind what hangs in front of it.
 '''
 import cv2
 import numpy as np
 
 # Garment-sized: smaller gaps are accessories and specks (the bottom of a
-# birdcage earring, 0.5% of a figure), which a body pass would not draw and
-# Myriad's importer lifts from the source up to this same share.
+# birdcage earring, 0.5% of a figure), which Myriad's importer lifts from the
+# source up to this same share.
 GAP_MIN_SHARE = 0.02
-# The share of a gap its pass must draw to be taken: with all tags to choose
-# from, a hakama's pass drew 46% of it into the top, its pleats into nothing.
-GAP_TAKE = 0.7
 # Alpha (0..255) that counts as drawn.
 DRAWN = 40
 # Colour distance from the source's backdrop that counts as the figure.
 BACKDROP_DISTANCE = 40
-# Colour distance within which a part draws what the source shows.
-MATCH_DISTANCE = 70
+# Colour distance past which the drawing shows something else than the source (Myriad's importer's too).
+MISMATCH_DISTANCE = 98
 # Strands across a gap up to this wide do not split it.
 STRAND = 13
-# The tags a gap may go to: the body's parts but the head and its hair, which have passes of their own.
-GAP_TAGS = ('neck', 'neckwear', 'topwear', 'handwear', 'bottomwear', 'legwear', 'footwear', 'tail', 'wings', 'objects')
+# Smaller pieces of a garment have no outline worth completing.
+HIDDEN_MIN_PIECE = 400
+# How far past a gap the garment takes over what shows of the parts behind it.
+REACH = 21
 
 
 def figure_mask(page: np.ndarray, placement) -> np.ndarray:
@@ -47,23 +51,34 @@ def figure_mask(page: np.ndarray, placement) -> np.ndarray:
     return cv2.morphologyEx(figure.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)) > 0
 
 
-def find_gaps(figure: np.ndarray, page: np.ndarray, parts, head_xyxy=None):
+def composite(images):
+    '''The parts (canvas RGBA, back to front) drawn together: colour, alpha, and the index of the part on top (-1).'''
+    h, w = images[0].shape[:2]
+    color = np.zeros((h, w, 3), np.float32)
+    alpha = np.zeros((h, w, 1), np.float32)
+    top = np.full((h, w), -1, np.int32)
+    for index, image in enumerate(images):
+        a = image[..., 3:4].astype(np.float32) / 255
+        color = image[..., :3].astype(np.float32) * a + color * (1 - a)
+        alpha = a + alpha * (1 - a)
+        top[image[..., 3] > 128] = index
+    return color / np.maximum(alpha, 1e-6), alpha[..., 0], top
+
+
+def unexplained(figure: np.ndarray, page: np.ndarray, images) -> np.ndarray:
+    '''Where the drawing (images, back to front) misses the figure: nothing drawn, or something else than the source on top.'''
+    color, alpha, _ = composite(images)
+    distance = np.linalg.norm(color - page[..., :3].astype(np.float32), axis=-1)
+    return figure & ((alpha < 0.5) | (distance > MISMATCH_DISTANCE))
+
+
+def find_gaps(figure: np.ndarray, page: np.ndarray, images, head_xyxy=None):
     '''
-    The figure's gaps no part explains, largest first, each a boolean mask, of
-    at least GAP_MIN_SHARE of the figure and not centred in the head's box
-    (canvas x1, y1, x2, y2). A part explains a pixel it draws in the source's
-    colour there: one drawn behind a missing part (the back hair the
-    decomposition paints behind a skirt) does not. Strands across a gap do
-    not split it. page: the fitted source; parts: the parts' RGBA on the canvas.
+    The drawing's gaps (unexplained), largest first, each a boolean mask of
+    at least GAP_MIN_SHARE of the figure, not centred in the head's box
+    (x1, y1, x2, y2); strands across a gap do not split it.
     '''
-    source = page[..., :3].astype(np.float32)
-    explained = np.zeros(figure.shape, bool)
-    for part in parts:
-        drawn = part[..., 3] > DRAWN
-        explained |= drawn & (np.linalg.norm(part[..., :3].astype(np.float32) - source, axis=-1) <= MATCH_DISTANCE)
-    # The parts' anti-aliased rims fall short of the source's outlines.
-    explained = cv2.dilate(explained.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
-    gap = cv2.morphologyEx((figure & ~explained).astype(np.uint8), cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    gap = cv2.morphologyEx(unexplained(figure, page, images).astype(np.uint8), cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
     gap = (cv2.morphologyEx(gap, cv2.MORPH_CLOSE, np.ones((STRAND, STRAND), np.uint8)) > 0) & figure
     n, labels, stats, centroids = cv2.connectedComponentsWithStats(gap.astype(np.uint8), connectivity=8)
     floor = GAP_MIN_SHARE * figure.sum()
@@ -78,38 +93,10 @@ def find_gaps(figure: np.ndarray, page: np.ndarray, parts, head_xyxy=None):
     return found
 
 
-def best_tag(gap: np.ndarray, drawn: dict):
-    '''Of {tag: RGBA on the canvas}, the tag that draws the largest share of the gap, and that share.'''
-    area = max(1, int(gap.sum()))
-    best, share = None, 0.0
-    for tag, picture in drawn.items():
-        s = float((gap & (picture[..., 3] > 128)).sum()) / area
-        if s > share:
-            best, share = tag, s
-    return best, share
-
-
-def take(part: np.ndarray, drawn: np.ndarray, gap: np.ndarray) -> np.ndarray:
-    '''
-    part (RGBA) with what drawn draws of the gap: its pieces that reach into
-    the gap, whole (the parts the gap's pass found hidden too), where they
-    are more opaque than part is. Elsewhere part is as it was.
-    '''
-    pieces = drawn[..., 3] > DRAWN
-    n, labels = cv2.connectedComponents(pieces.astype(np.uint8), connectivity=8)
-    reach = np.unique(labels[gap & pieces])
-    keep = np.isin(labels, reach[reach > 0])
-    over = keep & (drawn[..., 3] > part[..., 3])
-    out = part.copy()
-    out[over] = drawn[over]
-    return out
-
-
 def place_tag(gap: np.ndarray, parts: dict) -> str:
     '''
-    The part a gap no pass explains is of, by its place: below the lower
-    garment the legs', below the top's middle the lower garment's, else an
-    object's.
+    The part a gap is of, by its place: below the lower garment the legs',
+    below the top's middle the lower garment's, else an object's.
     '''
     def rows(tag):
         if tag not in parts:
@@ -126,11 +113,7 @@ def place_tag(gap: np.ndarray, parts: dict) -> str:
 
 
 def fill_from_source(part: np.ndarray, page: np.ndarray, gap: np.ndarray, figure: np.ndarray) -> np.ndarray:
-    '''
-    part (RGBA) with the source's own pixels over the gap, the holes inside it
-    (where another part's hidden side happens to share its colours, as a
-    sleeve's print does a hakama's) and its rim, within the figure.
-    '''
+    '''part (RGBA) with the source's own pixels over the gap, the holes inside it and its rim, within the figure.'''
     whole = gap.astype(np.uint8)
     contours, _ = cv2.findContours(whole, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     cv2.drawContours(whole, contours, -1, 1, thickness=cv2.FILLED)
@@ -141,23 +124,27 @@ def fill_from_source(part: np.ndarray, page: np.ndarray, gap: np.ndarray, figure
     return out
 
 
-# What hangs in front of a part where it was hidden at rest: the sleeves over
-# a skirt, locks over anything. Parts behind it (back hair behind a skirt,
-# legs under it) are left as they show.
+# What hangs in front of a part where it was hidden at rest, whatever depth
+# the parts were given (a kimono bust had its sleeves behind its top): the
+# sleeves over a skirt, locks over anything. Parts behind it (back hair
+# behind a skirt, legs under it) are left as they show.
 IN_FRONT_OF = {
-    'bottomwear': {'handwear', 'front hair', 'objects'},
-    'legwear': {'handwear', 'front hair', 'bottomwear', 'objects'},
-    'objects': {'handwear', 'front hair'},
+    'bottomwear': ('handwear', 'front hair', 'objects'),
+    'legwear': ('handwear', 'front hair', 'bottomwear', 'objects'),
+    'objects': ('handwear', 'front hair'),
 }
-# Smaller pieces of a garment have no outline worth completing.
-HIDDEN_MIN_PIECE = 400
 
 
-def hidden_side(garment: np.ndarray, tag: str, page: np.ndarray, parts: dict) -> np.ndarray:
+def kind(name: str) -> str:
+    '''A part's tag without its side: handwear-l is handwear.'''
+    return name[:-2] if name.endswith(('-l', '-r')) else name
+
+
+def hidden_side(garment: np.ndarray, in_front: np.ndarray) -> np.ndarray:
     '''
     Where a garment lifted from the source lies hidden at rest: inside the
-    outline of each of its pieces (their convex hulls), where a part that
-    hangs in front of it (IN_FRONT_OF) draws the source's colour.
+    outline of each of its pieces (their convex hulls), where a part in front
+    of it shows (in_front, a mask).
     '''
     shown = garment[..., 3] > 128
     hull = np.zeros(shown.shape, np.uint8)
@@ -165,14 +152,7 @@ def hidden_side(garment: np.ndarray, tag: str, page: np.ndarray, parts: dict) ->
     for contour in contours:
         if cv2.contourArea(contour) >= HIDDEN_MIN_PIECE:
             cv2.fillPoly(hull, [cv2.convexHull(contour)], 1)
-    source = page[..., :3].astype(np.float32)
-    front = np.zeros(shown.shape, bool)
-    for name, part in parts.items():
-        if name not in IN_FRONT_OF.get(tag, ()):
-            continue
-        drawn = part[..., 3] > DRAWN
-        front |= drawn & (np.linalg.norm(part[..., :3].astype(np.float32) - source, axis=-1) <= MATCH_DISTANCE)
-    return (hull > 0) & front & ~shown
+    return (hull > 0) & in_front & ~shown
 
 
 def complete_hidden(garment: np.ndarray, hidden: np.ndarray, inpaint) -> np.ndarray:
@@ -196,3 +176,145 @@ def complete_hidden(garment: np.ndarray, hidden: np.ndarray, inpaint) -> np.ndar
     out[y0: y1, x0: x1][region, :3] = filled[region]
     out[y0: y1, x0: x1][region, 3] = 255
     return out
+
+
+# A part that hangs in front of a garment is brought in front of it when the
+# drawing at rest gets worse from the source in no more than this share of the figure.
+MOVE_TOLERANCE = 0.002
+
+
+def worse(images, page, figure, before_error) -> int:
+    '''How many figure pixels the drawing (images) shows further from the source than before_error allowed.'''
+    color, alpha, _ = composite(images)
+    error = np.linalg.norm(color - page[..., :3].astype(np.float32), axis=-1) * (alpha >= 0.5) + 1e3 * (alpha < 0.5)
+    return int((figure & (error > MISMATCH_DISTANCE) & (before_error <= MISMATCH_DISTANCE)).sum())
+
+
+def cover(names, images, page, placement, head_xyxy=None, inpaint=None, log=print):
+    '''
+    The parts (names, canvas RGBA images, back to front) with the figure's
+    garment-sized gaps given to the part their place says. Returns the parts'
+    new order and images (names, images, back to front) and what changed, or
+    None when nothing did. A new part goes just in front of the frontmost one
+    it covers; a part that hangs in front of it (IN_FRONT_OF) but was put
+    behind is brought in front of it when the source allows, and the garment
+    is drawn in behind what hangs in front of it.
+    '''
+    figure = figure_mask(page, placement)
+    found = find_gaps(figure, page, images, head_xyxy)
+    if not found:
+        return None
+    names, images = list(names), list(images)
+    raw = unexplained(figure, page, images)
+    _, _, top = composite(images)
+    changes = []
+    for gap in found:
+        tag = place_tag(gap, dict(zip(names, images)))
+        hangs = IN_FRONT_OF.get(tag, ())
+        ahead = [i for i, name in enumerate(names) if kind(name) in hangs]
+        if tag in names:
+            at = names.index(tag)
+            where = 'grown'
+        else:
+            # What it covers: what shows where the drawing was wrong (not the strands bridged across
+            # it), but for what hangs in front of it, whose redrawn strands may stray over it.
+            covered = top[gap & raw & (top >= 0) & ~np.isin(top, ahead)]
+            at = int(covered.max()) + 1 if covered.size else len(names)
+            where = f'new, in front of {names[at - 1]}' if 0 < at <= len(names) else 'new'
+            names.insert(at, tag)
+            images.insert(at, np.zeros_like(images[0]))
+        # Close by, what shows of a part behind it is its too where the source shows it: a top
+        # drawn on down over a hakama's band left square notches the gap's cleaning cut off.
+        reach = (cv2.morphologyEx(gap.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((REACH, REACH), np.uint8)) > 0) & (top < at)
+        images[at] = fill_from_source(images[at], page, gap | reach, figure)
+        # What hangs in front of it but was put behind comes in front, if the source allows.
+        color, alpha, _ = composite(images)
+        error = np.linalg.norm(color - page[..., :3].astype(np.float32), axis=-1) * (alpha >= 0.5) + 1e3 * (alpha < 0.5)
+        moved = []
+        for name in [n for n in names[:at] if kind(n) in hangs]:
+            i = names.index(name)
+            trial_names = names[:i] + names[i + 1:]
+            trial_images = images[:i] + images[i + 1:]
+            g = trial_names.index(tag)
+            trial_names.insert(g + 1, name)
+            trial_images.insert(g + 1, images[i])
+            if worse(trial_images, page, figure, error) <= MOVE_TOLERANCE * figure.sum():
+                names, images = trial_names, trial_images
+                moved.append(name)
+        at = names.index(tag)
+        _, _, top = composite(images)
+        in_front = np.isin(top, [i for i, name in enumerate(names) if i > at and kind(name) in hangs])
+        behind = hidden_side(images[at], in_front)
+        hidden = 0
+        if inpaint is not None and behind.any():
+            try:
+                images[at] = complete_hidden(images[at], behind, inpaint)
+                hidden = int(behind.sum())
+            except Exception as error:  # the inpainter is a nicety; the garment stands without it
+                log(f'[gaps] hidden side not drawn: {error!r}')
+        changes.append((tag, where, moved))
+        log(f'[gaps] {int(gap.sum())} px of the figure the drawing missed -> {tag} ({where})'
+            f'{"; brought in front of it: " + ", ".join(moved) if moved else ""}; {hidden} px drawn in behind what hangs in front')
+    return names, images, changes
+
+
+def cover_parts(part_dict_list, page, placement, inpaint=None, log=print):
+    '''
+    cover on the parts as further_extr has them before the PSD (each a dict of
+    tag, img cropped to xyxy, its depth (0..255) and depth_median, the PSD
+    drawing them by depth_median, far first), in place: a new part is added,
+    and the parts given a new place get depth_medians between their new
+    neighbours'; the others keep theirs. Returns what changed (cover's).
+    '''
+    h, w = page.shape[:2]
+    order = sorted(part_dict_list, key=lambda part: part['depth_median'], reverse=True)
+
+    def canvas(part):
+        out = np.zeros((h, w, 4), np.uint8)
+        x1, y1, x2, y2 = part['xyxy']
+        out[y1: y2, x1: x2] = part['img']
+        return out
+
+    face = next((part for part in order if part['tag'] == 'face'), None)
+    covered = cover([part['tag'] for part in order], [canvas(part) for part in order], page, placement,
+                    tuple(face['xyxy']) if face else None, inpaint, log)
+    if covered is None:
+        return []
+    names, images, changes = covered
+    by_tag = {part['tag']: part for part in part_dict_list}
+    placed = {tag for tag, _, _ in changes} | {name for _, _, moved in changes for name in moved}
+    for tag in placed - by_tag.keys():
+        part = {'tag': tag, 'depth': np.zeros((0, 0), np.uint8), 'xyxy': [0, 0, 0, 0]}
+        part_dict_list.append(part)
+        by_tag[tag] = part
+    # Each run of placed parts shares out the depth between the parts behind and in front of it.
+    medians = [None if name in placed else float(by_tag[name]['depth_median']) for name in names]
+    index = 0
+    while index < len(names):
+        if medians[index] is not None:
+            index += 1
+            continue
+        end = index
+        while end < len(names) and medians[end] is None:
+            end += 1
+        behind = medians[index - 1] if index > 0 else 1.0
+        ahead = medians[end] if end < len(names) else min(0.0, behind - 1e-3)
+        for k in range(index, end):
+            medians[k] = behind - (behind - ahead) * (k - index + 1) / (end - index + 1)
+        index = end
+    if any(medians[k - 1] <= medians[k] or (k + 1 < len(names) and medians[k] <= medians[k + 1])
+           for k in range(len(names)) if names[k] in placed and k > 0):
+        # Placed between parts tied in depth: the order is kept by rank instead.
+        medians = list(np.linspace(1.0, 0.0, len(names)))
+    for name, median in zip(names, medians):
+        by_tag[name]['depth_median'] = median
+    for name in placed:
+        part = by_tag[name]
+        image = images[names.index(name)]
+        x, y, bw, bh = cv2.boundingRect(cv2.findNonZero((image[..., 3] > 10).astype(np.uint8)))
+        depth = np.full((h, w), round(part['depth_median'] * 255), np.uint8)
+        x1, y1, x2, y2 = part['xyxy']
+        if part['depth'].size:
+            depth[y1: y2, x1: x2] = part['depth']
+        part.update(img=image[y: y + bh, x: x + bw], xyxy=[x, y, x + bw, y + bh], depth=depth[y: y + bh, x: x + bw])
+    return changes

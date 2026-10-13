@@ -2,7 +2,6 @@ import os
 import os.path as osp
 import gc
 import math
-import time
 
 from modules.layerdiffuse.diffusers_kdiffusion_sdxl import KDiffusionStableDiffusionXLPipeline, UNetFrameConditionModel
 from modules.layerdiffuse.vae import TransparentVAE
@@ -292,7 +291,6 @@ def _apply_layerdiff_canvas(pipeline, imgp, saved, seed, num_inference_steps, ta
     front and back hair: the hair is drawn finer than anything else on the
     figure, and the body pass sees it at the figure's scale.
     '''
-    started = time.time()
     if hair_pass not in ('canvas', 'head'):
         raise ValueError("hair_pass must be 'canvas' or 'head'")
     # body_tags: only these of the body pass's tags (it needs 'head' to find the head pass's box).
@@ -359,6 +357,9 @@ def _apply_layerdiff_canvas(pipeline, imgp, saved, seed, num_inference_steps, ta
                 big = tuple(v * output_scale for v in canvas_hw) + (4,)
                 Image.fromarray(np.zeros(big, np.uint8)).save(osp.join(hires, f'{tag}.png'))
 
+    if not head_mask.any():
+        no_head()
+        return
     scale, ox, oy, _, _ = placement
     sh, sw = input_img.shape[:2]
 
@@ -371,19 +372,9 @@ def _apply_layerdiff_canvas(pipeline, imgp, saved, seed, num_inference_steps, ta
         y1 = min(max(int(math.ceil((by + bh - oy) / scale)), 0), sh)
         return None if x1 <= x0 or y1 <= y0 else [x0, y0, x1 - x0, y1 - y0]
 
-    def cover(head_xyxy):
-        '''The figure's gaps no part covers, each given to a part (gaps.py); not when only some tags were run.'''
-        if body_tags is None:
-            _cover_gaps(run, pipeline, input_img, fullpage, placement, canvas_hw, saved, head_resolution, head_xyxy, source_box, started)
-
-    if not head_mask.any():
-        no_head()
-        cover(None)
-        return
     head_box = source_box(head_mask)
     if head_box is None:
         no_head()
-        cover(None)
         return
     if hair_pass == 'head':
         hair_mask = head_mask.copy()
@@ -413,73 +404,6 @@ def _apply_layerdiff_canvas(pipeline, imgp, saved, seed, num_inference_steps, ta
         Image.fromarray(_place_on_canvas(region, box, placement, canvas_hw)).save(osp.join(saved, f'{tag}.png'))
         if output_scale > 1:
             Image.fromarray(_place_on_canvas(region, box, placement, canvas_hw, output_scale)).save(osp.join(hires, f'{tag}.png'))
-    bx, by, bw, bh = cv2.boundingRect(cv2.findNonZero(head_mask))
-    cover((bx, by, bx + bw, by + bh))
-
-
-# A gap's pass draws one tag, quicker than a head pass; no more than this
-# many, and none once the decomposition has run this long: the depth pass and
-# the PSD follow, inside the Space's GPU time booked per call (300 s for
-# decompose; its body and head passes take about 150 s).
-GAP_PASSES = 2
-GAP_SECONDS = 180
-
-
-def _cover_gaps(run, pipeline, input_img, fullpage, placement, canvas_hw, saved, head_resolution, head_xyxy, source_box, started):
-    '''
-    What the source shows of the figure that no part has (gaps.py), given to
-    the part its place says. Each gap's box is run once more, scaled to the
-    head pass's square, for that one tag alone: with every tag to choose from
-    the model had drawn a hakama's band into the top and its pleats into
-    nothing. What it draws of the gap is taken when it draws most of it; what
-    is still not drawn is the source's own pixels.
-    '''
-    from utils import gaps
-
-    parts = {}
-    for tag in BODY_TAGS_V3 + HEAD_TAGS_V3:
-        path = osp.join(saved, f'{tag}.png')
-        if osp.exists(path):
-            parts[tag] = np.array(Image.open(path).convert('RGBA'))
-    figure = gaps.figure_mask(fullpage, placement)
-    found = gaps.find_gaps(figure, fullpage, parts.values(), head_xyxy)
-    for index, gap in enumerate(found):
-        tag = gaps.place_tag(gap, parts)
-        parts.setdefault(tag, np.zeros(tuple(canvas_hw) + (4,), np.uint8))
-        at = time.time() - started
-        drew = 'no pass'
-        box = source_box(gap.astype(np.uint8))
-        if box is not None and index < GAP_PASSES and at < GAP_SECONDS:
-            crop, crop_box = _crop_head_box(input_img, box)
-            page, page_placement = fit_pad_resize(crop, (head_resolution, head_resolution))
-            _, px, py, pw, ph = page_placement
-            rst = run_tags(run, pipeline, BODY_TAGS_V3, [tag], page, 0)[0]
-            drawn = _place_on_canvas(rst[py: py + ph, px: px + pw], crop_box, placement, canvas_hw)
-            share = gaps.best_tag(gap, {tag: drawn})[1]
-            taken = share >= gaps.GAP_TAKE
-            if taken:
-                parts[tag] = gaps.take(parts[tag], drawn, gap)
-            drew = f"its {tag} pass drew {share:.0%}{', taken' if taken else ''} ({time.time() - started - at:.0f}s)"
-        left = gap & (parts[tag][..., 3] <= 128)
-        hidden = 0
-        if left.any():
-            parts[tag] = gaps.fill_from_source(parts[tag], fullpage, left, figure)
-            # What the source shows of it ends where something hangs in front: drawn in behind that.
-            behind = gaps.hidden_side(parts[tag], tag, fullpage, parts)
-            try:
-                parts[tag] = gaps.complete_hidden(parts[tag], behind, _inpaint)
-                hidden = int(behind.sum())
-            except Exception as error:  # the inpainter is a nicety; the garment stands without it
-                print(f'[gaps] hidden side not drawn: {error!r}', flush=True)
-        Image.fromarray(parts[tag]).save(osp.join(saved, f'{tag}.png'))
-        print(f'[gaps] {int(gap.sum())} px no part had, at {at:.0f}s, -> {tag}: {drew}; '
-              f'{int(left.sum())} px from the source, {hidden} px drawn in behind what hangs in front', flush=True)
-
-
-def _inpaint(rgb, mask):
-    '''LaMa (anime, large) on the GPU when there is one.'''
-    from annotators.lama_inpainter import apply_inpaint
-    return apply_inpaint(rgb, mask, device='cuda' if torch.cuda.is_available() else 'cpu')
 
 
 def promote_output_scale(saved: str, imgp: str):
@@ -883,6 +807,11 @@ def further_extr(srcd: str, rotate=True, save_to_psd=False, tblr_split=True):
     # if 'hairb' in tag2pinfo:
     #     tag2pinfo['hairb']['depth_median'] = 1.
 
+    if save_to_psd and fitted and not rotate:
+        _cover_gaps(part_dict_list, fullpage, srcd)
+        for part_dict in part_dict_list:
+            tag2pinfo.setdefault(part_dict['tag'], part_dict)
+
     frame_size = fullpage.shape[:2]
 
     if save_to_psd:
@@ -890,6 +819,26 @@ def further_extr(srcd: str, rotate=True, save_to_psd=False, tblr_split=True):
         print(f'psd saved to {psd_savep}')
     else:
         dict2json({'parts': tag2pinfo, 'frame_size': frame_size}, osp.join(saved, 'info.json'))
+
+
+def _cover_gaps(part_dict_list, fullpage, srcd):
+    '''A garment-sized part of the figure the drawing missed, given to the part its place says (utils/gaps.py).'''
+    from utils import gaps
+
+    canvas = json2dict(osp.join(srcd, CANVAS_INFO))
+    # The page is output_scale times the canvas once promoted; the placement is the canvas's.
+    k = fullpage.shape[0] / canvas['canvas'][0]
+    scale, x, y, w, h = canvas['placement']
+    gaps.cover_parts(
+        part_dict_list, fullpage, (scale * k, round(x * k), round(y * k), round(w * k), round(h * k)),
+        _inpaint if torch.cuda.is_available() else None, lambda line: print(line, flush=True),
+    )
+
+
+def _inpaint(rgb, mask):
+    '''LaMa (anime, large) on the GPU.'''
+    from annotators.lama_inpainter import apply_inpaint
+    return apply_inpaint(rgb, mask)
 
 
 def dump_parts_psd(tag2pinfo, frame_size, psd_savep, part_dict_list=None):
