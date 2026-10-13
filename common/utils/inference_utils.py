@@ -228,6 +228,39 @@ def _crop_head_box(img, xywh):
     return img[y1: y2, x1: x2], (x1, y1, x2, y2)
 
 
+# The head pass's box reaches up over the head by at most this share of it.
+HEAD_REACH_UP = 0.5
+
+
+def _head_box_with_what_it_wears(xywh, img):
+    '''
+    The head's box (source pixels) up to the top of the figure over it: what
+    is worn on the head reaches above the head the body pass finds (a maid's
+    frill, a hat), and the head pass's parts end at its box, so a frill came
+    out cut straight across. By at most HEAD_REACH_UP of the head; the
+    margin _crop_head_box gave it below is kept, as that margin shrinks to
+    the room left above. As it is when the backdrop does not tell the figure
+    (utils/gaps.py).
+    '''
+    from utils import gaps
+
+    x, y, w, h = xywh
+    ih, iw = img.shape[:2]
+    rgba = img if img.shape[2] == 4 else np.concatenate([img, np.full((ih, iw, 1), 255, img.dtype)], axis=2)
+    figure = gaps.figure_mask(rgba, (1.0, 0, 0, iw, ih))
+    if figure is None:
+        return xywh
+    rows = np.nonzero(figure[:y, x: x + w].any(axis=1))[0]
+    if not len(rows):
+        return xywh
+    top = max(int(rows.min()) - 8, int(y - HEAD_REACH_UP * h), 0)
+    if top >= y:
+        return xywh
+    below = min(ih - y - h, y, h // 5) if h < ih // 2 else 0
+    bottom = min(ih, y + h + below)
+    return [x, top, w, bottom - top]
+
+
 def _place_on_canvas(region, box, placement, canvas_hw, scale_out=1):
     '''
     `region`, a picture of the source's box (x1, y1, x2, y2), drawn where that
@@ -376,6 +409,7 @@ def _apply_layerdiff_canvas(pipeline, imgp, saved, seed, num_inference_steps, ta
     if head_box is None:
         no_head()
         return
+    head_box = _head_box_with_what_it_wears(head_box, input_img)
     if hair_pass == 'head':
         hair_mask = head_mask.copy()
         for tag in ('front hair', 'back hair'):
