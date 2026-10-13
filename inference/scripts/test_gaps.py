@@ -127,6 +127,34 @@ def test_below_the_lower_garment_a_gap_is_the_legs():
     assert gaps.place_tag(picture([(0, 0, 5, 5, (1, 1, 1, 255))])[..., 3] > 0, {'topwear': picture([TOP])}) == 'objects'
 
 
+def test_above_the_chin_a_gap_is_headwear_and_to_one_side_an_arm():
+    parts = {'face': picture([HEAD]), 'topwear': picture([TOP])}
+    flower = picture([(70, 5, 20, 15, (1, 1, 1, 255))])[..., 3] > 0
+    assert gaps.place_tag(flower, parts) == 'headwear'
+    left_arm = picture([(20, 60, 12, 50, (1, 1, 1, 255))])[..., 3] > 0
+    right_arm = picture([(88, 60, 12, 50, (1, 1, 1, 255))])[..., 3] > 0
+    assert gaps.place_tag(left_arm, parts) == 'handwear-r', 'See-through names the picture-left arm -r'
+    assert gaps.place_tag(right_arm, parts) == 'handwear-l'
+    skirt = picture([SKIRT])[..., 3] > 0
+    assert gaps.place_tag(skirt, parts) == 'bottomwear', 'across the middle it is the lower garment'
+
+
+def test_a_skirt_drawn_in_part_is_grown_with_the_rest():
+    page = source([HEAD, TOP, SKIRT])
+    half = picture([(30, 110, 30, 50, SKIRT[4])])
+    names = ['face', 'topwear', 'bottomwear']
+    images = [picture([HEAD]), picture([TOP]), half]
+    figure = gaps.figure_mask(page, PLACEMENT)
+    found = gaps.find_gaps(figure, page, images, HEAD_BOX)
+    assert len(found) == 1
+    _, _, top = gaps.composite(images)
+    assert gaps.carried_on(found[0], page, names, images, top) == 'bottomwear'
+    lines = []
+    out_names, out_images, changes = gaps.cover(names, images, page, PLACEMENT, HEAD_BOX, None, lines.append)
+    assert changes[0][:2] == ('bottomwear', 'grown') and out_names == names
+    assert tuple(out_images[2][130, 75]) == SKIRT[4]
+
+
 def test_a_lifted_skirt_is_drawn_in_behind_what_hangs_in_front_only():
     garment = picture([SKIRT])
     garment[120:150, 30:42] = 0   # under a sleeve in front, above its hem, which shows
