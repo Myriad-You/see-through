@@ -2,6 +2,7 @@ import os
 import os.path as osp
 import gc
 import math
+import time
 
 from modules.layerdiffuse.diffusers_kdiffusion_sdxl import KDiffusionStableDiffusionXLPipeline, UNetFrameConditionModel
 from modules.layerdiffuse.vae import TransparentVAE
@@ -291,6 +292,7 @@ def _apply_layerdiff_canvas(pipeline, imgp, saved, seed, num_inference_steps, ta
     front and back hair: the hair is drawn finer than anything else on the
     figure, and the body pass sees it at the figure's scale.
     '''
+    started = time.time()
     if hair_pass not in ('canvas', 'head'):
         raise ValueError("hair_pass must be 'canvas' or 'head'")
     # body_tags: only these of the body pass's tags (it needs 'head' to find the head pass's box).
@@ -357,9 +359,6 @@ def _apply_layerdiff_canvas(pipeline, imgp, saved, seed, num_inference_steps, ta
                 big = tuple(v * output_scale for v in canvas_hw) + (4,)
                 Image.fromarray(np.zeros(big, np.uint8)).save(osp.join(hires, f'{tag}.png'))
 
-    if not head_mask.any():
-        no_head()
-        return
     scale, ox, oy, _, _ = placement
     sh, sw = input_img.shape[:2]
 
@@ -372,9 +371,19 @@ def _apply_layerdiff_canvas(pipeline, imgp, saved, seed, num_inference_steps, ta
         y1 = min(max(int(math.ceil((by + bh - oy) / scale)), 0), sh)
         return None if x1 <= x0 or y1 <= y0 else [x0, y0, x1 - x0, y1 - y0]
 
+    def cover(head_xyxy):
+        '''The figure's gaps no part covers, each given to a part (gaps.py); not when only some tags were run.'''
+        if body_tags is None:
+            _cover_gaps(run, input_img, fullpage, placement, canvas_hw, saved, head_resolution, head_xyxy, source_box, started)
+
+    if not head_mask.any():
+        no_head()
+        cover(None)
+        return
     head_box = source_box(head_mask)
     if head_box is None:
         no_head()
+        cover(None)
         return
     if hair_pass == 'head':
         hair_mask = head_mask.copy()
@@ -404,6 +413,55 @@ def _apply_layerdiff_canvas(pipeline, imgp, saved, seed, num_inference_steps, ta
         Image.fromarray(_place_on_canvas(region, box, placement, canvas_hw)).save(osp.join(saved, f'{tag}.png'))
         if output_scale > 1:
             Image.fromarray(_place_on_canvas(region, box, placement, canvas_hw, output_scale)).save(osp.join(hires, f'{tag}.png'))
+    bx, by, bw, bh = cv2.boundingRect(cv2.findNonZero(head_mask))
+    cover((bx, by, bx + bw, by + bh))
+
+
+# A gap's own pass costs about a head pass; no more than this many, and none
+# once the decomposition has run this long (the Space's GPU time is booked
+# per call).
+GAP_PASSES = 2
+GAP_SECONDS = 120
+
+
+def _cover_gaps(run, input_img, fullpage, placement, canvas_hw, saved, head_resolution, head_xyxy, source_box, started):
+    '''
+    What the source shows of the figure that no part has (gaps.py): each gap
+    run once more on its own box, scaled to the head pass's square, and taken
+    by the tag that draws most of it there, or else given the source's own
+    pixels in the part its place says.
+    '''
+    from utils import gaps
+
+    parts = {}
+    for tag in BODY_TAGS_V3 + HEAD_TAGS_V3:
+        path = osp.join(saved, f'{tag}.png')
+        if osp.exists(path):
+            parts[tag] = np.array(Image.open(path).convert('RGBA'))
+    figure = gaps.figure_mask(fullpage, placement)
+    found = gaps.find_gaps(figure, fullpage, parts.values(), head_xyxy)
+    for index, gap in enumerate(found):
+        tag, share = None, 0.0
+        box = source_box(gap.astype(np.uint8))
+        if box is not None and index < GAP_PASSES and time.time() - started < GAP_SECONDS:
+            crop, crop_box = _crop_head_box(input_img, box)
+            page, page_placement = fit_pad_resize(crop, (head_resolution, head_resolution))
+            _, px, py, pw, ph = page_placement
+            drawn = {}
+            for rst, name in zip(run(BODY_TAGS_V3, page, 0), BODY_TAGS_V3):
+                if name in gaps.GAP_TAGS:
+                    drawn[name] = _place_on_canvas(rst[py: py + ph, px: px + pw], crop_box, placement, canvas_hw)
+            tag, share = gaps.best_tag(gap, drawn)
+        if tag is not None and share >= gaps.GAP_TAKE:
+            parts[tag] = gaps.take(parts[tag], drawn[tag], gap)
+            how = f'its own pass drew {share:.0%} of it'
+        else:
+            tag = gaps.place_tag(gap, parts)
+            parts.setdefault(tag, np.zeros(tuple(canvas_hw) + (4,), np.uint8))
+            parts[tag] = gaps.fill_from_source(parts[tag], fullpage, gap, figure)
+            how = f'its own pass drew {share:.0%}; the source pixels by its place'
+        Image.fromarray(parts[tag]).save(osp.join(saved, f'{tag}.png'))
+        print(f'[gaps] {int(gap.sum())} px of the figure no part had -> {tag} ({how})', flush=True)
 
 
 def promote_output_scale(saved: str, imgp: str):
