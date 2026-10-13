@@ -140,11 +140,73 @@ def kind(name: str) -> str:
     return name[:-2] if name.endswith(('-l', '-r')) else name
 
 
+# A pixel is of the garment's colours when it is as close to the garment's
+# colours close by as this share of the gap's own pixels are.
+GARMENT_LIKE_SHARE = 0.9
+
+
+def garment_colours(gap: np.ndarray, page: np.ndarray) -> np.ndarray:
+    '''Where the source shows the colours of the garment the gap is of, close by (within about REACH).'''
+    weight = gap.astype(np.float32)
+    total = cv2.GaussianBlur(page[..., :3].astype(np.float32) * weight[..., None], (0, 0), REACH)
+    local = total / np.maximum(cv2.GaussianBlur(weight, (0, 0), REACH), 1e-6)[..., None]
+    distance = np.linalg.norm(page[..., :3].astype(np.float32) - local, axis=-1)
+    return distance <= np.percentile(distance[gap], GARMENT_LIKE_SHARE * 100)
+
+
+def shown_over(images, indices, page, like=None) -> np.ndarray:
+    '''
+    Where the parts (indices) draw what the source shows, with their soft
+    rims: a lock's strands over a skirt, outlines and all. Not the garment's
+    to take from the source. With like (a mask of the garment's colours),
+    only where the source is not of those colours: a part behind it may
+    have drawn some of the garment.
+    '''
+    core = np.zeros(page.shape[:2], bool)
+    rim = np.zeros(page.shape[:2], bool)
+    for i in indices:
+        image = images[i]
+        distance = np.linalg.norm(image[..., :3].astype(np.float32) - page[..., :3].astype(np.float32), axis=-1)
+        core |= (image[..., 3] > DRAWN) & (distance <= MISMATCH_DISTANCE)
+        rim |= image[..., 3] > 10
+    if like is not None:
+        core &= ~like
+        rim &= ~like
+    return (cv2.dilate(core.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0) & rim
+
+
+def taken_beside(gap: np.ndarray, figure: np.ndarray, behind: np.ndarray, like: np.ndarray) -> np.ndarray:
+    '''
+    Beside the gap (within twice REACH, joined to it), where a part behind
+    the garment shows its colours: the garment's, drawn into that part (a
+    sleeve's layer took the hakama's lit edge beside it).
+    '''
+    near = cv2.dilate(gap.astype(np.uint8), np.ones((4 * REACH + 1, 4 * REACH + 1), np.uint8)) > 0
+    beside = near & ~gap & figure & behind & like
+    # Past the gap's outline, not the thin lines it runs on into (the top's dark outline past the band's ends).
+    outline = np.zeros(gap.shape, np.uint8)
+    contours, _ = cv2.findContours(gap.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.fillPoly(outline, [cv2.convexHull(np.concatenate(contours))], 1)
+    solid = cv2.morphologyEx((gap | beside).astype(np.uint8), cv2.MORPH_OPEN, np.ones((5, 5), np.uint8)) > 0
+    beside &= solid | (outline > 0)
+    _, labels = cv2.connectedComponents((gap | beside).astype(np.uint8), connectivity=8)
+    joined = np.unique(labels[gap])
+    return beside & np.isin(labels, joined[joined > 0])
+
+
+# How far past a part in front of a garment the hidden side looks for what shows beyond it.
+ACROSS = 64
+DIRECTIONS = ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1))
+
+
 def hidden_side(garment: np.ndarray, in_front: np.ndarray) -> np.ndarray:
     '''
     Where a garment lifted from the source lies hidden at rest: inside the
     outline of each of its pieces (their convex hulls), where a part in front
-    of it shows (in_front, a mask).
+    of it shows (in_front, a mask), and where, looking past that part every
+    way, the garment shows beyond it at least as often as anything else does.
+    A sleeve over a skirt's edge has the skirt above, below and inside it; a
+    lock over the sleeve beside a skirt's waist has the sleeve either side.
     '''
     shown = garment[..., 3] > 128
     hull = np.zeros(shown.shape, np.uint8)
@@ -152,7 +214,29 @@ def hidden_side(garment: np.ndarray, in_front: np.ndarray) -> np.ndarray:
     for contour in contours:
         if cv2.contourArea(contour) >= HIDDEN_MIN_PIECE:
             cv2.fillPoly(hull, [cv2.convexHull(contour)], 1)
-    return (hull > 0) & in_front & ~shown
+    candidates = (hull > 0) & in_front & ~shown
+    if not candidates.any():
+        return candidates
+    h, w = shown.shape
+    ys, xs = np.nonzero(candidates)
+    y0, y1 = max(0, ys.min() - ACROSS), min(h, ys.max() + ACROSS + 1)
+    x0, x1 = max(0, xs.min() - ACROSS), min(w, xs.max() + ACROSS + 1)
+    # Beyond the parts in front: 1 the garment, 2 anything else (nothing too); 0 still in front.
+    seen = np.where(shown, 1, np.where(in_front, 0, 2))[y0: y1, x0: x1].astype(np.uint8)
+    sh, sw = seen.shape
+    padded = np.pad(seen, ACROSS, constant_values=2)
+    garment_votes = np.zeros((sh, sw), np.uint8)
+    other_votes = np.zeros((sh, sw), np.uint8)
+    for dx, dy in DIRECTIONS:
+        hit = np.zeros((sh, sw), np.uint8)
+        for k in range(1, ACROSS + 1):
+            look = padded[ACROSS + k * dy: ACROSS + k * dy + sh, ACROSS + k * dx: ACROSS + k * dx + sw]
+            hit = np.where(hit == 0, look, hit)
+        garment_votes += hit == 1
+        other_votes += hit == 2
+    out = np.zeros(shown.shape, bool)
+    out[y0: y1, x0: x1] = candidates[y0: y1, x0: x1] & (garment_votes > 0) & (garment_votes >= other_votes)
+    return out
 
 
 def complete_hidden(garment: np.ndarray, hidden: np.ndarray, inpaint) -> np.ndarray:
@@ -226,7 +310,14 @@ def cover(names, images, page, placement, head_xyxy=None, inpaint=None, log=prin
         # Close by, what shows of a part behind it is its too where the source shows it: a top
         # drawn on down over a hakama's band left square notches the gap's cleaning cut off.
         reach = (cv2.morphologyEx(gap.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((REACH, REACH), np.uint8)) > 0) & (top < at)
-        images[at] = fill_from_source(images[at], page, gap | reach, figure)
+        like = garment_colours(gap, page)
+        # What the parts in front of it draw where it shows stays theirs (a lock's strands, outlines
+        # and all): drawn in behind them below, not lifted with them. So does what a part behind it
+        # that hangs over it draws of its own colours.
+        over = shown_over(images, range(at + 1, len(names)), page) | shown_over(
+            images, [i for i in range(at) if kind(names[i]) in hangs], page, like)
+        beside = taken_beside(gap, figure, top < at, like)
+        images[at] = fill_from_source(images[at], page, gap | reach | beside, figure & ~over)
         # What hangs in front of it but was put behind comes in front, if the source allows.
         color, alpha, _ = composite(images)
         error = np.linalg.norm(color - page[..., :3].astype(np.float32), axis=-1) * (alpha >= 0.5) + 1e3 * (alpha < 0.5)
@@ -243,7 +334,10 @@ def cover(names, images, page, placement, head_xyxy=None, inpaint=None, log=prin
                 moved.append(name)
         at = names.index(tag)
         _, _, top = composite(images)
-        in_front = np.isin(top, [i for i, name in enumerate(names) if i > at and kind(name) in hangs])
+        in_front = np.zeros(figure.shape, bool)
+        for i in range(at + 1, len(names)):
+            if kind(names[i]) in hangs:
+                in_front |= images[i][..., 3] > DRAWN
         behind = hidden_side(images[at], in_front)
         hidden = 0
         if inpaint is not None and behind.any():

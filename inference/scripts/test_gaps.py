@@ -113,6 +113,16 @@ def test_a_lifted_skirt_is_drawn_in_behind_what_hangs_in_front_only():
     assert done[140, 85, 3] == 0 and done[5, 5, 3] == 0
 
 
+def test_a_lock_over_the_sleeve_beside_a_waist_hides_the_sleeve_not_the_skirt():
+    # A narrow waist over a wide skirt; the sleeve shows in the corner beside the waist.
+    garment = picture([(30, 100, 40, 20, SKIRT[4]), (30, 120, 60, 40, SKIRT[4])])
+    lock = picture([(60, 106, 26, 8, (1, 1, 1, 255))])[..., 3] > 0
+    garment[lock] = 0
+    behind = gaps.hidden_side(garment, lock)
+    assert behind[110, 65], 'the waist goes on under the lock'
+    assert not behind[110, 80], 'beside it the lock hides the sleeve'
+
+
 def test_cover_gives_the_skirt_a_new_part_and_brings_the_sleeve_in_front_of_it():
     sleeve = (30, 120, 12, 30, (240, 200, 230, 255))
     # The skirt's band over the top's hem, as a hakama's over a kimono.
