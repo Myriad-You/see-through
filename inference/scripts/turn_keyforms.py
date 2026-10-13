@@ -1575,16 +1575,28 @@ def raise_hair_over_eyes(front, picture, log):
 # 0.25-0.43 on every character so far), less CROWN_MARGIN eye spans for the
 # forehead under the bangs. The forehead lies between the eyes' outer corners:
 # above the eyes and outside them (CROWN_MARGIN eye spans out) are the
-# temples, under the side hair, cut too. Where the back hair has a gap under
+# temples, under the side hair, cut too, down to the eyes' middle CROWN_MARGIN
+# eye spans out. The hairline rounds down to them as a quarter ellipse, flat
+# over the forehead, reaching the eyes' top at their outer corners: cut
+# square, the face kept a corner at each temple that a turn brought out past
+# the side hair as a pointed ear (2026-10-13 kimono bust), and a rounded one
+# still showed as a patch of skin. Where the back hair has a gap under
 # them (the decomposition painted the scalp only behind the face's outline),
 # hidden at rest, it is filled from the back hair around. A pixel is cut only
 # where no pose would show a hole for it: at rest and at every key, it is
 # still covered, or back hair lies where it goes. What shows at rest is never
-# cut.
+# cut; the back hair is filled a little way under the face's new top edge
+# as well, or the slit that opens there as face and hair turn by their own
+# keys shows the backdrop between two locks as a dark fleck. A piece of what
+# shows at rest left above the hairline, apart from the face (a line
+# of the hair the decomposition gave the face, skin between two locks), goes
+# to the lock over it: on the face it would stay put while the hair turns.
 CROWN_FOREHEAD = 0.6
 CROWN_MARGIN = 0.1
 CROWN_MIN_SKIN = 300
 CROWN_FILL_RADIUS = 8
+# How far under the face's top edge the back hair is filled, in eye spans.
+CROWN_UNDER = 0.1
 
 
 def keyed_alpha(front, names, keys, side):
@@ -1631,10 +1643,12 @@ def cut_crown(front, keys, log):
         return 0
     hairline = int(min(tops) - CROWN_MARGIN * span)
     margin = int(CROWN_MARGIN * span)
-    zone = np.zeros((front.H, front.W), bool)
-    zone[:max(0, hairline)] = True
-    zone[:ey.min(), :max(0, ex.min() - margin)] = True
-    zone[:ey.min(), ex.max() + margin:] = True
+    out = np.abs(np.arange(front.W) - (ex.min() + ex.max()) / 2) - span / 2
+    t = np.clip(1 + out / (span / 2), 0, 1)
+    line = hairline + max(0, ey.min() - hairline) * (1 - np.sqrt(1 - t * t))
+    # Past the eyes' outer corners the side hair covers the temple down to the eyes' middle.
+    line += (ey.mean() - ey.min()) * np.clip(out / max(1, margin), 0, 1)
+    zone = np.arange(front.H)[:, None] < line[None, :]
     cut = zone & (face[..., 3] > 0) & ~(cv2.dilate(shows, np.ones((5, 5), np.uint8)) > 0)
     li = front.order.index('face')
     above = front.order[li + 1:]
@@ -1642,7 +1656,11 @@ def cut_crown(front, keys, log):
     if back:
         hair = front.layers[back[0]]
         covered = keyed_alpha(front, above, keys, None) > 0.9
-        gap = cut & covered & (hair[..., 3] < 0.5)
+        # Under the face's new top edge too: the face and the back hair turn
+        # by their own keys, and a slit between them shows through the locks.
+        reach = 2 * int(CROWN_UNDER * span) + 1
+        under = (cv2.dilate(cut.astype(np.uint8), np.ones((reach, reach), np.uint8)) > 0) & (face[..., 3] > 0) & ~cut
+        gap = ((cut & covered) | under) & (hair[..., 3] < 0.5)
         if gap.sum() >= 50:
             rgb = (np.clip(hair[..., :3], 0, 1) * 255).astype(np.uint8)
             unknown = (hair[..., 3] < 0.5).astype(np.uint8)
@@ -1664,7 +1682,43 @@ def cut_crown(front, keys, log):
         cut[qy[~safe], qx[~safe]] = False
     face[..., 3] *= 1 - cut
     log(f'cut the crown above y {hairline} and the temples: {int(cut.sum())} px')
+    strays_to_locks(front, zone, log)
     return int(cut.sum())
+
+
+def strays_to_locks(front, zone, log):
+    """Pieces of the face above the hairline, apart from it, go to the front hair lock around them, drawn as they were."""
+    face = front.layers['face']
+    n, lab, stats, _ = cv2.connectedComponentsWithStats((face[..., 3] > 0).astype(np.uint8), connectivity=8)
+    if n <= 2:
+        return 0
+    main = 1 + int(np.argmax(stats[1:, 4]))
+    li = front.order.index('face')
+    locks = [name for name in front.order[li + 1:] if family_of(name) and family_of(name).startswith('front-hair')]
+    if not locks:
+        return 0
+    moved = []
+    for k in range(1, n):
+        piece = lab == k
+        if k == main or not zone[piece].all():
+            continue
+        ring = cv2.dilate(piece.astype(np.uint8), np.ones((9, 9), np.uint8)) > 0
+        holds = [float(front.layers[name][..., 3][ring].sum()) for name in locks]
+        if max(holds) <= 0:
+            continue
+        lock = front.layers[locks[int(np.argmax(holds))]]
+        # The lock over the piece, as drawn at rest: lock over face.
+        la = lock[piece, 3:4]
+        fa = face[piece, 3:4]
+        alpha = la + fa * (1 - la)
+        rgb = (lock[piece, :3] * la + face[piece, :3] * fa * (1 - la)) / np.maximum(alpha, 1e-6)
+        lock[piece, :3] = rgb
+        lock[piece, 3:4] = alpha
+        face[piece, 3] = 0
+        moved.append((locks[int(np.argmax(holds))], int(piece.sum())))
+    if moved:
+        log(f'face pieces above the hairline to the locks: {moved}')
+    return len(moved)
 
 
 # The light on a part changes as the head turns: a neck the raised chin no
