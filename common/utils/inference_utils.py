@@ -374,7 +374,7 @@ def _apply_layerdiff_canvas(pipeline, imgp, saved, seed, num_inference_steps, ta
     def cover(head_xyxy):
         '''The figure's gaps no part covers, each given to a part (gaps.py); not when only some tags were run.'''
         if body_tags is None:
-            _cover_gaps(run, input_img, fullpage, placement, canvas_hw, saved, head_resolution, head_xyxy, source_box, started)
+            _cover_gaps(run, pipeline, input_img, fullpage, placement, canvas_hw, saved, head_resolution, head_xyxy, source_box, started)
 
     if not head_mask.any():
         no_head()
@@ -417,20 +417,22 @@ def _apply_layerdiff_canvas(pipeline, imgp, saved, seed, num_inference_steps, ta
     cover((bx, by, bx + bw, by + bh))
 
 
-# A gap's own pass costs about a head pass (50 s on the Space, after a body
-# and head pass of 150 s); no more than this many, and none once the
-# decomposition has run this long: the depth pass and the PSD follow, inside
-# the Space's GPU time booked per call (300 s for decompose).
+# A gap's pass draws one tag, quicker than a head pass; no more than this
+# many, and none once the decomposition has run this long: the depth pass and
+# the PSD follow, inside the Space's GPU time booked per call (300 s for
+# decompose; its body and head passes take about 150 s).
 GAP_PASSES = 2
 GAP_SECONDS = 180
 
 
-def _cover_gaps(run, input_img, fullpage, placement, canvas_hw, saved, head_resolution, head_xyxy, source_box, started):
+def _cover_gaps(run, pipeline, input_img, fullpage, placement, canvas_hw, saved, head_resolution, head_xyxy, source_box, started):
     '''
-    What the source shows of the figure that no part has (gaps.py): each gap
-    run once more on its own box, scaled to the head pass's square, and taken
-    by the tag that draws most of it there, or else given the source's own
-    pixels in the part its place says.
+    What the source shows of the figure that no part has (gaps.py), given to
+    the part its place says. Each gap's box is run once more, scaled to the
+    head pass's square, for that one tag alone: with every tag to choose from
+    the model had drawn a hakama's band into the top and its pleats into
+    nothing. What it draws of the gap is taken when it draws most of it; what
+    is still not drawn is the source's own pixels.
     '''
     from utils import gaps
 
@@ -442,31 +444,28 @@ def _cover_gaps(run, input_img, fullpage, placement, canvas_hw, saved, head_reso
     figure = gaps.figure_mask(fullpage, placement)
     found = gaps.find_gaps(figure, fullpage, parts.values(), head_xyxy)
     for index, gap in enumerate(found):
-        tag, share, drew = None, 0.0, 'no pass'
+        tag = gaps.place_tag(gap, parts)
+        parts.setdefault(tag, np.zeros(tuple(canvas_hw) + (4,), np.uint8))
         at = time.time() - started
+        drew = 'no pass'
         box = source_box(gap.astype(np.uint8))
         if box is not None and index < GAP_PASSES and at < GAP_SECONDS:
             crop, crop_box = _crop_head_box(input_img, box)
             page, page_placement = fit_pad_resize(crop, (head_resolution, head_resolution))
             _, px, py, pw, ph = page_placement
-            drawn = {}
-            for rst, name in zip(run(BODY_TAGS_V3, page, 0), BODY_TAGS_V3):
-                if name in gaps.GAP_TAGS:
-                    drawn[name] = _place_on_canvas(rst[py: py + ph, px: px + pw], crop_box, placement, canvas_hw)
-            tag, share = gaps.best_tag(gap, drawn)
-            area = max(1, int(gap.sum()))
-            shares = sorted(((float((gap & (d[..., 3] > 128)).sum()) / area, n) for n, d in drawn.items()), reverse=True)[:3]
-            drew = 'its pass drew ' + ', '.join(f'{n} {v:.0%}' for v, n in shares) + f' ({time.time() - started - at:.0f}s)'
-        if tag is not None and share >= gaps.GAP_TAKE:
-            parts[tag] = gaps.take(parts[tag], drawn[tag], gap)
-            how = 'taken from its pass'
-        else:
-            tag = gaps.place_tag(gap, parts)
-            parts.setdefault(tag, np.zeros(tuple(canvas_hw) + (4,), np.uint8))
-            parts[tag] = gaps.fill_from_source(parts[tag], fullpage, gap, figure)
-            how = 'the source pixels by its place'
+            rst = run_tags(run, pipeline, BODY_TAGS_V3, [tag], page, 0)[0]
+            drawn = _place_on_canvas(rst[py: py + ph, px: px + pw], crop_box, placement, canvas_hw)
+            share = gaps.best_tag(gap, {tag: drawn})[1]
+            taken = share >= gaps.GAP_TAKE
+            if taken:
+                parts[tag] = gaps.take(parts[tag], drawn, gap)
+            drew = f"its {tag} pass drew {share:.0%}{', taken' if taken else ''} ({time.time() - started - at:.0f}s)"
+        left = gap & (parts[tag][..., 3] <= 128)
+        if left.any():
+            parts[tag] = gaps.fill_from_source(parts[tag], fullpage, left, figure)
         Image.fromarray(parts[tag]).save(osp.join(saved, f'{tag}.png'))
-        print(f'[gaps] {int(gap.sum())} px no part had, at {at:.0f}s: {drew}; -> {tag}, {how}', flush=True)
+        print(f'[gaps] {int(gap.sum())} px no part had, at {at:.0f}s, -> {tag}: {drew}; '
+              f'{int(left.sum())} px from the source', flush=True)
 
 
 def promote_output_scale(saved: str, imgp: str):

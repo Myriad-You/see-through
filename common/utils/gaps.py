@@ -2,10 +2,10 @@
 A part the body pass leaves out altogether. The hakama under a kimono came
 back with its bottomwear empty (2026-10-13), and nothing downstream noticed:
 a part only drops out when it is empty. What the source shows of the figure
-that no part has is a gap. A gap below the head is run once more on its own
-box, scaled up as the head is, and the body tag that draws most of it there
-takes what it drew of it, hidden parts included. A gap no tag takes is the
-source's own pixels, given to the part its place says.
+that no part has is a gap, given to the part its place says. Its box is run
+once more for that part alone, scaled up as the head is; what that pass
+draws of it is taken when it draws most of it, hidden parts included, and
+what is still missing is the source's own pixels.
 '''
 import cv2
 import numpy as np
@@ -14,8 +14,9 @@ import numpy as np
 # birdcage earring, 0.5% of a figure), which a body pass would not draw and
 # Myriad's importer lifts from the source up to this same share.
 GAP_MIN_SHARE = 0.02
-# The share of a gap a tag must draw in the gap's own pass to take it.
-GAP_TAKE = 0.3
+# The share of a gap its pass must draw to be taken: with all tags to choose
+# from, a hakama's pass drew 46% of it into the top, its pleats into nothing.
+GAP_TAKE = 0.7
 # Alpha (0..255) that counts as drawn.
 DRAWN = 40
 # Colour distance from the source's backdrop that counts as the figure.
