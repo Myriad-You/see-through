@@ -33,11 +33,17 @@ HIDDEN_MIN_PIECE = 400
 REACH = 21
 
 
-def figure_mask(page: np.ndarray, placement) -> np.ndarray:
+# The source's edge is a flat backdrop only when this share of it is near its
+# median colour (as Myriad's upload trim tells one); a gradient or a scene is
+# not one, and nothing tells the figure from it.
+FLAT_EDGE_SHARE = 0.6
+
+
+def figure_mask(page: np.ndarray, placement):
     '''
     The figure on the fitted canvas (RGBA): the source's alpha where its
     backdrop is transparent, else what is not its backdrop, the colour along
-    the source's edge.
+    the source's edge. None when that edge is not a flat backdrop.
     '''
     _, x, y, w, h = placement
     region = page[y: y + h, x: x + w]
@@ -46,6 +52,8 @@ def figure_mask(page: np.ndarray, placement) -> np.ndarray:
     if (ring[:, 3] < 128).mean() > 0.5:
         return figure
     backdrop = np.median(ring[:, :3].astype(np.float32), axis=0)
+    if (np.linalg.norm(ring[:, :3].astype(np.float32) - backdrop, axis=-1) <= BACKDROP_DISTANCE).mean() < FLAT_EDGE_SHARE:
+        return None
     distance = np.linalg.norm(page[..., :3].astype(np.float32) - backdrop, axis=-1)
     figure &= distance > BACKDROP_DISTANCE
     return cv2.morphologyEx(figure.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)) > 0
@@ -285,6 +293,9 @@ def cover(names, images, page, placement, head_xyxy=None, inpaint=None, log=prin
     is drawn in behind what hangs in front of it.
     '''
     figure = figure_mask(page, placement)
+    if figure is None:
+        log('[gaps] the source has no flat backdrop to tell the figure from: not looked for')
+        return None
     found = find_gaps(figure, page, images, head_xyxy)
     if not found:
         return None

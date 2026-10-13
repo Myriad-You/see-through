@@ -50,6 +50,16 @@ def test_the_figure_is_what_is_not_the_backdrop():
     assert (gaps.figure_mask(clear, PLACEMENT) == figure).all(), 'a transparent backdrop is read from alpha'
 
 
+def test_a_scene_behind_the_figure_is_not_looked_into():
+    page = source([HEAD, TOP, SKIRT])
+    page[..., 0] = np.linspace(0, 255, W).astype(np.uint8)[None, :]   # a gradient, not a backdrop
+    page[..., 1] = np.linspace(255, 0, H).astype(np.uint8)[:, None]
+    assert gaps.figure_mask(page, PLACEMENT) is None
+    lines = []
+    assert gaps.cover(['face', 'topwear'], [picture([HEAD]), picture([TOP])], page, PLACEMENT, HEAD_BOX, None, lines.append) is None
+    assert 'no flat backdrop' in lines[0]
+
+
 def test_a_dropped_skirt_is_the_one_gap_and_goes_below_the_top():
     page = source([HEAD, TOP, SKIRT])
     figure = gaps.figure_mask(page, PLACEMENT)
