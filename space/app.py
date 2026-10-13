@@ -185,13 +185,14 @@ def inference(image: Image.Image, resolution: int = 768, seed: int = 42, tblr_sp
     return _decompose(image, resolution, seed, tblr_split)[:2]
 
 
-@spaces.GPU(duration=240)
+@spaces.GPU(duration=300)
 def decompose(image: Image.Image, canvas: str = "1088x1664", seed: int = 42, tblr_split: bool = True,
               output_scale: int = 1, size_condition: str = "trained"):
     """
     The image fitted on a canvas of its own shape (WxH), never stretched. The
     head pass stays a 1280 square; output_scale 2 keeps its precision in a PSD
-    twice the canvas size.
+    twice the canvas size. A part the body pass left out gets a pass of its
+    own (utils/gaps.py), about as long as the head's: room for one.
     """
     output_scale = int(output_scale)
     if output_scale not in (1, 2):

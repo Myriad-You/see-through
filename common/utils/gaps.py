@@ -125,8 +125,15 @@ def place_tag(gap: np.ndarray, parts: dict) -> str:
 
 
 def fill_from_source(part: np.ndarray, page: np.ndarray, gap: np.ndarray, figure: np.ndarray) -> np.ndarray:
-    '''part (RGBA) with the source's own pixels over the gap and its rim, within the figure.'''
-    area = (cv2.dilate(gap.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0) & figure
+    '''
+    part (RGBA) with the source's own pixels over the gap, the holes inside it
+    (where another part's hidden side happens to share its colours, as a
+    sleeve's print does a hakama's) and its rim, within the figure.
+    '''
+    whole = gap.astype(np.uint8)
+    contours, _ = cv2.findContours(whole, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    cv2.drawContours(whole, contours, -1, 1, thickness=cv2.FILLED)
+    area = (cv2.dilate(whole, np.ones((5, 5), np.uint8)) > 0) & figure
     over = area & (page[..., 3] > part[..., 3])
     out = part.copy()
     out[over] = page[over]

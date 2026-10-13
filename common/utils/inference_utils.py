@@ -417,11 +417,12 @@ def _apply_layerdiff_canvas(pipeline, imgp, saved, seed, num_inference_steps, ta
     cover((bx, by, bx + bw, by + bh))
 
 
-# A gap's own pass costs about a head pass; no more than this many, and none
-# once the decomposition has run this long (the Space's GPU time is booked
-# per call).
+# A gap's own pass costs about a head pass (50 s on the Space, after a body
+# and head pass of 150 s); no more than this many, and none once the
+# decomposition has run this long: the depth pass and the PSD follow, inside
+# the Space's GPU time booked per call (300 s for decompose).
 GAP_PASSES = 2
-GAP_SECONDS = 120
+GAP_SECONDS = 180
 
 
 def _cover_gaps(run, input_img, fullpage, placement, canvas_hw, saved, head_resolution, head_xyxy, source_box, started):
@@ -441,9 +442,10 @@ def _cover_gaps(run, input_img, fullpage, placement, canvas_hw, saved, head_reso
     figure = gaps.figure_mask(fullpage, placement)
     found = gaps.find_gaps(figure, fullpage, parts.values(), head_xyxy)
     for index, gap in enumerate(found):
-        tag, share = None, 0.0
+        tag, share, drew = None, 0.0, 'no pass'
+        at = time.time() - started
         box = source_box(gap.astype(np.uint8))
-        if box is not None and index < GAP_PASSES and time.time() - started < GAP_SECONDS:
+        if box is not None and index < GAP_PASSES and at < GAP_SECONDS:
             crop, crop_box = _crop_head_box(input_img, box)
             page, page_placement = fit_pad_resize(crop, (head_resolution, head_resolution))
             _, px, py, pw, ph = page_placement
@@ -452,16 +454,19 @@ def _cover_gaps(run, input_img, fullpage, placement, canvas_hw, saved, head_reso
                 if name in gaps.GAP_TAGS:
                     drawn[name] = _place_on_canvas(rst[py: py + ph, px: px + pw], crop_box, placement, canvas_hw)
             tag, share = gaps.best_tag(gap, drawn)
+            area = max(1, int(gap.sum()))
+            shares = sorted(((float((gap & (d[..., 3] > 128)).sum()) / area, n) for n, d in drawn.items()), reverse=True)[:3]
+            drew = 'its pass drew ' + ', '.join(f'{n} {v:.0%}' for v, n in shares) + f' ({time.time() - started - at:.0f}s)'
         if tag is not None and share >= gaps.GAP_TAKE:
             parts[tag] = gaps.take(parts[tag], drawn[tag], gap)
-            how = f'its own pass drew {share:.0%} of it'
+            how = 'taken from its pass'
         else:
             tag = gaps.place_tag(gap, parts)
             parts.setdefault(tag, np.zeros(tuple(canvas_hw) + (4,), np.uint8))
             parts[tag] = gaps.fill_from_source(parts[tag], fullpage, gap, figure)
-            how = f'its own pass drew {share:.0%}; the source pixels by its place'
+            how = 'the source pixels by its place'
         Image.fromarray(parts[tag]).save(osp.join(saved, f'{tag}.png'))
-        print(f'[gaps] {int(gap.sum())} px of the figure no part had -> {tag} ({how})', flush=True)
+        print(f'[gaps] {int(gap.sum())} px no part had, at {at:.0f}s: {drew}; -> {tag}, {how}', flush=True)
 
 
 def promote_output_scale(saved: str, imgp: str):
