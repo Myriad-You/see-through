@@ -52,12 +52,26 @@ def test_the_figure_is_what_is_not_the_backdrop():
 
 def test_a_scene_behind_the_figure_is_not_looked_into():
     page = source([HEAD, TOP, SKIRT])
-    page[..., 0] = np.linspace(0, 255, W).astype(np.uint8)[None, :]   # a gradient, not a backdrop
-    page[..., 1] = np.linspace(255, 0, H).astype(np.uint8)[:, None]
+    yy, xx = np.mgrid[0:H, 0:W]
+    scene = np.stack([128 + 100 * np.sin(xx / 3.0), 128 + 100 * np.cos(yy / 5.0), 128 + 100 * np.sin((xx + yy) / 4.0)], -1)
+    clear = np.all(page[..., :3] == BACKDROP[:3], axis=-1)
+    page[clear, :3] = scene[clear].astype(np.uint8)
     assert gaps.figure_mask(page, PLACEMENT) is None
     lines = []
     assert gaps.cover(['face', 'topwear'], [picture([HEAD]), picture([TOP])], page, PLACEMENT, HEAD_BOX, None, lines.append) is None
     assert 'no flat backdrop' in lines[0]
+
+
+def test_a_gradient_behind_the_figure_is_backdrop_between_locks_too():
+    page = source([HEAD, TOP, SKIRT])
+    yy, xx = np.mgrid[0:H, 0:W]
+    gradient = np.stack([250 - 90 * yy / H, 250 - 60 * yy / H, 250 - 20 * xx / W], -1).astype(np.uint8)
+    clear = np.all(page[..., :3] == BACKDROP[:3], axis=-1)
+    page[clear, :3] = gradient[clear]
+    page[60:70, 50:60, :3] = gradient[60:70, 50:60]   # a pocket the figure surrounds
+    figure = gaps.figure_mask(page, PLACEMENT)
+    assert figure is not None and figure[80, 40] and figure[130, 60]
+    assert not figure[195, 5] and not figure[195, 115] and not figure[65, 55]
 
 
 def test_a_dropped_skirt_is_the_one_gap_and_goes_below_the_top():

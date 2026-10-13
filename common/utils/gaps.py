@@ -33,17 +33,56 @@ HIDDEN_MIN_PIECE = 400
 REACH = 21
 
 
-# The source's edge is a flat backdrop only when this share of it is near its
-# median colour (as Myriad's upload trim tells one); a gradient or a scene is
-# not one, and nothing tells the figure from it.
+# The source's edge is a backdrop only when this share of it lies near a
+# smooth one (a flat colour, a gradient, a vignette; Myriad's upload trim asks
+# the same share of a flat one); a scene is not one, and nothing tells the
+# figure from it.
 FLAT_EDGE_SHARE = 0.6
+
+
+# The backdrop is fitted again to the edge's pixels this close to the last fit:
+# a backdrop's are a few apart, light clothes where a bust is cut ten and more.
+BACKDROP_FIT = 15
+
+
+def backdrop_model(region: np.ndarray):
+    '''
+    The backdrop's colour at each pixel of the source's region (RGBA): a
+    quadratic in x and y fitted to its edge, so a gradient or a vignette is
+    backdrop wherever it shows, between locks too; a flat backdrop is its
+    colour. Fitted to the edge's pixels near its median colour, then again to
+    those close to the last fit (not light clothes where a bust is cut).
+    Returns the model and the share of the edge it fits; None for too little
+    edge to fit.
+    '''
+    h, w = region.shape[:2]
+    ys = np.concatenate([np.zeros(w), np.full(w, h - 1), np.arange(h), np.arange(h)])
+    xs = np.concatenate([np.arange(w), np.arange(w), np.zeros(h), np.full(h, w - 1)])
+    ring = region[ys.astype(int), xs.astype(int), :3].astype(np.float64)
+
+    def terms(x, y):
+        x, y = x / max(w - 1, 1), y / max(h - 1, 1)
+        return np.stack([np.ones_like(x), x, y, x * x, x * y, y * y], -1)
+
+    basis = terms(xs, ys)
+    keep = np.linalg.norm(ring - np.median(ring, axis=0), axis=-1) <= BACKDROP_DISTANCE
+    for _ in range(3):
+        if keep.sum() < 6 * 4:
+            return None, 0.0
+        coef, *_ = np.linalg.lstsq(basis[keep], ring[keep], rcond=None)
+        residual = np.linalg.norm(ring - np.einsum('nk,kc->nc', basis, coef), axis=-1)
+        keep = residual <= BACKDROP_FIT
+    fit = residual <= BACKDROP_DISTANCE
+    gy, gx = np.mgrid[0:h, 0:w].astype(np.float64)
+    return np.einsum('hwk,kc->hwc', terms(gx, gy), coef).astype(np.float32), float(fit.mean())
 
 
 def figure_mask(page: np.ndarray, placement):
     '''
     The figure on the fitted canvas (RGBA): the source's alpha where its
-    backdrop is transparent, else what is not its backdrop, the colour along
-    the source's edge. None when that edge is not a flat backdrop.
+    backdrop is transparent, else what is not its backdrop (backdrop_model).
+    None when the edge is not a backdrop: less than FLAT_EDGE_SHARE of it
+    fits a smooth one (a scene).
     '''
     _, x, y, w, h = placement
     region = page[y: y + h, x: x + w]
@@ -51,11 +90,11 @@ def figure_mask(page: np.ndarray, placement):
     figure = page[..., 3] > 128
     if (ring[:, 3] < 128).mean() > 0.5:
         return figure
-    backdrop = np.median(ring[:, :3].astype(np.float32), axis=0)
-    if (np.linalg.norm(ring[:, :3].astype(np.float32) - backdrop, axis=-1) <= BACKDROP_DISTANCE).mean() < FLAT_EDGE_SHARE:
+    model, share = backdrop_model(region)
+    if model is None or share < FLAT_EDGE_SHARE:
         return None
-    distance = np.linalg.norm(page[..., :3].astype(np.float32) - backdrop, axis=-1)
-    figure &= distance > BACKDROP_DISTANCE
+    distance = np.linalg.norm(region[..., :3].astype(np.float32) - model, axis=-1)
+    figure[y: y + h, x: x + w] &= distance > BACKDROP_DISTANCE
     return cv2.morphologyEx(figure.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)) > 0
 
 
