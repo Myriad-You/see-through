@@ -119,6 +119,15 @@ def test_a_gap_in_the_head_box_is_the_head_pass_s():
     assert len(gaps.find_gaps(figure, page, parts)) == 1
 
 
+def test_a_wide_hat_around_the_head_is_a_gap_though_its_middle_is_in_the_head_box():
+    hat = (10, 2, 100, 30, (40, 40, 90, 255))
+    page = source([HEAD, TOP, hat])
+    figure = gaps.figure_mask(page, PLACEMENT)
+    found = gaps.find_gaps(figure, page, [picture([HEAD]), picture([TOP])], (40, 10, 80, 50))
+    assert len(found) == 1 and found[0][15, 15]
+    assert gaps.place_tag(found[0], {'face': picture([HEAD]), 'topwear': picture([TOP])}) == 'headwear'
+
+
 def test_below_the_lower_garment_a_gap_is_the_legs():
     gap = picture([(40, 170, 40, 20, (1, 1, 1, 255))])[..., 3] > 0
     parts = {'topwear': picture([TOP]), 'bottomwear': picture([(30, 110, 60, 40, (120, 60, 160, 255))])}

@@ -52,8 +52,8 @@ def backdrop_model(region: np.ndarray):
     backdrop wherever it shows, between locks too; a flat backdrop is its
     colour. Fitted to the edge's pixels near its median colour, then again to
     those close to the last fit (not light clothes where a bust is cut).
-    Returns the model and the share of the edge it fits; None for too little
-    edge to fit.
+    Returns the model and the share of the edge it fits, the bottom edge
+    aside; None for too little edge to fit.
     '''
     h, w = region.shape[:2]
     ys = np.concatenate([np.zeros(w), np.full(w, h - 1), np.arange(h), np.arange(h)])
@@ -74,7 +74,10 @@ def backdrop_model(region: np.ndarray):
         keep = residual <= BACKDROP_FIT
     fit = residual <= BACKDROP_DISTANCE
     gy, gx = np.mgrid[0:h, 0:w].astype(np.float64)
-    return np.einsum('hwk,kc->hwc', terms(gx, gy), coef).astype(np.float32), float(fit.mean())
+    # The share is the top's and sides': a bust is cut at the bottom by design, and broad shoulders
+    # reach the sides low down; a scene fills the top as well.
+    open_edge = ys < h - 1
+    return np.einsum('hwk,kc->hwc', terms(gx, gy), coef).astype(np.float32), float(fit[open_edge].mean())
 
 
 def figure_mask(page: np.ndarray, placement):
@@ -160,7 +163,7 @@ def drawn_right(page: np.ndarray, images) -> np.ndarray:
 def find_gaps(figure: np.ndarray, page: np.ndarray, images, head_xyxy=None):
     '''
     The drawing's gaps (unexplained), largest first, each a boolean mask of
-    at least GAP_MIN_SHARE of the figure, not centred in the head's box
+    at least GAP_MIN_SHARE of the figure, not mostly within the head's box
     (x1, y1, x2, y2), and not buried (BURIED_SHARE); strands across a gap
     do not split it.
     '''
@@ -173,12 +176,15 @@ def find_gaps(figure: np.ndarray, page: np.ndarray, images, head_xyxy=None):
     for k in np.argsort(-stats[1:, cv2.CC_STAT_AREA]) + 1:
         if stats[k, cv2.CC_STAT_AREA] < floor:
             break
-        cx, cy = centroids[k]
-        if head_xyxy is not None and head_xyxy[0] <= cx < head_xyxy[2] and head_xyxy[1] <= cy < head_xyxy[3]:
-            continue
+        mask = labels == k
+        if head_xyxy is not None:
+            # Mostly over the head's box, it is the head pass's to draw; a wide hat brim around the
+            # head has its middle there too, but most of it outside.
+            x1, y1, x2, y2 = [int(round(v)) for v in head_xyxy]
+            if mask[max(0, y1): y2, max(0, x1): x2].sum() * 2 > stats[k, cv2.CC_STAT_AREA]:
+                continue
         if right is None:
             right = drawn_right(page, images)
-        mask = labels == k
         if right[mask].mean() > BURIED_SHARE:
             continue
         found.append(mask)
