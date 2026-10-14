@@ -199,6 +199,24 @@ def test_a_sleeve_grown_behind_the_skirt_it_hangs_over_comes_in_front_of_it():
     assert np.linalg.norm(color[130, 80] - np.array(sleeve_colour[:3], np.float32)) < 1, 'the sleeve shows over the skirt'
 
 
+def test_white_drawn_inside_a_sleeve_is_filled_but_the_neck_in_the_collar_is_not():
+    sleeve_colour = (180, 210, 220, 255)
+    neck_colour = (240, 210, 200, 255)
+    page = source([HEAD, (50, 45, 20, 20, neck_colour), TOP, (90, 60, 25, 80, sleeve_colour)])
+    page[100: 104, 100: 104, :3] = 252          # a highlight, white on white, inside the sleeve
+    page[55: 60, 57: 63, :3] = neck_colour[:3]  # the neck showing in the collar's opening
+    sleeve = picture([(90, 60, 25, 80, sleeve_colour)])
+    sleeve[100: 104, 100: 104] = 0
+    top = picture([TOP])
+    top[55: 60, 57: 63] = 0
+    names = ['neck', 'face', 'topwear', 'handwear-l']
+    images = [picture([(50, 45, 20, 20, neck_colour)]), picture([HEAD]), top, sleeve]
+    filled = gaps.fill_see_through(names, images, page, PLACEMENT, lambda line: None)
+    assert dict(filled) == {'handwear-l': 16}, filled
+    assert images[3][101, 101, 3] == 255
+    assert images[2][57, 60, 3] == 0, 'the neck stays the neck'
+
+
 def test_a_lifted_skirt_is_drawn_in_behind_what_hangs_in_front_only():
     garment = picture([SKIRT])
     garment[120:150, 30:42] = 0   # under a sleeve in front, above its hem, which shows

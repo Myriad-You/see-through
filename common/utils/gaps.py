@@ -468,6 +468,36 @@ def close_holes(part: np.ndarray, page: np.ndarray, figure: np.ndarray, in_front
     return out
 
 
+def fill_see_through(names, images, page, placement, log=print):
+    '''
+    Small holes inside a worn part's outline that no part in front of it
+    draws, where the source is not the backdrop open to its edge: white
+    drawn on white (a sleeve's ginkgo highlights) a decomposition left out,
+    so the backdrop or the hakama behind showed through the garment, and
+    stayed behind as specks when it moved. The frontmost part around each
+    takes the source's pixels there (close_holes). In place; returns what
+    it filled.
+    '''
+    backdrop = open_backdrop(page, placement)
+    if backdrop is None:
+        return []
+    # Not what a part draws as the source has it, behind or not: the neck in a collar's opening.
+    body = ~backdrop & (page[..., 3] > 128) & ~drawn_right(page, images)
+    filled = []
+    for index in reversed(range(len(names))):
+        if kind(names[index]) not in WORN:
+            continue
+        part = close_holes(images[index], page, body, images[index + 1:])
+        took = (part[..., 3] > 128) & ~(images[index][..., 3] > 128)
+        if took.any():
+            images[index] = part
+            body &= ~took
+            filled.append((names[index], int(took.sum())))
+    if filled:
+        log(f'[gaps] holes the backdrop showed through, filled from the source: {filled}')
+    return filled
+
+
 # A part that hangs in front of a garment is brought in front of it when the
 # drawing at rest gets worse from the source in no more than this share of the figure.
 MOVE_TOLERANCE = 0.002
@@ -697,13 +727,15 @@ def cover_parts(part_dict_list, page, placement, inpaint=None, log=print, head_b
 
     names, images = [part['tag'] for part in order], [canvas(part) for part in order]
     grown = extend_cut(names, images, page, placement, head_box, log) if head_box is not None else []
+    grown += [name for name, _ in fill_see_through(names, images, page, placement, log)]
     face = next((part for part in order if part['tag'] == 'face'), None)
     covered = cover(names, images, page, placement, tuple(face['xyxy']) if face else None, inpaint, log)
     if covered is None and not grown:
         return []
     names, images, changes = covered if covered is not None else (names, images, [])
     by_tag = {part['tag']: part for part in part_dict_list}
-    # A part carried on past the head pass's box keeps its depth; its new pixels take its median.
+    # A part carried on past the head pass's box, or filled where the backdrop showed through it,
+    # keeps its depth; its new pixels take its median.
     for tag in set(grown) - {tag for tag, _, _ in changes}:
         part = by_tag[tag]
         image = images[names.index(tag)]
