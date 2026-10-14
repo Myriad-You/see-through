@@ -303,6 +303,13 @@ def test_cover_parts_keeps_the_order_by_rank_between_tied_depths():
     assert order == ['topwear', 'bottomwear', 'face'], order
 
 
+def test_cover_parts_on_a_tile_drawn_empty_changes_nothing():
+    page = source([HEAD, TOP])
+    lines = []
+    assert gaps.cover_parts([], page, PLACEMENT, None, lines.append, head_box=(0, 0, 10, 10)) == []
+    assert any('no parts' in line for line in lines)
+
+
 def kept(psd_path, master_path, expected):
     '''A kept front decomposition (back to front) against its master, fitted as the canvas path fits it.'''
     from PIL import Image

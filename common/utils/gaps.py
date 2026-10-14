@@ -722,6 +722,11 @@ def cover_parts(part_dict_list, page, placement, inpaint=None, log=print, head_b
     place get depth_medians between their new neighbours'; the others keep
     theirs. Returns what changed (cover's).
     '''
+    if not part_dict_list:
+        # A tile the decomposition drew nothing in (a figure's legs, all boots): nothing to cover
+        # on; the figure's stitch takes the whole there.
+        log('[gaps] no parts drawn: not looked for')
+        return []
     h, w = page.shape[:2]
     order = sorted(part_dict_list, key=lambda part: part['depth_median'], reverse=True)
 
