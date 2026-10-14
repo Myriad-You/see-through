@@ -137,6 +137,9 @@ def test_above_the_chin_a_gap_is_headwear_and_to_one_side_an_arm():
     assert gaps.place_tag(right_arm, parts) == 'handwear-l'
     skirt = picture([SKIRT])[..., 3] > 0
     assert gaps.place_tag(skirt, parts) == 'bottomwear', 'across the middle it is the lower garment'
+    # A figure's lower tile: part of the skirt and the shoes, no face, no top.
+    hem = {'bottomwear': picture([(30, 0, 60, 60, (120, 60, 160, 255))]), 'footwear': picture([(45, 150, 30, 20, (9, 9, 9, 255))])}
+    assert gaps.place_tag(picture([(10, 20, 100, 90, (1, 1, 1, 255))])[..., 3] > 0, hem) == 'bottomwear'
 
 
 def test_a_skirt_drawn_in_part_is_grown_with_the_rest():

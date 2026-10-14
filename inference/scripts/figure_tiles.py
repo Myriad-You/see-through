@@ -259,17 +259,62 @@ def tile_weight_small(tile, box, s, out_hw):
 
 # ---------------------------------------------------------------- stitching
 
-def stitch(whole, tiles, out_hw, path, log=print):
+# Colour distance past which a stitched pixel shows the picture wrong (as utils/gaps.py).
+WRONG_DISTANCE = 98
+# The whole stands where it is this much closer to the picture (colour distance).
+BETTER_BY = 30
+# Wrong places smaller than this many output pixels are a strand's edge, not a dropped part.
+WRONG_MIN_AREA = 1500
+
+
+def _composite(pieces, out_hw):
+    """The premultiplied pieces (box, rgba) drawn back to front: straight colour and alpha."""
+    H, W = out_hw
+    color = np.zeros((H, W, 3), np.float32)
+    alpha = np.zeros((H, W), np.float32)
+    for box, rgba in pieces:
+        y0, x0, y1, x1 = box
+        a = rgba[..., 3]
+        color[y0:y1, x0:x1] = rgba[..., :3] + color[y0:y1, x0:x1] * (1 - a[..., None])
+        alpha[y0:y1, x0:x1] = a + alpha[y0:y1, x0:x1] * (1 - a)
+    return color / np.maximum(alpha, 1e-6)[..., None], alpha
+
+
+def _whole_better(stitched, picture, out_hw):
+    """Where the stitched layers show the picture (RGB 0..255 at out_hw) wrong and the whole's right, in places of some size."""
+    target = picture[..., :3].astype(np.float32) / 255
+    tc, ta = _composite([(box, pre) for _, box, pre, _, _ in stitched], out_hw)
+    wc, wa = _composite([(box, base) for _, box, _, base, _ in stitched], out_hw)
+    whole_error = np.linalg.norm(wc - target, axis=-1)
+    tiles_error = np.linalg.norm(tc - target, axis=-1)
+    whole_right = (wa > 0.5) & (whole_error <= WRONG_DISTANCE / 255)
+    # Wrong by much more than the whole (grey hair through a navy skirt is within 98 of it), or
+    # only part drawn where the whole is not (a skirt one tile drew and the next did not, faded).
+    tiles_wrong = (ta < np.minimum(wa, 0.9)) | (tiles_error > whole_error + BETTER_BY / 255)
+    wrong = cv2.morphologyEx((whole_right & tiles_wrong).astype(np.uint8), cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(wrong, connectivity=8)
+    keep = np.zeros(count, bool)
+    keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= WRONG_MIN_AREA
+    return cv2.dilate(keep[labels].astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+
+
+def stitch(whole, tiles, out_hw, path, log=print, picture=None):
     """
     Writes the figure's PSD at out_hw (the picture's size): the whole's layers
     and order, each layer's pixels from the tiles that drew it, faded into one
-    another and into the whole's where no tile did.
+    another and into the whole's where no tile did, and the whole's where the
+    tiles together show the picture (RGB at out_hw, when given) wrong and the
+    whole shows it right.
     """
     H, W = out_hw
     order = [name for name, *_ in whole.layers]
     matches = {tile.name: match_tile(whole, tile, order, out_hw, log) for tile in tiles}
     psd = PSDImage.new(mode='RGBA', size=(W, H), depth=8)
     kernel = np.ones((2 * REACH + 1, 2 * REACH + 1), np.uint8)
+    stitched = []
+    # How much of each pixel neither the whole's layers nor the stitched ones cover.
+    whole_alpha = np.ones((H, W), np.float32)
+    tiles_alpha = np.ones((H, W), np.float32)
     for name in order:
         base_piece = whole.placed(name)
         pieces = [base_piece]
@@ -323,6 +368,21 @@ def stitch(whole, tiles, out_hw, path, log=print):
         cover = np.minimum(den, 1)
         tiled = np.where(den > 0, num / np.maximum(den, 1e-6), 0)
         pre = tiled * cover + base * (1 - cover)
+        stitched.append((name, box, pre, base, used))
+        whole_alpha[box[0]:box[2], box[1]:box[3]] *= 1 - base[..., 3]
+        tiles_alpha[box[0]:box[2], box[1]:box[3]] *= 1 - pre[..., 3]
+    # Where the tiles together show the picture wrong and the whole shows it right (a tile named a
+    # skirt's panel for the top it carries on, the top was kept only near the whole's top, and the
+    # back hair the tile drew behind it showed), every layer is the whole's there.
+    holes = _whole_better(stitched, picture, out_hw) if picture is not None else \
+        (whole_alpha < 0.5) & (tiles_alpha > 0.5)
+    if holes.any():
+        log(f'the whole stands where the tiles show the picture wrong: {int(holes.sum())} px')
+    for name, box, pre, base, used in stitched:
+        hole = holes[box[0]:box[2], box[1]:box[3]]
+        if (hole & ((base[..., 3] > 0.004) | (pre[..., 3] > 0.004))).any():
+            pre = np.where(hole[..., None], base, pre)
+            used = used + ['the whole where the tiles show it wrong']
         rgba = pre.copy()
         rgba[..., :3] = np.where(rgba[..., 3:4] > 1e-4, rgba[..., :3] / np.maximum(rgba[..., 3:4], 1e-4), 0)
         ys, xs = np.nonzero(rgba[..., 3] > 0.004)
@@ -336,7 +396,7 @@ def stitch(whole, tiles, out_hw, path, log=print):
     psd.save(path)
 
 
-def stitch_files(image_hw, whole_path, tile_paths, tiles, path, log=print):
+def stitch_files(image_hw, whole_path, tile_paths, tiles, path, log=print, picture=None):
     """stitch from files: tile_paths and tiles keyed 'upper', 'middle', 'lower' (crops' sizes as crops() made them)."""
     H, W = image_hw
     whole = Source(whole_path, [0, 0, W, H], image_hw, 'whole')
@@ -345,7 +405,7 @@ def stitch_files(image_hw, whole_path, tile_paths, tiles, path, log=print):
         x0, y0, x1, y1 = tiles[name]
         input_hw = BUST_PIXELS[::-1] if name == 'upper' else (y1 - y0, x1 - x0)
         sources.append(Source(tile_paths[name], tiles[name], input_hw, name))
-    stitch(whole, sources, image_hw, path, log)
+    stitch(whole, sources, image_hw, path, log, picture)
 
 
 if __name__ == '__main__':

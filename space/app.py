@@ -550,7 +550,8 @@ def figure_stitch(image, whole_psd, upper_psd, middle_psd, lower_psd, tiles):
     t0 = time.time()
     figure_tiles.stitch_files(
         (picture.height, picture.width), path(whole_psd),
-        dict(upper=path(upper_psd), middle=path(middle_psd), lower=path(lower_psd)), plan, out, log=_log)
+        dict(upper=path(upper_psd), middle=path(middle_psd), lower=path(lower_psd)), plan, out, log=_log,
+        picture=__import__("numpy").asarray(picture.convert("RGB")))
     _log(f"Stitch done ({time.time() - t0:.1f}s)")
     return out
 

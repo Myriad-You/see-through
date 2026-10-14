@@ -191,7 +191,9 @@ def place_tag(gap: np.ndarray, parts: dict) -> str:
     lower garment the legs'; to one side of the body's middle (the face's,
     else the top's), not across it, from the shoulders down and above the
     lower garment, an arm's (handwear-r on the picture's left, as See-through
-    names them); below the top's middle the lower garment's; else an object's.
+    names them); below the top's middle the lower garment's, as is what
+    lies across the lower garment where there is no top (a figure's lower
+    tile); else an object's.
     '''
     def drawn(tag, axis):
         if tag not in parts:
@@ -204,7 +206,8 @@ def place_tag(gap: np.ndarray, parts: dict) -> str:
     if len(face_rows) and cy < face_rows.max():
         return 'headwear'
     lower, top = drawn('bottomwear', 1), drawn('topwear', 1)
-    if len(lower) and cy > lower.max():
+    # Legs start at the hem; what runs on down from well above it is the rest of the skirt.
+    if len(lower) and cy > lower.max() and lower.max() - ys.min() <= 0.1 * (ys.max() - ys.min()):
         return 'legwear'
     across = drawn('face', 0) if len(face_rows) else drawn('topwear', 0)
     if len(across):
@@ -213,6 +216,9 @@ def place_tag(gap: np.ndarray, parts: dict) -> str:
         if aside and (not len(top) or ys.max() > top.min()) and (not len(lower) or ys.min() < lower.min()):
             return 'handwear-r' if xs.mean() < middle else 'handwear-l'
     if len(top) and cy >= (top.min() + top.max()) / 2:
+        return 'bottomwear'
+    # A figure's lower tile has the skirt and the legs but no top: across the lower garment it is the lower garment.
+    if not len(top) and len(lower) and ys.min() <= lower.max() and ys.max() >= lower.min():
         return 'bottomwear'
     return 'objects'
 
