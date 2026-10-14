@@ -436,6 +436,38 @@ def complete_hidden(garment: np.ndarray, hidden: np.ndarray, inpaint) -> np.ndar
     return out
 
 
+# A hole inside a part's outline up to this share of the part is its own pattern: a sleeve's
+# dark waves, which a hakama drawn whole behind it showed right enough at rest.
+HOLE_MAX_SHARE = 0.02
+
+
+def close_holes(part: np.ndarray, page: np.ndarray, figure: np.ndarray, in_front) -> np.ndarray:
+    '''
+    part (RGBA) with the small holes inside its outline taken from the source,
+    within the figure, where no part in front of it (in_front, canvas RGBA)
+    draws: what showed through them was a part behind, which a moving part
+    leaves behind as specks.
+    '''
+    shown = part[..., 3] > 128
+    if not shown.any():
+        return part
+    outline = shown.astype(np.uint8)
+    contours, _ = cv2.findContours(outline, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    cv2.drawContours(outline, contours, -1, 1, thickness=cv2.FILLED)
+    holes = (outline > 0) & ~shown & figure
+    for image in in_front:
+        holes &= ~(image[..., 3] > DRAWN)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(holes.astype(np.uint8), connectivity=8)
+    small = np.zeros(count, bool)
+    small[1:] = stats[1:, cv2.CC_STAT_AREA] <= HOLE_MAX_SHARE * shown.sum()
+    holes = small[labels]
+    if not holes.any():
+        return part
+    out = part.copy()
+    out[holes] = page[holes]
+    return out
+
+
 # A part that hangs in front of a garment is brought in front of it when the
 # drawing at rest gets worse from the source in no more than this share of the figure.
 MOVE_TOLERANCE = 0.002
@@ -552,6 +584,10 @@ def cover(names, images, page, placement, head_xyxy=None, inpaint=None, log=prin
         return None
     names, images = list(names), list(images)
     raw = unexplained(figure, page, images)
+    # What is filled in from the source is the figure and the white drawn inside its outline (a
+    # sleeve's silver waves, white on white), not only what stands off the backdrop's colour.
+    backdrop = open_backdrop(page, placement)
+    body = figure | (~backdrop & (page[..., 3] > 128)) if backdrop is not None else figure
     _, _, top = composite(images)
     changes = []
     for gap in found:
@@ -580,7 +616,7 @@ def cover(names, images, page, placement, head_xyxy=None, inpaint=None, log=prin
         over = shown_over(images, range(at + 1, len(names)), page) | shown_over(
             images, [i for i in range(at) if kind(names[i]) in hangs], page, like)
         beside = taken_beside(gap, figure, top < at, like)
-        images[at] = fill_from_source(images[at], page, gap | reach | beside, figure & ~over)
+        images[at] = fill_from_source(images[at], page, gap | reach | beside, body & ~over)
         # A part left all but empty keeps a haze where it was meant to be (an arm drawn at alpha 1..9):
         # off its edge it would show once what hangs over it swings away.
         part_alpha = images[at][..., 3]
@@ -620,6 +656,7 @@ def cover(names, images, page, placement, head_xyxy=None, inpaint=None, log=prin
                 names, images = trial_names, trial_images
                 moved.append(name)
         at = names.index(tag)
+        images[at] = close_holes(images[at], page, body, [images[i] for i in range(at + 1, len(names))])
         _, _, top = composite(images)
         in_front = np.zeros(figure.shape, bool)
         for i in range(at + 1, len(names)):
