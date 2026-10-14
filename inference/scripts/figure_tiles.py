@@ -33,8 +33,12 @@ OVERLAP = 0.06
 ROOM = 0.02
 # A tile fades out over this many output pixels at its inner edges.
 FEATHER = 32
-# A tile's layer is the whole's layer of its name when they cover each other this much.
+# A tile's layer is the whole's layer of its name when they cover each other this much, or
+# when it covers this much of what of the whole's shows: a neck the bust tile drew on down
+# under the collar and not up behind the chin (IoU 0.46 with the whole's). What lies past the
+# whole's is cut (REACH).
 AGREE_IOU = 0.5
+AGREE_COVER = 0.95
 # A layer the tile left empty is in another of its layers when that layer covers
 # this share of it, in colours this close (mean RGB distance, 0..1).
 TAKEN_IN = 0.5
@@ -201,9 +205,13 @@ def match_tile(whole, tile, order, out_hw, log):
     tile_a = {name: alpha(tile.placed(name, s)) for name, *_ in tile.layers}
     whole_rgb = {name: rgb(whole.placed(name, s)) for name in order}
     tile_rgb = {name: rgb(tile.placed(name, s)) for name, *_ in tile.layers}
+    # Which of the whole's layers shows on top, per pixel.
+    shows = np.full((box[2] - box[0], box[3] - box[1]), -1)
+    for index, name in enumerate(order):
+        shows = np.where(whole_a[name] > 0.5, index, shows)
     out = {}
     own = {}
-    for name in order:
+    for index, name in enumerate(order):
         a, b = tile_a.get(name), whole_a[name]
         if a is None:
             continue
@@ -214,10 +222,14 @@ def match_tile(whole, tile, order, out_hw, log):
         if ((a > 0.5) & core).sum() < MIN_PIXELS and ((b > 0.5) & core).sum() < MIN_PIXELS:
             continue
         iou = (a_in & b_in & core).sum() / max(1, union.sum())
-        if iou >= AGREE_IOU:
+        seen = (b > 0.5) & (shows == index) & core
+        cover = (a_in & seen).sum() / max(1, seen.sum())
+        if iou >= AGREE_IOU or cover >= AGREE_COVER:
             own[name] = name
+            if iou < AGREE_IOU:
+                log(f'{name:14s} {tile.name}: IoU {iou:.2f} with the whole, but covers {cover:.2f} of it')
         else:
-            log(f'{name:14s} {tile.name}: IoU {iou:.2f} with the whole')
+            log(f'{name:14s} {tile.name}: IoU {iou:.2f} with the whole, covers {cover:.2f} of it')
     # The whole's layers this tile left empty, taken in by another of its layers.
     taken = {}
     for name in order:

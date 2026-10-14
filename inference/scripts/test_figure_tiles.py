@@ -80,6 +80,28 @@ def test_a_tile_that_shows_the_picture_right_is_kept():
         assert not any('stands' in line for line in lines)
 
 
+SKIN = (240, 210, 200)
+
+
+def test_a_tile_neck_drawn_on_under_the_collar_is_the_whole_neck():
+    with tempfile.TemporaryDirectory() as tmp:
+        # The whole's neck goes up behind the chin and stops at the collar; the tile's goes on down
+        # under the collar and not up behind the chin: little IoU, but it covers what of it shows.
+        whole = psd(osp.join(tmp, 'whole.psd'), [('neck', (40, 20, 20, 40), SKIN), ('face', (30, 0, 40, 35), SKIN)])
+        tile = psd(osp.join(tmp, 'tile.psd'), [('neck', (38, 32, 24, 70), SKIN), ('face', (30, 0, 40, 35), SKIN)])
+        aside = psd(osp.join(tmp, 'aside.psd'), [('neck', (70, 40, 20, 60), SKIN), ('face', (30, 0, 40, 35), SKIN)])
+        source = figure_tiles.Source(whole, [0, 0, W, H], (H, W), 'whole')
+        lines = []
+        matches = figure_tiles.match_tile(source, figure_tiles.Source(tile, [0, 0, W, H], (H, W), 'upper'),
+                                          ['neck', 'face'], (H, W), lines.append)
+        assert matches.get('neck') == [('neck', None)], (matches, lines)
+        assert any('covers 1.00' in line for line in lines), lines
+        # A tile's neck beside the whole's is another thing of the same name.
+        matches = figure_tiles.match_tile(source, figure_tiles.Source(aside, [0, 0, W, H], (H, W), 'upper'),
+                                          ['neck', 'face'], (H, W), lines.append)
+        assert 'neck' not in matches, matches
+
+
 if __name__ == '__main__':
     for name, test in sorted(globals().items()):
         if name.startswith('test_'):
