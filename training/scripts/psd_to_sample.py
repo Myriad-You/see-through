@@ -6,6 +6,7 @@ layout syn_data.py writes (dataset_layerdiff.LayerDiffDataset3D reads it):
     <stem>_ann.json          {final_size, tag_info: {tag: {exists, xyxy}}}
     <stem>_<tag>.png         the tag's layers composited, cropped to xyxy
     <stem>_<tag>_depth.png   their depth (0 near), from the depth PSD or the PSD's order
+    <stem>_absent_known.png  where a tag the sample has not is known empty: off the figure
     <stem>_<tag>_known.png   where the target is known: drawn, or empty and not
                              under a part in front. A checked PSD shows what
                              the picture shows; what lies hidden under a part
@@ -118,6 +119,12 @@ def convert(psd_path, picture_path, out_dir, stem, depth_path=None):
         Image.fromarray(d[y1:y2, x1:x2]).save(osp.join(out_dir, f'{stem}_{tag}_depth.png'))
         Image.fromarray(known).save(osp.join(out_dir, f'{stem}_{tag}_known.png'))
         tag_info[tag] = {'exists': True, 'xyxy': [x1, y1, x2, y2]}
+    # A tag the sample has not is known to be empty only outside the figure: legs under a long
+    # skirt are not drawn, but are there.
+    anything = np.zeros(hw, bool)
+    for layer in drawn:
+        anything |= layer
+    Image.fromarray((~anything).astype(np.uint8) * 255).save(osp.join(out_dir, f'{stem}_absent_known.png'))
     with open(osp.join(out_dir, f'{stem}_ann.json'), 'w') as f:
         json.dump({'final_size': list(hw), 'tag_info': tag_info, 'source': osp.basename(psd_path)}, f)
     return tag_info

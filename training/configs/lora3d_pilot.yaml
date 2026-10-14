@@ -1,0 +1,29 @@
+# Pilot LoRA on seethroughv0.0.2_layerdiff3d (train/train_lora3d.py). Paths are the Colab layout.
+repo: layerdifforg/seethroughv0.0.2_layerdiff3d
+output_dir: /content/drive/MyDrive/seethrough-lora/pilot
+samples:
+  - sample_list: /content/samples/target.txt
+    sample_rate: 1
+  - sample_list: /content/samples/replay.txt
+    sample_rate: 1
+target_size: 1280
+random_flip: 0.5
+random_pad_prob: 0.5
+ngroup_iters: 1
+num_workers: 2
+seed: 42
+
+lora_rank: 16
+lora_alpha: 16
+learning_rate: 1.0e-4
+warmup_steps: 50
+weight_decay: 0.0
+gradient_accumulation_steps: 4
+max_grad_norm: 1.0
+max_steps: 1000
+gradient_checkpointing: true
+snr_gamma: 5.0
+vae_use_offset_prob: 0.25
+
+log_every: 10
+checkpoint_every: 100
