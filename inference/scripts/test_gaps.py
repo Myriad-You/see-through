@@ -140,6 +140,9 @@ def test_above_the_chin_a_gap_is_headwear_and_to_one_side_an_arm():
     # A figure's lower tile: part of the skirt and the shoes, no face, no top.
     hem = {'bottomwear': picture([(30, 0, 60, 60, (120, 60, 160, 255))]), 'footwear': picture([(45, 150, 30, 20, (9, 9, 9, 255))])}
     assert gaps.place_tag(picture([(10, 20, 100, 90, (1, 1, 1, 255))])[..., 3] > 0, hem) == 'bottomwear'
+    # Sleeves hanging beside it there are arms.
+    assert gaps.place_tag(picture([(5, 0, 20, 70, (1, 1, 1, 255))])[..., 3] > 0, hem) == 'handwear-r'
+    assert gaps.place_tag(picture([(95, 0, 20, 70, (1, 1, 1, 255))])[..., 3] > 0, hem) == 'handwear-l'
 
 
 def test_a_skirt_drawn_in_part_is_grown_with_the_rest():
@@ -179,6 +182,21 @@ def test_a_head_part_cut_at_the_head_pass_box_goes_on_from_the_source():
     assert images[1][10, 60, 3] == 0 and images[1][30, 30, 3] == 0, 'not the backdrop outside it'
     assert gaps.extend_cut(['face'], [picture([face])], page, PLACEMENT, (20, 40, 100, 120), lines.append) == [], \
         'a part inside its box is not cut'
+
+
+def test_a_sleeve_grown_behind_the_skirt_it_hangs_over_comes_in_front_of_it():
+    sleeve_colour = (200, 230, 240, 255)
+    # A wide sleeve hanging over the skirt's side, its top drawn, the rest left out.
+    page = source([HEAD, TOP, SKIRT, (60, 60, 40, 80, sleeve_colour)])
+    drawn_sleeve = picture([(60, 60, 40, 30, sleeve_colour)])
+    # The skirt was drawn whole, hidden part and all, and the sleeve put behind it.
+    names = ['handwear-l', 'face', 'topwear', 'bottomwear']
+    images = [drawn_sleeve, picture([HEAD]), picture([TOP]), picture([SKIRT])]
+    out_names, out_images, changes = gaps.cover(names, images, page, PLACEMENT, HEAD_BOX, None, lambda line: None)
+    assert changes[0][0] == 'handwear-l' and 'brought in front of bottomwear' in changes[0][1], changes
+    assert out_names.index('handwear-l') > out_names.index('bottomwear')
+    color, _, _ = gaps.composite(out_images)
+    assert np.linalg.norm(color[130, 80] - np.array(sleeve_colour[:3], np.float32)) < 1, 'the sleeve shows over the skirt'
 
 
 def test_a_lifted_skirt_is_drawn_in_behind_what_hangs_in_front_only():

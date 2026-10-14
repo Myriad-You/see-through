@@ -209,11 +209,14 @@ def place_tag(gap: np.ndarray, parts: dict) -> str:
     # Legs start at the hem; what runs on down from well above it is the rest of the skirt.
     if len(lower) and cy > lower.max() and lower.max() - ys.min() <= 0.1 * (ys.max() - ys.min()):
         return 'legwear'
-    across = drawn('face', 0) if len(face_rows) else drawn('topwear', 0)
+    # The body's middle: the face's, else the top's, else (a figure's lower tile) the lower garment's.
+    across = drawn('face', 0) if len(face_rows) else drawn('topwear', 0) if len(top) else drawn('bottomwear', 0)
     if len(across):
         middle = across.mean()
         aside = xs.max() < middle or xs.min() > middle
-        if aside and (not len(top) or ys.max() > top.min()) and (not len(lower) or ys.min() < lower.min()):
+        # Arms hang from the shoulders, down beside the lower garment from its top (or, with no top
+        # in the picture, beside it anywhere: sleeves hanging by a hakama).
+        if aside and (not len(top) or ys.max() > top.min()) and (not len(lower) or not len(top) or ys.min() < lower.min()):
             return 'handwear-r' if xs.mean() < middle else 'handwear-l'
     if len(top) and cy >= (top.min() + top.max()) / 2:
         return 'bottomwear'
@@ -586,18 +589,24 @@ def cover(names, images, page, placement, head_xyxy=None, inpaint=None, log=prin
         color, alpha, _ = composite(images)
         error = np.linalg.norm(color - page[..., :3].astype(np.float32), axis=-1) * (alpha >= 0.5) + 1e3 * (alpha < 0.5)
         # A part grown where it was put behind what covers it (headwear behind the back hair it sits
-        # on) comes in front of that, when the gap still mostly shows wrong and the source allows.
-        if where == 'grown' and front > at + 1 and (error[gap] > MISMATCH_DISTANCE).mean() > 0.5:
-            trial_names = names[:at] + names[at + 1:]
-            trial_images = images[:at] + images[at + 1:]
-            trial_names.insert(front - 1, tag)
-            trial_images.insert(front - 1, images[at])
-            if worse(trial_images, page, figure, error) <= MOVE_TOLERANCE * figure.sum():
-                where = f'grown, brought in front of {trial_names[front - 2]}'
-                names, images = trial_names, trial_images
-                at = front - 1
-                color, alpha, _ = composite(images)
-                error = np.linalg.norm(color - page[..., :3].astype(np.float32), axis=-1) * (alpha >= 0.5) + 1e3 * (alpha < 0.5)
+        # on, a sleeve behind the hakama it hangs over) comes in front of that, when what it now has
+        # shows wrong under it in a twentieth of the gap or more and the source allows.
+        if where == 'grown':
+            _, _, now_top = composite(images)
+            hidden = gap & (images[at][..., 3] > 128) & (now_top > at) & (error > MISMATCH_DISTANCE)
+            covering = now_top[hidden & ~np.isin(now_top, ahead)]
+            if hidden.sum() >= 0.05 * gap.sum() and covering.size:
+                over = int(covering.max())
+                trial_names = names[:at] + names[at + 1:]
+                trial_images = images[:at] + images[at + 1:]
+                trial_names.insert(over, tag)
+                trial_images.insert(over, images[at])
+                if worse(trial_images, page, figure, error) <= MOVE_TOLERANCE * figure.sum():
+                    where = f'grown, brought in front of {names[over]}'
+                    names, images = trial_names, trial_images
+                    at = over
+                    color, alpha, _ = composite(images)
+                    error = np.linalg.norm(color - page[..., :3].astype(np.float32), axis=-1) * (alpha >= 0.5) + 1e3 * (alpha < 0.5)
         # What hangs in front of it but was put behind comes in front, if the source allows.
         moved = []
         for name in [n for n in names[:at] if kind(n) in hangs]:
