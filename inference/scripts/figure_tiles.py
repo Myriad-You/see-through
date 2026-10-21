@@ -14,6 +14,13 @@ of the tile's layers covers it and looks like it, that layer is split by the
 whole's layers. A tile's layer keeps only what lies on the whole's layers it
 was matched to (a floor shadow the legs tile took in is dropped).
 
+The whole, seeing the figure small, can fold a lower garment into another
+part (dark trousers into the top) and have no layer of it. A tile's lower
+garment the whole has no layer of is a layer of its own, cut out of the
+whole's layer it lay in; a tile's layer that carries on the other tile's
+part where the two overlap (the legs tile calling the same trousers the top)
+is that part too.
+
     plan(whole, image_hw) -> {'upper': box, 'middle': box, 'lower': box} or None
     crops(image, tiles)   -> the pictures to decompose, and their sizes
     stitch(...)           -> the figure's PSD at the picture's own size
@@ -45,6 +52,19 @@ TAKEN_IN = 0.5
 TAKEN_IN_COLOUR = 0.12
 # A tile's layer keeps what lies within this many output pixels of the whole's layers it was matched to.
 REACH = 8
+# Parts the whole can fold into another (`NEW_PARTS`): a tile's layer of one, when the whole has
+# none, is a part of its own if it is this share of the tile at least, lies this much on the
+# whole's drawn pixels (not the floor), and is not another of the tile's layers again (IoU
+# AGREE_IOU: an arm the waist tile also called legwear).
+NEW_PARTS = ('bottomwear', 'legwear', 'footwear')
+NEW_MIN_SHARE = 0.01
+NEW_ON_WHOLE = 0.8
+# A new part keeps what lies on the whole's figure with bites of up to this many output pixels closed.
+BITE = 48
+# A tile's layer is the other tile's new part when, where the two tiles overlap, this share of
+# it lies on that part and at most CARRIED_OTHER on the other tile's layer of its own name.
+CARRIED_ON = 0.6
+CARRIED_OTHER = 0.2
 # Matching is measured at this fraction of the output size.
 MATCH_SCALE = 0.5
 MIN_PIXELS = 12
@@ -188,11 +208,24 @@ def tile_weight(tile, box, out_hw):
 
 # ---------------------------------------------------------------- matching
 
+class Matches(dict):
+    """
+    match_tile's: {whole name: [(tile name, owned)]}, and in `new` the parts
+    the whole lacks, {name: the whole's layer it lay in} (each also a key,
+    drawn by the tile's layer of its name).
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.new = {}
+
+
 def match_tile(whole, tile, order, out_hw, log):
     """
     For one tile, which of its layers draws which of the whole's: {whole name:
     [(tile name, owned)]}, owned None for the tile's layer whole, else the
-    whole's names whose share of a split tile layer goes to it.
+    whole's names whose share of a split tile layer goes to it. Its lower
+    garments the whole has no layer of are parts of their own (Matches.new).
     """
     s = MATCH_SCALE
     H, W = int(out_hw[0] * s), int(out_hw[1] * s)
@@ -209,10 +242,31 @@ def match_tile(whole, tile, order, out_hw, log):
     shows = np.full((box[2] - box[0], box[3] - box[1]), -1)
     for index, name in enumerate(order):
         shows = np.where(whole_a[name] > 0.5, index, shows)
-    out = {}
+    # The tile's lower garments the whole has no layer of: what of the whole's layers they lie on
+    # is left out of matching those (the waist tile's top is the whole's without the trousers).
+    new = {}
+    on_whole = shows >= 0
+    for tname, a in tile_a.items():
+        if tname in order or tname.split('-')[0] not in NEW_PARTS:
+            continue
+        drawn = (a > 0.5) & core
+        if drawn.sum() < max(MIN_PIXELS, NEW_MIN_SHARE * core.sum()):
+            continue
+        on = (drawn & on_whole).sum() / drawn.sum()
+        twin = max(((drawn & (tile_a[o] > 0.5)).sum() / max(1, (drawn | ((tile_a[o] > 0.5) & core)).sum())
+                    for o in tile_a if o in order), default=0)
+        if on < NEW_ON_WHOLE or twin >= AGREE_IOU:
+            log(f'{tname:14s} {tile.name}: not in the whole, {on:.2f} on it, IoU {twin:.2f} with another of its layers: dropped')
+            continue
+        lay = np.bincount(shows[drawn & on_whole], minlength=len(order))
+        new[tname] = order[int(lay.argmax())]
+        log(f'{tname:14s} {tile.name}: not in the whole, a part of its own (out of its {new[tname]})')
+    elsewhere = np.zeros(shows.shape, bool)
+    for tname in new:
+        elsewhere |= tile_a[tname] > 0.5
     own = {}
     for index, name in enumerate(order):
-        a, b = tile_a.get(name), whole_a[name]
+        a, b = tile_a.get(name), whole_a[name] * ~elsewhere
         if a is None:
             continue
         # Thin strokes (a brow) drawn a pixel apart still agree.
@@ -253,12 +307,51 @@ def match_tile(whole, tile, order, out_hw, log):
         if best:
             taken.setdefault(best[0], []).append(name)
             log(f'{name:14s} {tile.name}: taken in by its {best[0]} ({best[1]:.2f}, colour {best[2]:.3f}), split out')
+    out = Matches()
     for name, tname in own.items():
         out.setdefault(name, []).append((tname, None if tname not in taken else [name] + taken[tname]))
     for tname, names in taken.items():
         for name in names:
             out.setdefault(name, []).append((tname, [own[tname]] + taken[tname]))
+    for tname, container in new.items():
+        out.new[tname] = container
+        out[tname] = [(tname, None)]
     return out
+
+
+def carry_new_parts(matches, tiles, out_hw, log):
+    """
+    Where two tiles overlap, a tile's layer matched to the whole's of its name
+    that lies there on the other tile's new part, not on the other's layer of
+    its name, is that part (the legs tile calling the trousers the waist tile
+    found the top). Changes `matches` in place.
+    """
+    s = MATCH_SCALE
+    for a in tiles:
+        for b in tiles:
+            if a is b or not matches[a.name].new:
+                continue
+            ax0, ay0, ax1, ay1 = a.box
+            bx0, by0, bx1, by1 = b.box
+            band = (int(max(ay0, by0) * s), int(max(ax0, bx0) * s), int(min(ay1, by1) * s), int(min(ax1, bx1) * s))
+            if band[2] <= band[0] or band[3] <= band[1]:
+                continue
+            alpha = lambda tile, name: paste(band, tile.placed(name, s))[..., 3] > 0.5
+            for name, drawn_by in list(matches[b.name].items()):
+                if name in matches[b.name].new or drawn_by != [(name, None)]:
+                    continue
+                mine = alpha(b, name)
+                if mine.sum() < MIN_PIXELS:
+                    continue
+                other = (mine & alpha(a, name)).sum() / mine.sum()
+                for part, container in matches[a.name].new.items():
+                    on = (mine & alpha(a, part)).sum() / mine.sum()
+                    if on >= CARRIED_ON and other <= CARRIED_OTHER:
+                        del matches[b.name][name]
+                        matches[b.name].setdefault(part, []).append((name, None))
+                        matches[b.name].new.setdefault(part, container)
+                        log(f'{name:14s} {b.name}: carries on {a.name}\'s {part} ({on:.2f}), is that part')
+                        break
 
 
 def tile_weight_small(tile, box, s, out_hw):
@@ -279,6 +372,33 @@ BETTER_BY = 30
 WRONG_MIN_AREA = 1500
 
 
+def _drawn_again(pre, under):
+    """
+    Where premultiplied `pre` covers `under` in the same colours (TAKEN_IN_COLOUR),
+    closed over the odd pixel between, and its faint edge there.
+    """
+    on = under[..., 3] > 0.3
+    straight = lambda rgba: rgba[..., :3] / np.maximum(rgba[..., 3:4], 1e-3)
+    same = (pre[..., 3] > 0.5) & on & (np.abs(straight(pre) - straight(under)).mean(-1) < TAKEN_IN_COLOUR)
+    same = cv2.morphologyEx(same.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8)) > 0
+    faint = (pre[..., 3] <= 0.5) & (under[..., 3] > 0.02) & (cv2.dilate(same.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0)
+    return (on & same) | faint
+
+
+def _holes(mask):
+    """What a mask closes round: background not reached from its box's edge."""
+    ys, xs = np.nonzero(mask)
+    out = np.zeros(mask.shape, bool)
+    if not len(ys):
+        return out
+    y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+    inside = np.pad(~mask[y0:y1, x0:x1], 1, constant_values=True).astype(np.uint8)
+    count, labels = cv2.connectedComponents(inside, connectivity=4)
+    outer = labels[0, 0]
+    out[y0:y1, x0:x1] = (labels != outer)[1:-1, 1:-1] & (inside[1:-1, 1:-1] > 0)
+    return out
+
+
 def _composite(pieces, out_hw):
     """The premultiplied pieces (box, rgba) drawn back to front: straight colour and alpha."""
     H, W = out_hw
@@ -295,8 +415,8 @@ def _composite(pieces, out_hw):
 def _whole_better(stitched, picture, out_hw):
     """Where the stitched layers show the picture (RGB 0..255 at out_hw) wrong and the whole's right, in places of some size."""
     target = picture[..., :3].astype(np.float32) / 255
-    tc, ta = _composite([(box, pre) for _, box, pre, _, _ in stitched], out_hw)
-    wc, wa = _composite([(box, base) for _, box, _, base, _ in stitched], out_hw)
+    tc, ta = _composite([(box, pre) for _, box, pre, *_ in stitched], out_hw)
+    wc, wa = _composite([(box, base) for _, box, _, base, *_ in stitched], out_hw)
     whole_error = np.linalg.norm(wc - target, axis=-1)
     tiles_error = np.linalg.norm(tc - target, axis=-1)
     whole_right = (wa > 0.5) & (whole_error <= WRONG_DISTANCE / 255)
@@ -321,14 +441,50 @@ def stitch(whole, tiles, out_hw, path, log=print, picture=None):
     H, W = out_hw
     order = [name for name, *_ in whole.layers]
     matches = {tile.name: match_tile(whole, tile, order, out_hw, log) for tile in tiles}
+    carry_new_parts(matches, tiles, out_hw, log)
+    # The parts the whole lacks go just under the tile's next layer up the stitch has (as what it
+    # stands for: the shoes under the legs tile's "top" that is the trousers).
+    new = {}
+    layers = list(order)
+    for tile in tiles:
+        names = [name for name, *_ in tile.layers]
+        stands = {}
+        for name, drawn_by in matches[tile.name].items():
+            for tname, _ in drawn_by:
+                stands.setdefault(tname, name)
+        for part, container in matches[tile.name].new.items():
+            if part in new:
+                continue
+            new[part] = container
+            tname = next(t for t, owned in matches[tile.name][part])
+            ups = [stands.get(n, n) for n in names[names.index(tname) + 1:]]
+            above = next((n for n in ups if n in layers), None)
+            layers.insert(layers.index(above) if above else len(layers), part)
     psd = PSDImage.new(mode='RGBA', size=(W, H), depth=8)
     kernel = np.ones((2 * REACH + 1, 2 * REACH + 1), np.uint8)
+    bite = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * BITE + 1, 2 * BITE + 1))
+    # Where a new part is drawn, the whole's layer it lay in is not (the trousers out of the top), to
+    # REACH past its outline (the whole drew it a little wider), not into holes in it (the belt).
+    carved = {}
+    if new:
+        drawn_on = np.zeros((H, W), bool)
+        for name in order:
+            drawn_on |= paste((0, 0, H, W), whole.placed(name))[..., 3] > 0.3
+        drawn_on = cv2.dilate(drawn_on.astype(np.uint8), kernel) > 0
+        for part, container in new.items():
+            cut = carved.setdefault(container, np.zeros((H, W), np.float32))
+            for tile in tiles:
+                for tname, _ in matches[tile.name].get(part, []):
+                    mine = paste((0, 0, H, W), tile.placed(tname))[..., 3] * drawn_on
+                    mine = np.where(_holes(mine > 0.5), mine, cv2.dilate(mine, kernel))
+                    mine = mine * tile_weight(tile, (0, 0, H, W), out_hw)[..., 0]
+                    np.maximum(cut, mine, out=cut)
     stitched = []
     # How much of each pixel neither the whole's layers nor the stitched ones cover.
     whole_alpha = np.ones((H, W), np.float32)
     tiles_alpha = np.ones((H, W), np.float32)
-    for name in order:
-        base_piece = whole.placed(name)
+    for name in layers:
+        base_piece = whole.placed(name) if name in order else None
         pieces = [base_piece]
         drawn = []
         for tile in tiles:
@@ -345,15 +501,28 @@ def stitch(whole, tiles, out_hw, path, log=print, picture=None):
         if box[2] <= box[0] or box[3] <= box[1]:
             continue
         base = paste(box, base_piece)
+        whole_base = base
+        if name in carved:
+            base = base * (1 - carved[name][box[0]:box[2], box[1]:box[3], None])
         num = np.zeros_like(base)
         den = np.zeros(base.shape[:2] + (1,), np.float32)
         used = []
         for tile, tname, owners, piece in drawn:
             mine = paste(box, piece)
+            # What the tile drew again over one of its new parts, in its colours, is that part's (the
+            # shoes the legs tile drew into the trousers too): kept twice, they part when a leg moves.
+            tile_order = [n for n, *_ in tile.layers]
+            for part in matches[tile.name].new:
+                for pname, _ in matches[tile.name].get(part, []):
+                    if tile_order.index(pname) < tile_order.index(tname):
+                        mine *= ~_drawn_again(mine, paste(box, tile.placed(pname)))[..., None]
             # Within reach of the whole's layers this one stands for; split by them when it stands for several.
-            names = owners or [name]
+            names = owners or ([name] if name in order else order)
             stack = np.stack([paste(box, whole.placed(n))[..., 3] for n in names])
             keep = cv2.dilate((stack.max(0) > 0.3).astype(np.uint8), kernel) > 0
+            if name not in order:
+                # On the figure, its bites closed (a white shoe's toe the whole took for the white page).
+                keep = cv2.morphologyEx(keep.astype(np.uint8), cv2.MORPH_CLOSE, bite) > 0
             under = None
             if owners:
                 # Each pixel to the topmost of them drawn there, else the one most drawn.
@@ -380,8 +549,8 @@ def stitch(whole, tiles, out_hw, path, log=print, picture=None):
         cover = np.minimum(den, 1)
         tiled = np.where(den > 0, num / np.maximum(den, 1e-6), 0)
         pre = tiled * cover + base * (1 - cover)
-        stitched.append((name, box, pre, base, used))
-        whole_alpha[box[0]:box[2], box[1]:box[3]] *= 1 - base[..., 3]
+        stitched.append((name, box, pre, whole_base, used, base))
+        whole_alpha[box[0]:box[2], box[1]:box[3]] *= 1 - whole_base[..., 3]
         tiles_alpha[box[0]:box[2], box[1]:box[3]] *= 1 - pre[..., 3]
     # Where the tiles together show the picture wrong and the whole shows it right (a tile named a
     # skirt's panel for the top it carries on, the top was kept only near the whole's top, and the
@@ -390,8 +559,9 @@ def stitch(whole, tiles, out_hw, path, log=print, picture=None):
         (whole_alpha < 0.5) & (tiles_alpha > 0.5)
     if holes.any():
         log(f'the whole stands where the tiles show the picture wrong: {int(holes.sum())} px')
-    for name, box, pre, base, used in stitched:
-        hole = holes[box[0]:box[2], box[1]:box[3]]
+    for name, box, pre, _, used, base in stitched:
+        # A part the whole lacks keeps the tiles' there; the layer it was cut out of stays cut.
+        hole = holes[box[0]:box[2], box[1]:box[3]] if name in order else np.zeros(pre.shape[:2], bool)
         if (hole & ((base[..., 3] > 0.004) | (pre[..., 3] > 0.004))).any():
             pre = np.where(hole[..., None], base, pre)
             used = used + ['the whole where the tiles show it wrong']

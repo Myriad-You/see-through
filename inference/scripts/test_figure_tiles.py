@@ -18,9 +18,9 @@ NAVY = (30, 40, 110)
 GREY = (150, 150, 150)
 
 
-def psd(path, layers):
+def psd(path, layers, size=(W, H)):
     '''A PSD of W x H with each (name, (x, y, w, h), rgb[, (x0, x1) left out]) a layer, back to front.'''
-    doc = PSDImage.new(mode='RGBA', size=(W, H), depth=8)
+    doc = PSDImage.new(mode='RGBA', size=size, depth=8)
     for name, (x, y, w, h), rgb, *gap in layers:
         image = np.zeros((h, w, 4), np.uint8)
         image[...] = rgb + (255,)
@@ -35,7 +35,7 @@ def stitched(path):
     out = PSDImage.open(path)
     canvas = {}
     for layer in out.descendants():
-        image = np.zeros((H, W, 4), np.uint8)
+        image = np.zeros((out.height, out.width, 4), np.uint8)
         pixels = np.array(layer.topil().convert('RGBA'))
         image[layer.top: layer.top + pixels.shape[0], layer.left: layer.left + pixels.shape[1]] = pixels
         canvas[layer.name] = image
@@ -100,6 +100,42 @@ def test_a_tile_neck_drawn_on_under_the_collar_is_the_whole_neck():
         matches = figure_tiles.match_tile(source, figure_tiles.Source(aside, [0, 0, W, H], (H, W), 'upper'),
                                           ['neck', 'face'], (H, W), lines.append)
         assert 'neck' not in matches, matches
+
+
+DARK = (40, 40, 50)
+WHITE = (235, 235, 235)
+
+
+def test_trousers_the_whole_put_in_the_top_are_a_layer_of_their_own():
+    with tempfile.TemporaryDirectory() as tmp:
+        size, hw = (160, 320), (320, 160)
+        # The whole saw the trousers and shoes as the top, down to the feet.
+        whole = psd(osp.join(tmp, 'whole.psd'), [('handwear-r', (20, 60, 20, 120), SKIN),
+                                                 ('topwear', (50, 40, 60, 260), NAVY)], size)
+        # The waist tile has the trousers, and the arm twice (once as legwear).
+        middle = psd(osp.join(tmp, 'middle.psd'), [('handwear-r', (20, 60, 20, 120), SKIN),
+                                                   ('legwear', (20, 60, 20, 120), SKIN),
+                                                   ('bottomwear', (50, 120, 60, 80), DARK),
+                                                   ('topwear', (50, 40, 60, 80), NAVY)], (160, 200))
+        # The legs tile calls the trousers the top again; the shoes under them are shoes.
+        lower = psd(osp.join(tmp, 'lower.psd'), [('footwear', (50, 120, 60, 20), WHITE),
+                                                 ('topwear', (50, 0, 60, 120), DARK)], (160, 160))
+        sources = [figure_tiles.Source(middle, [0, 0, 160, 200], (200, 160), 'middle'),
+                   figure_tiles.Source(lower, [0, 160, 160, 320], (160, 160), 'lower')]
+        lines = []
+        out = osp.join(tmp, 'out.psd')
+        figure_tiles.stitch(figure_tiles.Source(whole, [0, 0, 160, 320], hw, 'whole'), sources, hw, out, lines.append)
+        layers = stitched(out)
+        order = [layer.name for layer in PSDImage.open(out).descendants()]
+        assert 'legwear' not in layers, lines
+        assert order.index('footwear') < order.index('bottomwear') < order.index('topwear'), order
+        for y in (130, 250):
+            assert layers['bottomwear'][y, 80, 3] == 255, (y, lines)
+            assert tuple(layers['bottomwear'][y, 80, :3]) == DARK
+            assert layers['topwear'][y, 80, 3] == 0, ('the trousers are out of the top', y)
+        assert tuple(layers['topwear'][80, 80]) == NAVY + (255,)
+        assert tuple(layers['footwear'][290, 80]) == WHITE + (255,)
+        assert any('carries on middle' in line for line in lines), lines
 
 
 if __name__ == '__main__':
