@@ -138,6 +138,44 @@ def test_trousers_the_whole_put_in_the_top_are_a_layer_of_their_own():
         assert any('carries on middle' in line for line in lines), lines
 
 
+CREAM = (225, 215, 200)
+
+
+def test_a_legs_tile_calling_the_trousers_front_hair_draws_the_trousers():
+    with tempfile.TemporaryDirectory() as tmp:
+        whole = psd(osp.join(tmp, 'whole.psd'), [('back hair', (20, 0, 60, 40), GREY),
+                                                 ('legwear', (25, 50, 50, 100), CREAM)])
+        legs = psd(osp.join(tmp, 'legs.psd'), [('front hair', (25, 50, 50, 100), CREAM)])
+        # Long hair down the waist tile lies on the whole's hair: it stays hair.
+        waist = psd(osp.join(tmp, 'waist.psd'), [('back hair', (20, 0, 60, 40), GREY),
+                                                 ('legwear', (25, 50, 50, 100), CREAM)])
+        source = figure_tiles.Source(whole, [0, 0, W, H], (H, W), 'whole')
+        lines = []
+        tile = figure_tiles.Source(legs, [0, 0, W, H], (H, W), 'lower')
+        matches = figure_tiles.match_tile(source, tile, ['back hair', 'legwear'], (H, W), lines.append)
+        assert matches.get('legwear') == [('legwear', None)], (matches, lines)
+        assert 'front hair' not in tile.by_name
+        assert any('no head here' in line for line in lines), lines
+        matches = figure_tiles.match_tile(source, figure_tiles.Source(waist, [0, 0, W, H], (H, W), 'middle'),
+                                          ['back hair', 'legwear'], (H, W), lines.append)
+        assert matches.get('back hair') == [('back hair', None)], matches
+
+
+def test_a_tile_the_whole_stands_in_for_is_left_out():
+    picture = np.full((H, W, 3), 255, np.uint8)
+    picture[40: 150, 25: 75] = NAVY
+    with tempfile.TemporaryDirectory() as tmp:
+        whole = psd(osp.join(tmp, 'whole.psd'), [('bottomwear', (25, 40, 50, 110), NAVY)])
+        # The tile drew the skirt in steps: a third of it is the page.
+        tile = psd(osp.join(tmp, 'tile.psd'), [('bottomwear', (25, 40, 50, 110), NAVY, (25, 45))])
+        lines = []
+        out = osp.join(tmp, 'out.psd')
+        figure_tiles.stitch(figure_tiles.Source(whole, [0, 0, W, H], (H, W), 'whole'),
+                            [figure_tiles.Source(tile, [0, 0, W, H], (H, W), 'middle')], (H, W), out, lines.append, picture)
+        assert any('left out' in line for line in lines), lines
+        assert stitched(out)['bottomwear'][90, 30, 3] == 255
+
+
 if __name__ == '__main__':
     for name, test in sorted(globals().items()):
         if name.startswith('test_'):

@@ -65,6 +65,17 @@ BITE = 48
 # it lies on that part and at most CARRIED_OTHER on the other tile's layer of its own name.
 CARRIED_ON = 0.6
 CARRIED_OTHER = 0.2
+# A waist or legs tile has no head. Its layer named a head part (wide cream trousers drawn whole
+# but called front hair) that lies NEW_ON_WHOLE on the whole's figure and at most HAIR_ON_HAIR
+# on the whole's head parts (back hair hanging down the waist tile lies on the whole's) is the
+# whole's part it lies on most.
+HEAD_PARTS = ('front hair', 'back hair', 'face', 'headwear', 'ears', 'nose', 'mouth', 'eyebrow',
+              'eyewhite', 'irides', 'eyelash', 'earwear', 'eyewear')
+HAIR_ON_HAIR = 0.3
+# A waist or legs tile is left out when the whole stands in for more than this share of the
+# figure in it: a waist tile that put wide trousers and a sash in the top, cut in steps, had
+# 0.28; the 13 other waist and legs tiles of seven figures 0.18 or less.
+TILE_WRONG_SHARE = 0.25
 # Matching is measured at this fraction of the output size.
 MATCH_SCALE = 0.5
 MIN_PIXELS = 12
@@ -163,6 +174,12 @@ class Source:
             self._placed[name, scale] = self._place(name, scale)
         return self._placed[name, scale]
 
+    def rename(self, old, new):
+        """The layer `old` is called `new` from here on."""
+        self.layers = [(new if name == old else name, *rest) for name, *rest in self.layers]
+        self.by_name[new] = self.by_name.pop(old)
+        self._placed = {key: value for key, value in self._placed.items() if key[0] != old}
+
     def _place(self, name, scale):
         if name not in self.by_name:
             return None
@@ -242,6 +259,23 @@ def match_tile(whole, tile, order, out_hw, log):
     shows = np.full((box[2] - box[0], box[3] - box[1]), -1)
     for index, name in enumerate(order):
         shows = np.where(whole_a[name] > 0.5, index, shows)
+    # A head part in a waist or legs tile is the part under it named wrong (HEAD_PARTS).
+    if tile.name != 'upper':
+        head = np.isin(shows, [index for index, name in enumerate(order) if name.split('-')[0] in HEAD_PARTS])
+        hair = [name for name in tile_a if name.split('-')[0] in HEAD_PARTS]
+        for tname in sorted(hair, key=lambda name: -(tile_a[name] > 0.5).sum()):
+            drawn = (tile_a[tname] > 0.5) & core
+            on = drawn & (shows >= 0)
+            if drawn.sum() < max(MIN_PIXELS, NEW_MIN_SHARE * core.sum()) or on.sum() < NEW_ON_WHOLE * drawn.sum() \
+                    or (on & head).sum() > HAIR_ON_HAIR * on.sum():
+                continue
+            lay = np.bincount(shows[on & ~head], minlength=len(order))
+            name = order[int(lay.argmax())]
+            if name in tile_a:
+                continue
+            log(f"{tname:14s} {tile.name}: no head here, on the whole's {name} ({lay.max() / on.sum():.2f}): {name}")
+            tile.rename(tname, name)
+            tile_a[name], tile_rgb[name] = tile_a.pop(tname), tile_rgb.pop(tname)
     # The tile's lower garments the whole has no layer of: what of the whole's layers they lie on
     # is left out of matching those (the waist tile's top is the whole's without the trousers).
     new = {}
@@ -559,6 +593,18 @@ def stitch(whole, tiles, out_hw, path, log=print, picture=None):
         (whole_alpha < 0.5) & (tiles_alpha > 0.5)
     if holes.any():
         log(f'the whole stands where the tiles show the picture wrong: {int(holes.sum())} px')
+    # A waist or legs tile the whole has to stand in for this much of is left out: patched in
+    # pieces it shows blocks (TILE_WRONG_SHARE).
+    figure = whole_alpha < 0.5
+    for tile in tiles:
+        if tile.name == 'upper':
+            continue
+        x0, y0, x1, y1 = tile.box
+        on = (slice(max(0, y0), max(0, y1)), slice(max(0, x0), max(0, x1)))
+        share = holes[on].sum() / max(1, figure[on].sum())
+        if share > TILE_WRONG_SHARE:
+            log(f'{tile.name}: the whole stands for {share:.2f} of it: left out')
+            return stitch(whole, [other for other in tiles if other is not tile], out_hw, path, log, picture)
     for name, box, pre, _, used, base in stitched:
         # A part the whole lacks keeps the tiles' there; the layer it was cut out of stays cut.
         hole = holes[box[0]:box[2], box[1]:box[3]] if name in order else np.zeros(pre.shape[:2], bool)
