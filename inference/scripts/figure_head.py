@@ -133,7 +133,9 @@ CLIP = re.compile(r'headwear(-\d+)?$')
 def take_hair(figure, head, factor, offset):
     """
     Replaces the figure's front hair (whole, or locks taken before), back hair
-    and hair clips (headwear) with the head's, placed on the figure's canvas (p_figure = p_head * factor + offset). Returns the names taken, or []
+    and hair clips (headwear) with the head's, placed on the figure's canvas
+    (p_figure = p_head * factor + offset); past the head's crop the figure's
+    own hair stays (in the back hair, or the lock it continues). Returns the names taken, or []
     when the head has no locks or back hair (the figure keeps its own hair).
     """
     locks = [name for name in head.order if FRONT_LOCK.match(name)]
@@ -155,6 +157,15 @@ def take_hair(figure, head, factor, offset):
         out[..., 3:4] = alpha
         return np.clip(out, 0, 1).astype(np.float32)
 
+    # The head's hair is only what its crop held: long hair past the crop's
+    # sides and bottom is the figure's own, kept where it falls.
+    outside = ~_crop_on_figure(figure, head, factor, offset)[..., None]
+    own_front = np.zeros((figure.H, figure.W, 4), np.float32)
+    for name in front:
+        own_front = _over(figure.layers[name], own_front)
+    own_front *= outside
+    own_back = figure.layers['back hair'] * outside if 'back hair' in figure.layers else None
+
     at = figure.order.index(front[0])
     for name in front:
         figure.order.remove(name)
@@ -162,9 +173,12 @@ def take_hair(figure, head, factor, offset):
     figure.order[at:at] = locks
     for name in locks:
         figure.layers[name] = placed(name)
+    _hang_on_locks(figure, locks, own_front)
     if 'back hair' not in figure.layers:
         figure.order.insert(0, 'back hair')
     figure.layers['back hair'] = placed('back hair')
+    if own_back is not None:
+        figure.layers['back hair'] = _over(own_back, figure.layers['back hair'])
     # The clips on that hair go with it: the head's hair was cut and filled
     # around its own clips (their shading baked next to them), which the
     # figure's, drawn a few pixels off, leave showing.
@@ -179,6 +193,42 @@ def take_hair(figure, head, factor, offset):
         for name in clips:
             figure.layers[name] = placed(name)
     return locks + ['back hair'] + clips
+
+
+def _crop_on_figure(figure, head, factor, offset):
+    """Where the head's crop lies on the figure's canvas (the head's canvas pads it round, placement)."""
+    scale, x, y = placement(BUST_PIXELS[::-1], (head.H, head.W))
+    w, h = BUST_PIXELS[0] * scale, BUST_PIXELS[1] * scale
+    x0, y0 = int(np.floor(x * factor + offset[0])), int(np.floor(y * factor + offset[1]))
+    x1, y1 = int(np.ceil((x + w) * factor + offset[0])), int(np.ceil((y + h) * factor + offset[1]))
+    inside = np.zeros((figure.H, figure.W), bool)
+    inside[max(0, y0):max(0, y1), max(0, x0):max(0, x1)] = True
+    return inside
+
+
+def _over(top, under):
+    """Straight-alpha `top` drawn on `under` (float RGBA)."""
+    a, b = top[..., 3:4], under[..., 3:4]
+    alpha = a + b * (1 - a)
+    rgb = np.where(alpha > 1e-4, (top[..., :3] * a + under[..., :3] * b * (1 - a)) / np.maximum(alpha, 1e-4), 0)
+    return np.concatenate([rgb, alpha], 2).astype(np.float32)
+
+
+# A piece of the figure's own front hair past the crop joins the lock it
+# continues: the one with most hair within this many pixels of it.
+LOCK_REACH = 4
+
+
+def _hang_on_locks(figure, locks, own):
+    """The figure's own front hair past the crop, each piece into the lock it continues (the topmost when none)."""
+    count, labels = cv2.connectedComponents((own[..., 3] > 0.05).astype(np.uint8), connectivity=8)
+    kernel = np.ones((2 * LOCK_REACH + 1, 2 * LOCK_REACH + 1), np.uint8)
+    for k in range(1, count):
+        piece = labels == k
+        near = cv2.dilate(piece.astype(np.uint8), kernel) > 0
+        touch = [(figure.layers[name][..., 3][near] > 0.5).sum() for name in locks]
+        lock = locks[int(np.argmax(touch))] if max(touch) > 0 else locks[-1]
+        figure.layers[lock] = _over(own * piece[..., None], figure.layers[lock])
 
 
 class _Canvas:
