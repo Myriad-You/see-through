@@ -1943,7 +1943,12 @@ def _fit_direction(front_path, turned_path):
                     lines.append(f'ears        turned ears are {ratio:.1f}x the front ones: they ride the {by}')
                     fits['ears'] = dict(key, fit=None)
                 continue
-        fit = fit_family(front, turned, names, family, lines.append)
+        # The back hair turns with the whole of the hair: a turned decomposition
+        # can give the crown to the front hair (h08: the back hair at 0.56-0.69
+        # of its front area, the hair at 0.78-1.00), and fitted alone the back
+        # hair's outline was pulled ~70 px in under it, its shine stretched across.
+        fit_names = names + FAMILIES['front-hair'] if family == 'back-hair' else names
+        fit = fit_family(front, turned, fit_names, family, lines.append)
         if fit and family == 'ears' and fit['fit']['iou'] < EAR_FIT_IOU:
             # The turned ears are other parts (a human ear where a cat ear was dropped).
             ys, xs = np.nonzero(front.family(names)[..., 3] > 0.5)
