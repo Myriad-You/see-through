@@ -143,6 +143,7 @@ def _split(rgb, alpha):
         keep, drop = (u, v) if (lab == u).sum() >= (lab == v).sum() else (v, u)
         lab[lab == drop] = keep
 
+    lab = adopt_pieces(lab, min_area)
     out = np.zeros_like(lab)
     ids = sorted([l for l in np.unique(lab) if l > 0], key=lambda l: xx[lab == l].mean())
     for k, l in enumerate(ids, 1):
@@ -150,6 +151,32 @@ def _split(rgb, alpha):
     if tuft.any():
         out[tuft] = len(ids) + 1
     return out, dict(crown=crown, tips=tips, locks=int(out.max()))
+
+
+def adopt_pieces(lab, min_area):
+    """
+    A piece of a lock cut off from the rest of it, too small to be a lock
+    (strands past a gap, bits the strand field lost), goes with the lock nearest
+    it. Left with its own lock it moves with hair across the head, and on a turn
+    parts from the hair round it. A larger piece is the lock's own: a lock
+    another lies across is in two pieces.
+    """
+    ids = [int(l) for l in np.unique(lab) if l > 0]
+    if len(ids) < 2:
+        return lab
+    main, pieces = {}, []
+    for l in ids:
+        n, cc, stats, _ = cv2.connectedComponentsWithStats((lab == l).astype(np.uint8), connectivity=8)
+        big = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        main[l] = cc == big
+        pieces += [(l, cc == i) for i in range(1, n) if i != big and stats[i, cv2.CC_STAT_AREA] < min_area]
+    if not pieces:
+        return lab
+    away = {l: cv2.distanceTransform((~m).astype(np.uint8), cv2.DIST_L2, 5) for l, m in main.items()}
+    out = lab.copy()
+    for own, piece in pieces:
+        out[piece] = min(ids, key=lambda l: (float(away[l][piece].min()), l != own))
+    return out
 
 
 # ---------------------------------------------------------------- the drawing
