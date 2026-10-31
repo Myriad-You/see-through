@@ -760,6 +760,56 @@ RESTORE_DIFFERENT = 40
 RESTORE_DIFFERENT_DRAWN = 15
 RESTORE_AREA = (0.5, 2.0)
 RESTORE_HOLE = 0.2
+# An ornament can be drawn hidden under the parts over it (a hat's opening
+# drawn whole, flat, behind the face and hair): the picture shows those parts
+# there, nearer their drawing than the ornament's over most of it (under
+# HIDDEN_SHARE; 0-0.05 on hats, where a necklace the decomposition put under
+# the shirt, which the picture has on top, is 0.64-0.88). Where the picture
+# differs from them there, the decomposition drew them otherwise (an eye
+# redrawn, the seams between locks): no evidence of the ornament, and taken
+# from the picture an eye rides on the hat as the head turns. There (seams
+# closed up to RESTORE_SEAM) the ornament is the picture only where that is
+# nearer the ornament as it shows around (RESTORE_AROUND) than the parts over
+# it (COVER_AROUND): its brim between the locks.
+HIDDEN_SHARE = 0.5
+RESTORE_SEAM = 25
+RESTORE_AROUND = 31
+COVER_AROUND = 15
+
+
+def colour_around(rgb, alpha, k):
+    """Each pixel's colour of what `alpha` draws around it (a Gaussian over k px), and how much is drawn there."""
+    weight = cv2.GaussianBlur(alpha, (k, k), 0)
+    return cv2.GaussianBlur(rgb * alpha[..., None], (k, k), 0) / np.maximum(weight, 1e-4)[..., None], weight
+
+
+def hidden_ornament(front, name, picture, near):
+    """
+    Where `name` (within `near`) lies hidden under the layers over it, and of
+    that where the picture is nearer `name` as it shows around than them.
+    """
+    layer = front.layers[name]
+    rgb, _, alpha = composite_of(front, front.order[front.order.index(name) + 1:])
+    seam = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (RESTORE_SEAM, RESTORE_SEAM))
+    covered = (cv2.morphologyEx((alpha > 0.5).astype(np.uint8), cv2.MORPH_CLOSE, seam) > 0) & near
+    hidden = np.zeros_like(covered)
+    if not covered.any():
+        return hidden, hidden
+    # Drawn over white: their own colour is (rgb - (1 - alpha)) / alpha.
+    own = (rgb - (1 - alpha[..., None])) / np.maximum(alpha, 1e-3)[..., None]
+    theirs = picture_distance(layer[..., :3], picture) >= picture_distance(own, picture)
+    under = (layer[..., 3] > 0.3) & (alpha > 0.9)
+    n, parts = cv2.connectedComponents(covered.astype(np.uint8))
+    for k in range(1, n):
+        part = parts == k
+        if (part & under).any() and theirs[part & under].mean() > 1 - HIDDEN_SHARE:
+            hidden |= part
+    if not hidden.any():
+        return hidden, hidden
+    cover, _ = colour_around(own, alpha, COVER_AROUND)
+    shown, weight = colour_around(layer[..., :3], layer[..., 3] * ~covered, RESTORE_AROUND)
+    nearer = hidden & (weight > 0.02) & (picture_distance(shown, picture) < picture_distance(cover, picture))
+    return hidden, nearer
 
 
 def restore_ornaments(front, picture, log):
@@ -784,7 +834,12 @@ def restore_ornaments(front, picture, log):
         border = set(np.unique(np.concatenate([gaps[0], gaps[-1], gaps[:, 0], gaps[:, -1]])))
         enclosed = [g for g in range(1, n) if g not in border and stats[g, 4] < RESTORE_HOLE * art.sum()]
         art |= np.isin(gaps, enclosed)
-        ratio = art.sum() / drawn.sum()
+        hidden, nearer = hidden_ornament(front, name, picture, near)
+        if (art & hidden & ~nearer).any():
+            kept = cv2.morphologyEx((art & nearer).astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)) > 0
+            art = (art & ~hidden) | kept
+        # What lies hidden says nothing of how much of it the picture shows.
+        ratio = (art & ~hidden).sum() / max((drawn & ~hidden).sum(), 1)
         if not RESTORE_AREA[0] <= ratio <= RESTORE_AREA[1]:
             continue
         layer[art, :3] = picture[art]
@@ -829,11 +884,14 @@ def fill_under_piece(front, mask, family, log):
     return int(hole.sum())
 
 
-def match_piece(mask, front_rgb, turned_rgb, side, face_cx, earring, center=None):
+def match_piece(mask, front_rgb, turned_rgb, side, earring, center=None):
     """
     Where a piece went in the turned picture: the best match of its drawing,
-    squeezed as the turn foreshortens it, near `center` (where its host's key
-    carries it); at `center` itself when nothing near looks like it.
+    squeezed or widened as the turn foreshortens it, near `center` (where its
+    host's key carries it); at `center` itself when nothing near looks like it.
+    Which side of the head turns away differs between generated pictures (b00:
+    a bun clip right of the face widened to 1.15 on plus, and matched only
+    narrowed it took the pink of the ear), so a piece may do either.
     """
     ys, xs = np.nonzero(mask)
     x0, x1, y0, y1 = xs.min(), xs.max() + 1, ys.min(), ys.max() + 1
@@ -841,8 +899,7 @@ def match_piece(mask, front_rgb, turned_rgb, side, face_cx, earring, center=None
     m = mask[y0:y1, x0:x1].astype(np.float32)
     cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
     if side in ('plus', 'minus'):
-        far = (cx > face_cx) == (side == 'plus')
-        squeeze = (0.85, 1.05) if earring else ((0.6, 1.0) if far else (0.9, 1.15))
+        squeeze = (0.85, 1.05) if earring else (0.6, 1.15)
         reach = (260, 120)
     else:
         squeeze, reach = (0.9, 1.1), (30, 90)
@@ -2172,7 +2229,6 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
         box = (max(0, xs.min() - HEAD_KEY_PAD), max(0, ys.min() - HEAD_KEY_PAD),
                min(front.W - 1, xs.max() + HEAD_KEY_PAD), min(front.H - 1, ys.max() + HEAD_KEY_PAD))
         layer = front.layers['headwear']
-        face_cx = float(np.nonzero(front.layers['face'][..., 3] > 0.5)[1].mean())
         whole = layer[..., 3] > 0.5
         for side in turned_paths:
             if side in keys.get('headwear', {}) or side not in keys['face']:
@@ -2190,7 +2246,7 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
                     rgb = moved[..., :3] * moved[..., 3:4] + (1 - moved[..., 3:4])
                     ys, xs = np.nonzero(mask)
                     center = ((xs.min() + xs.max() + 1) / 2, (ys.min() + ys.max() + 1) / 2)
-                    found = match_piece(mask, rgb, picture, side, face_cx, False, center)
+                    found = match_piece(mask, rgb, picture, side, False, center)
                     if found['matched']:
                         dx, dy = found['target'][0] - found['source'][0], found['target'][1] - found['source'][1]
                         back = np.asarray(key['back'], np.float32).reshape(-1, 2) - [dx, dy]
@@ -2198,7 +2254,7 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
                         candidates.append((dict(key, box=[x0 + dx, y0 + dy, x1 + dx, y1 + dy],
                                                 back=[float(v) for v in back.reshape(-1)]),
                                            f'rides the head, shifted ({dx:.0f}, {dy:.0f})'))
-                rigid = match_piece(whole, placed_illustration(pictures['front'], front.W, front.H)[0], picture, side, face_cx, False)
+                rigid = match_piece(whole, placed_illustration(pictures['front'], front.W, front.H)[0], picture, side, False)
                 candidates.append((accessory_lattice([rigid]), 'moves whole'))
                 errors = [headwear_error(front, keys, side, k, picture, box) for k, _ in candidates]
                 best = int(np.argmin(errors))
@@ -2212,8 +2268,6 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
     # Accessories ride rigidly: every piece of every hair clip and earring,
     # matched on the illustrations when given (they hold what the
     # decompositions re-render or drop).
-    face = front.layers.get('face')
-    face_cx = float(np.nonzero(face[..., 3] > 0.5)[1].mean()) if face is not None else front.W / 2
     drawn = {}
     recovered = []
     if pictures:
@@ -2256,7 +2310,7 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
                     center = (float(tx[0]), float(ty[0]))
                 else:
                     center = (cx, cy)
-                found.append(match_piece(mask, front_rgb, turned_rgb, side, face_cx, host == 'ears', center))
+                found.append(match_piece(mask, front_rgb, turned_rgb, side, host == 'ears', center))
             lattice = accessory_lattice(found)
             for family in ACCESSORIES:
                 if family not in own:
