@@ -1454,10 +1454,13 @@ def turned_position(key, qx, qy):
 
 # A decomposition paints a part's hidden side whole, and some parts lie over
 # others they should not cover: the face's crown over back hair the front hair
-# does not reach (a band of skin across the top of the head). The picture
-# says what is on top: where such a part is on top, the picture is far from it
-# (RGB distance over CUT_DIFFERENT) and close to what lies under it (under
-# CUT_MATCH, and nearer by CUT_GAIN), the part is cut away.
+# does not reach (a band of skin across the top of the head); the front hair's
+# pale wash where it guessed hair over the hair behind (h13: a grey patch
+# beside an earring, which swung out from the earring and parted from the dark
+# hair on a turn). The picture says what is on top: where such a part is on
+# top, the picture is far from it (RGB distance over CUT_DIFFERENT) and close
+# to what lies under it (under CUT_MATCH, and nearer by CUT_GAIN), the part is
+# cut away.
 PAINTED_OVER = ('face', 'neck', 'ears-r', 'ears-l', 'ears', 'topwear')
 CUT_DIFFERENT = 35
 CUT_MATCH = 30
@@ -1516,15 +1519,14 @@ def cut_garment_under_face(front, log):
 
 def cut_by_picture(front, picture, log, lift=False):
     """
-    Cuts each of PAINTED_OVER where the picture shows what lies under it instead.
-    With `lift`, an ornament under it the picture shows on top is not uncovered
-    by a hole that would open as it moves: it goes over the part, which is
-    filled from around under it.
+    Cuts each of PAINTED_OVER and the front hair where the picture shows what
+    lies under it instead. With `lift`, an ornament under it the picture shows
+    on top is not uncovered by a hole that would open as it moves: it goes over
+    the part, which is filled from around under it.
     """
     report = {}
-    for name in PAINTED_OVER:
-        if name not in front.layers:
-            continue
+    hair = [n for n in front.order if n == 'front hair' or LOCK_LAYER.match(n)]
+    for name in [n for n in PAINTED_OVER if n in front.layers] + hair:
         on_top = front.owner() == name
         under, below, _ = composite_of(front, [n for n in front.order if n != name])
         now = picture_distance(front.composite(), picture)
