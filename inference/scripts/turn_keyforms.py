@@ -855,7 +855,9 @@ def fill_under_piece(front, mask, family, log):
     Fills the hair a piece riding `family` sits on where it has a hole under
     the piece. Under a clip on the back hair the decomposition paints the
     scalp's flat guess, not a hole: all of it is hidden at rest, so all of it
-    is drawn again from the hair around.
+    is drawn again from the hair around. What of the piece hangs past the back
+    hair (a ribbon's tails) has no hair under it: filled, it would swing out
+    from under the ribbon as a ribbon of hair.
     """
     names = [n for n in front.order if (family_of(n) or '').split(':')[0] == family]
     if not names or family not in ('front-hair', 'back-hair'):
@@ -864,7 +866,14 @@ def fill_under_piece(front, mask, family, log):
     ring = (cv2.dilate(mask.astype(np.uint8), np.ones((15, 15), np.uint8)) > 0) & ~mask
     name = max(names, key=lambda n: (front.layers[n][..., 3][ring] > 0.5).sum())
     layer = front.layers[name]
-    hole = mask & (layer[..., 3] < 0.5) if family == 'front-hair' else mask.copy()
+    bare = layer[..., 3] < 0.5
+    if family == 'front-hair':
+        hole = mask & bare
+    else:
+        # A bare part under the piece that runs out to bare ground beside it is past the hair, not a hole in it.
+        _, parts = cv2.connectedComponents(bare.astype(np.uint8), connectivity=8)
+        past = np.isin(parts, np.unique(parts[bare & ~mask]))
+        hole = mask & ~(bare & past)
     if hole.sum() < 50 or (layer[..., 3][ring] > 0.5).mean() < 0.5:
         return 0
     # Around the piece, every transparent pixel is unknown, so only the hair itself
