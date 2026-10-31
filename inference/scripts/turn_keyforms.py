@@ -1027,35 +1027,47 @@ def place_mouth(front, turned, keys, log):
 # believed where the front picture has it within CHIN_TRUST of the face's
 # bottom and where it folds the jaw by no more than CHIN_FOLD of its length
 # (past that the line is a shadow or a collar: h02 and h12 found one 130 px
-# off). The lattice is fitted to them in one least- squares solve, held where
+# off). The lattice is fitted to them in one least-squares solve, held where
 # the outline is (FEATURE_HOLD, on nodes within a cell and FEATURE_TAPER px of
 # it) and kept from bending (FEATURE_BEND, second differences: a fitted
 # polynomial bent 190 px past the brows and folded the nose onto the forehead;
 # a spline through the anchors folded the cheek). The outline holds above the
-# eyes, and below them unless the chin is more than CHIN_MOVED of the eyes'
-# span from where the key has it (raised with the mouth where the picture keeps
-# the jaw, h01's jaw bared the back hair behind it). Then the jaw goes where
-# the picture has it: along the face's outline below the mouth, every JAW_STEP
-# of the span where the front picture shows that outline as skin's edge
-# (JAW_SKIN, within CHIN_TRUST), the point the features carried it to moves
-# along the outline's normal to the turned picture's first edge (JAW_EDGE)
-# within JAW_REACH of the span, unless it moves JAW_ODD of the span apart from
-# its neighbours. The points step out from the chin's point, and where they
-# land is smoothed along the line (JAW_SOFT of the span: each edge found is a
-# few px off its own way, and pinned as found they were bumps; smoothed as
-# moves, the chin's, much the largest, came out short and its point stayed down
-# where the picture has it up). The line takes the chin over and is pinned
-# JAW_PULL times harder than the features' centres (the bending kept the point
-# down). The band JAW_BAND px inside it moves with it, so the line stays as
-# thin as drawn (seen from below the lower face stretches 1.45x, at its edge
-# 2.5x, and the chin's 2 px line had become a 6 px fringe). The oc-witch
-# pointed chin is then a wide flat jaw from ear to ear, rounder than the
-# lattice's 26 px cells draw: the key is refitted on FEATURE_FINE nodes (the
-# same map, then as stiff as before; the runtime takes up to 64). A turn is
-# left as fitted: the decomposition has its silhouette, and a field moving its
-# inside folded the cheek. A field that would cut into the face (face lost with
-# face still past it: below, or on both sides, more than FEATURE_DIP px from
-# what it draws) is scaled down until it does not, by halves (FEATURE_CUT px).
+# eyes, and below them on a nod down unless the chin is more than CHIN_MOVED of
+# the eyes' span from where the key has it (raised with the mouth where the
+# picture keeps the jaw, h01's jaw bared the back hair behind it); raised, the
+# jaw is the picture's wherever its line shows (by the chin's column alone,
+# missed under a shadow, h09's pointed chin stayed pointed where the picture
+# has it broad). Then the jaw goes where the picture has it: along the face's
+# outline below the mouth, every JAW_STEP of the span from the chin's point
+# where the front picture shows that outline as skin's edge (JAW_SKIN, within
+# CHIN_TRUST), the point the features carried it to moves along the ray from
+# between the eyes to the turned picture's edge within JAW_REACH of the span
+# (along the outline's normals the rays fanned out at the chin's point, its
+# neighbours landed 30 px apart and the lattice between them rounded it). The
+# edge is where the picture starts to darken (JAW_EDGE: a lit rim inside b07's
+# line is lighter, and its jaw was pulled in to it) nearest the point (a lock
+# across h13's cheek further in pulled its jaw in), halfway up the step that
+# follows within JAW_RISE px (h00's faint shade 5 px above its line was a
+# bump). A point that moves JAW_ODD of the span apart from its neighbours found
+# another line; one not found, with found ones on both sides within JAW_GAP
+# steps, goes on the line between them (h14's decomposition has a notch its
+# picture does not). Each move is the median of its own and JAW_MED neighbours'
+# each way, then smoothed along the line (JAW_SOFT of the span): each edge
+# found is a few px off its own way, and pinned as found they were bumps;
+# smoothed as places, every point the line turns at came out round. The line
+# takes the chin over and is pinned JAW_PULL times harder than the features'
+# centres (the bending kept the point down). The band JAW_BAND px inside it
+# moves with it, so the line stays as thin as drawn (seen from below the lower
+# face stretches 1.45x, at its edge 2.5x, and the chin's 2 px line had become a
+# 6 px fringe). The oc-witch pointed chin is then a wide flat jaw from ear to
+# ear, rounder than the lattice's 26 px cells draw: the key is refitted on
+# FEATURE_FINE nodes (the same map, then as stiff as before; the runtime takes
+# up to 64). A turn is left as fitted: the decomposition has its silhouette,
+# and a field moving its inside folded the cheek. A field that would cut into
+# the face (face lost with face still past it: below, or on both sides, more
+# than FEATURE_DIP px from what it draws) is scaled down until it does not, by
+# halves (FEATURE_CUT px); past the jaw's line where the picture has it is not
+# face (the oc-witch chin rises in the middle, with face on both sides of it).
 FEATURE_MIN_PIXELS = 30
 FEATURE_TAPER = 40
 FEATURE_HOLD = 3.0
@@ -1075,12 +1087,15 @@ JAW_TANGENT = 6
 JAW_WIDTH = 2
 JAW_INSIDE = 6
 JAW_EDGE = 0.06
+JAW_RISE = 16
 JAW_SKIN = 0.12
 JAW_REACH = 0.25
-JAW_STEP = 0.07
+JAW_STEP = 0.035
+JAW_GAP = 3
 JAW_ODD = 0.1
+JAW_MED = 1
+JAW_SOFT = 0.015
 JAW_BAND = 8
-JAW_SOFT = 0.05
 JAW_PULL = 3.0
 
 
@@ -1154,7 +1169,7 @@ def jaw_anchors(front, found, pictures, span, key):
     """
     The jaw's outline where the turned picture has it: (front point, turned
     point) along the face's outline below the mouth, each point carried by
-    `key` and moved along the outline's normal to the picture's edge there.
+    `key` and moved, on the ray from between the eyes, to the picture's edge.
     """
     (px, py), (qx, qy) = found['mouth']
     face = (front.layers['face'][..., 3] > 0.5).astype(np.uint8)
@@ -1173,53 +1188,81 @@ def jaw_anchors(front, found, pictures, span, key):
         return picture[iy, ix]
 
     def edge(picture, point, n, inside, reach):
-        """How far along n, from `inside` px in, the picture first leaves the colour it has there; None if it does not."""
+        """How far along n the picture darkens from the colour it has `inside` px in, nearest the point; None if it does not."""
         steps = np.arange(-inside, reach + 1)
         across = np.arange(-JAW_WIDTH, JAW_WIDTH + 1)
         side = np.array([-n[1], n[0]])
         points = point + steps[:, None, None] * n + across[None, :, None] * side
         profile = colour(picture, points).mean(1)
         start = profile[:JAW_INSIDE].mean(0)
-        off = np.nonzero(np.abs(profile - start).max(1) > JAW_EDGE)[0]
+        # Darker: a lit rim inside the line is lighter.
+        dark = -(profile - start).mean(1)
+        off = np.nonzero(dark > JAW_EDGE)[0]
         off = off[off >= JAW_INSIDE]
-        return (start, float(steps[off[0]])) if len(off) else (start, None)
+        if not len(off):
+            return start, None
+        # Where it starts to darken nearest the point: a lock across the cheek further in is not the edge.
+        rising = off[(off == JAW_INSIDE) | (dark[off - 1] <= JAW_EDGE)]
+        first = rising[np.argmin(np.abs(steps[rising]))]
+        # Halfway up the step it starts: a faint shade before the line is not the line.
+        ahead = dark[first:first + JAW_RISE + 1]
+        return start, float(steps[first + np.nonzero(ahead >= ahead.max() / 2)[0][0]])
 
     skin = [colour(pictures[0], np.array([px, py + 12])), colour(pictures[1], np.array([qx, qy + 12]))]
+    centre = [np.mean([found[e][k] for e in FEATURE_EYES], 0) for k in (0, 1)]
     reach = JAW_REACH * span
     out = {}
     below = np.nonzero(line[:, 1] > py)[0]
     # Out from the chin's point both ways: the point itself is one of them.
     tip = below[np.argmax(line[below, 1])]
     step = max(1, int(round(JAW_STEP * span)))
-    for i in below[(below - tip) % step == 0]:
+    sampled = below[(below - tip) % step == 0]
+    for i in sampled:
+        # On rays from between the eyes: along the outline's normals they fanned out at the chin's
+        # point, its neighbours landed 30 px apart, and the lattice between them rounded it.
         p = line[i]
-        n = normal[i]
+        n = (p - centre[0]) / np.hypot(*(p - centre[0]))
         start, seen = edge(pictures[0], p, n, JAW_INSIDE + CHIN_TRUST, 2 * CHIN_TRUST)
         # Seen as the face's edge in the front picture: skin inside, and the edge at the outline.
         if seen is None or abs(seen) > CHIN_TRUST or np.abs(start - skin[0]).max() > JAW_SKIN:
             continue
         tx, ty = turned_position(key, np.float32([p[0]]), np.float32([p[1]]))
         q = np.array([tx[0], ty[0]], np.float64)
+        n = (q - centre[1]) / np.hypot(*(q - centre[1]))
         start, there = edge(pictures[1], q, n, reach, reach)
         if there is None or np.abs(start - skin[1]).max() > JAW_SKIN:
             continue
-        out[f'jaw:{i}'] = ((float(p[0]), float(p[1])), (float(q[0] + (there - seen) * n[0]), float(q[1] + (there - seen) * n[1])))
+        out[i] = (p, q, n, there - seen)
     # A jaw's line moves smoothly along it: a point off from its neighbours found another line.
-    names = list(out)
-    moved = np.array([np.subtract(out[k][1], out[k][0]) for k in names]).reshape(-1, 2)
-    kept = [k for j, k in enumerate(names)
-            if len(moved[max(0, j - 2):j + 3]) >= 3
-            and np.hypot(*(moved[j] - np.median(moved[max(0, j - 2):j + 3], 0))) <= JAW_ODD * span]
-    # And the edges found are a few px off each their own way: the line is their smoothed run.
-    # (Smoothed as moves, the chin's, much the largest, came out short: its point stayed down.)
-    at = np.array([int(k.split(':')[1]) for k in kept], np.float64)
-    found_at = np.array([out[k][1] for k in kept]).reshape(-1, 2)
+    at = list(out)
+    moved = np.array([out[i][1] + out[i][3] * out[i][2] - out[i][0] for i in at]).reshape(-1, 2)
+    at = np.array([i for j, i in enumerate(at)
+                   if len(others := np.r_[moved[max(0, j - 3):j], moved[j + 1:j + 4]]) >= 3
+                   and np.hypot(*(moved[j] - np.median(others, 0))) <= JAW_ODD * span])
     keep = {}
-    for k, i in zip(kept, at.astype(int)):
+    if not len(at):
+        return keep
+    # And the edges found are a few px off each their own way: the line is their run, an odd one
+    # out by the median of its neighbours and the rest smoothed (JAW_SOFT). Smoothed as places,
+    # every point the line turns at was rounded; as moves along the rays, the chin's point,
+    # which moves the most, keeps its share.
+    d = np.array([out[i][3] for i in at])
+    d = np.array([np.median(d[max(0, j - JAW_MED):j + JAW_MED + 1]) for j in range(len(d))])
+    to = {}
+    for i in at:
         near = np.exp(-0.5 * ((at - i) / (JAW_SOFT * span)) ** 2)
-        tx, ty = (near[:, None] * found_at).sum(0) / near.sum()
-        (fx, fy), n = out[k][0], normal[i]
-        keep[k] = ((fx, fy), (float(tx), float(ty)))
+        _, q, n, _ = out[i]
+        to[i] = q + (near * d).sum() / near.sum() * n
+    for i in sampled:
+        if i not in to:
+            # Not found (a notch the picture does not have, a lock over it): on the line between its neighbours.
+            a, b = at[at < i], at[at > i]
+            if not len(a) or not len(b) or i - a.max() > JAW_GAP * step or b.min() - i > JAW_GAP * step:
+                continue
+            a, b = a.max(), b.min()
+            to[i] = to[a] + (i - a) / (b - a) * (to[b] - to[a])
+        (fx, fy), (tx, ty), n = line[i], to[i], normal[i]
+        keep[f'jaw:{i}'] = ((float(fx), float(fy)), (float(tx), float(ty)))
         # Its line as thin as it was drawn: the band inside the outline moves with it, unstretched.
         keep[f'band:{i}'] = ((fx - JAW_BAND * n[0], fy - JAW_BAND * n[1]), (float(tx - JAW_BAND * n[0]), float(ty - JAW_BAND * n[1])))
     return keep
@@ -1247,6 +1290,12 @@ def hold_face_to_features(front, t, keys, side, log, pictures=None):
         (px, py), (qx, qy) = found['chin']
         bx, by = sample(np.asarray(key['back'], np.float32).reshape(-1, 2), xs, ys, np.float32([qx]), np.float32([qy]))
         jaw = np.hypot(px - qx - bx[0], py - qy - by[0]) > CHIN_MOVED * span
+    first = {}
+    if side == 'up' and pictures is not None and 'mouth' in found:
+        # Raised, the jaw's line is the picture's wherever it shows: by the chin's column alone
+        # (missed under a shadow or a lock) a pointed chin stayed pointed where the picture has it broad.
+        first = jaw_anchors(front, found, pictures, span, key)
+        jaw = jaw or bool(first)
     fitted = key
     if jaw:
         # A raised chin's shape is finer than the lattice's cells: the same map on a finer one.
@@ -1308,7 +1357,8 @@ def hold_face_to_features(front, t, keys, side, log, pictures=None):
     back = carry(back, P, Q)
     if jaw:
         # The jaw's line where the picture has it, found from where the features carried it.
-        outline = jaw_anchors(front, found, pictures, span, dict(key, back=[float(v) for v in back.ravel()]))
+        # (Carried past the picture's edge by more than the reach, as found from where the key had it.)
+        outline = jaw_anchors(front, found, pictures, span, dict(key, back=[float(v) for v in back.ravel()])) or first
         if outline:
             # The line has the chin: one point of it found apart would be a step in it.
             rest = [j for j, n in enumerate(names) if n != 'chin']
@@ -1326,9 +1376,15 @@ def hold_face_to_features(front, t, keys, side, log, pictures=None):
         left, right = np.maximum.accumulate(a, 1), np.flip(np.maximum.accumulate(np.flip(a, 1), 1), 1)
         # An outline moved a few px is not a cut.
         near = cv2.dilate(a.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * FEATURE_DIP + 1,) * 2)) > 0
-        return int((was & ~a & ~near & (below | (left & right))).sum())
+        return int((was & ~a & ~near & ~past & (below | (left & right))).sum())
 
     was = drawn(old)
+    # Past the jaw's line where the picture has it is not face: a chin that rises there cuts nothing.
+    past = np.zeros((t.H, t.W), np.uint8)
+    jawline = [q for n, q in zip(names, Q) if n.startswith('jaw:')]
+    if jawline:
+        cv2.fillPoly(past, [np.round(np.r_[jawline, [[jawline[-1][0], t.H], [jawline[0][0], t.H]]]).astype(np.int32)], 1)
+    past = past > 0
     share = 1.0
     while share > 0.1:
         trial = old + share * (back - old)

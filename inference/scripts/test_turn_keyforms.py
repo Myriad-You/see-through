@@ -189,6 +189,21 @@ def test_a_raised_face_takes_the_jaws_line_from_the_picture():
         assert abs(bottom - 230) <= 6, f'the jaw at x {x} is where the picture has it: {bottom}'
 
 
+def test_a_raised_face_takes_the_jaws_line_where_its_chin_shows_none():
+    # The turned picture's line is lit away under the mouth: no chin there, the rest of the line still says where the jaw is.
+    front, turned = face_with_features(), face_with_features(dy=-30)
+    seen, there = face_picture(260), face_picture(260)
+    pointed(front.layers['face'], seen, 260, 30)
+    pointed(None, there, 230, 0)
+    there[230:233, 138:163] = 1.0
+    keys = face_keys('up', 0, -30)
+    turn_keyforms.hold_face_to_features(front, turned, keys, 'up', quiet, (seen, there))
+    drawn = turn_keyforms.remap(front.layers['face'], *turn_keyforms.lattice_maps(keys['face']['up'], FW, FH))[..., 3] > 0.5
+    for x in (100, 115, 185, 200):
+        bottom = np.nonzero(drawn[:, x])[0].max()
+        assert abs(bottom - 230) <= 6, f'the jaw at x {x} is where the picture has it: {bottom}'
+
+
 def test_a_turned_face_is_left_as_fitted():
     # A turn's silhouette is the decomposition's; the face key stays as fitted.
     front, turned = face_with_features(), face_with_features(dx=20)
