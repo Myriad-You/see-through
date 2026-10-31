@@ -94,6 +94,110 @@ def test_a_necklace_put_under_the_shirt_is_still_as_the_picture_has_it():
     assert neckwear[53, 60, 3] == 1 and np.allclose(neckwear[53, 60, :3], GOLD)
 
 
+# A face (x 60..240, y 40..260) on a larger canvas, its features where they are at rest.
+FW, FH = 300, 300
+FEATURES = {
+    'eyewhite-r': (100, 120, 130, 130),
+    'eyewhite-l': (170, 120, 200, 130),
+    'nose': (145, 160, 155, 170),
+    'mouth': (135, 200, 165, 206),
+}
+
+
+def face_with_features(dx=0, dy=0):
+    out = Made([])
+    out.W, out.H = FW, FH
+
+    def put(name, box, rgb):
+        x0, y0, x1, y1 = box
+        canvas = np.zeros((FH, FW, 4), np.float32)
+        canvas[y0:y1, x0:x1] = rgb + (1.0,)
+        out.order.append(name)
+        out.layers[name] = canvas
+
+    put('face', (60, 40, 240, 260), SKIN)
+    for name, (x0, y0, x1, y1) in FEATURES.items():
+        put(name, (x0 + dx, y0 + dy, x1 + dx, y1 + dy), EYE)
+    return out
+
+
+def shifted(dx, dy, box=(40, 20, 260, 280), grid=13):
+    """A lattice moving all it covers by (dx, dy)."""
+    return dict(box=[float(v) for v in box], grid=grid, back=[float(v) for _ in range(grid * grid) for v in (-dx, -dy)])
+
+
+def face_keys(side, dx, dy):
+    # The eyes keyed where the turned drawing has them; the face, fitted on its outline alone, not moved.
+    return {'face': {side: shifted(0, 0)}, 'eye:L': {side: shifted(dx, dy)}, 'eye:R': {side: shifted(dx, dy)}}
+
+
+def face_picture(chin):
+    """Skin over white with the jaw's line at row `chin`."""
+    picture = np.ones((FH, FW, 3), np.float32)
+    paint(picture, (60, 40, 240, chin), SKIN)
+    paint(picture, (60, chin, 240, chin + 3), EYE)
+    return picture
+
+
+def test_a_raised_face_carries_its_features_and_chin_up():
+    front, turned = face_with_features(), face_with_features(dy=-30)
+    keys = face_keys('up', 0, -30)
+    turn_keyforms.hold_face_to_features(front, turned, keys, 'up', quiet, (face_picture(260), face_picture(230)))
+    key = keys['face']['up']
+    mx, my = turn_keyforms.turned_position(key, np.float32([150]), np.float32([203]))
+    assert abs(mx[0] - 150) < 3 and abs(my[0] - 173) < 6, (mx, my)
+    drawn = turn_keyforms.remap(front.layers['face'], *turn_keyforms.lattice_maps(key, FW, FH))[..., 3]
+    bottom = np.nonzero(drawn[:, 150] > 0.5)[0].max()
+    assert bottom < 245, f'the chin goes up with the mouth: {bottom}'
+    top = np.nonzero(drawn[:, 150] > 0.5)[0].min()
+    assert abs(top - 40) <= 2, f'the crown holds: {top}'
+
+
+def test_a_raised_face_whose_chin_stays_keeps_its_jaw():
+    # The picture has the jaw where it was: rising with the mouth, it would bare what is behind it.
+    front, turned = face_with_features(), face_with_features(dy=-30)
+    keys = face_keys('up', 0, -30)
+    turn_keyforms.hold_face_to_features(front, turned, keys, 'up', quiet, (face_picture(260), face_picture(260)))
+    key = keys['face']['up']
+    _, my = turn_keyforms.turned_position(key, np.float32([150]), np.float32([203]))
+    assert my[0] < 190, my
+    drawn = turn_keyforms.remap(front.layers['face'], *turn_keyforms.lattice_maps(key, FW, FH))[..., 3]
+    assert np.nonzero(drawn[:, 150] > 0.5)[0].max() >= 257
+
+
+def pointed(face, picture, chin, side):
+    """The face (and the picture's jaw line) cut to a chin at row `chin`, rising by `side` toward x 60 and 240."""
+    for x in range(60, 240):
+        y = int(round(chin - side * abs(x - 150) / 90))
+        if face is not None:
+            face[y:, x] = 0
+        picture[y:, x] = 1.0
+        picture[y:y + 3, x] = EYE
+
+
+def test_a_raised_face_takes_the_jaws_line_from_the_picture():
+    # A pointed chin seen from below: the jaw's line flattens, the sides rising less than the chin.
+    front, turned = face_with_features(), face_with_features(dy=-30)
+    seen, there = face_picture(260), face_picture(260)
+    pointed(front.layers['face'], seen, 260, 30)
+    pointed(None, there, 230, 0)
+    keys = face_keys('up', 0, -30)
+    turn_keyforms.hold_face_to_features(front, turned, keys, 'up', quiet, (seen, there))
+    drawn = turn_keyforms.remap(front.layers['face'], *turn_keyforms.lattice_maps(keys['face']['up'], FW, FH))[..., 3] > 0.5
+    for x in (115, 150, 185):
+        bottom = np.nonzero(drawn[:, x])[0].max()
+        assert abs(bottom - 230) <= 6, f'the jaw at x {x} is where the picture has it: {bottom}'
+
+
+def test_a_turned_face_is_left_as_fitted():
+    # A turn's silhouette is the decomposition's; the face key stays as fitted.
+    front, turned = face_with_features(), face_with_features(dx=20)
+    keys = face_keys('plus', 20, 0)
+    fitted = list(keys['face']['plus']['back'])
+    assert turn_keyforms.hold_face_to_features(front, turned, keys, 'plus', quiet) is None
+    assert keys['face']['plus']['back'] == fitted
+
+
 if __name__ == '__main__':
     for name, test in list(globals().items()):
         if name.startswith('test_'):

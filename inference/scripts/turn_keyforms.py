@@ -1012,6 +1012,340 @@ def place_mouth(front, turned, keys, log):
         log(f'mouth placed {placed}')
 
 
+# The face is skin: fitted on its outline, the inside of its key follows only
+# the lattice's smoothness. Raised, a face foreshortens: the oc-witch eyes,
+# nose and mouth rose 55-80 px in the turned drawing where the face key moved
+# them 0-16 px (the nose came to 12 px under the eyes from 37). The nose and
+# mouth, too small to key, turn with the face and stayed down; the eyes, keyed,
+# rose off the face, and the face's own drawing under them (lash shadows) was
+# left on the cheeks. So on a nod the features say where the inside goes: the
+# eyes by their keys, the nose, mouth and brows where the turned decomposition
+# has them (FEATURE_MIN_PIXELS; the mouth by its ends too, MOUTH_END, and with
+# the MOUTH_BAND px above and below it unstretched: by its centre alone the
+# stretch below bent its line), and the chin where the turned picture has it:
+# the first line under the mouth (CHIN_DROP darker than the skin above it),
+# believed where the front picture has it within CHIN_TRUST of the face's
+# bottom and where it folds the jaw by no more than CHIN_FOLD of its length
+# (past that the line is a shadow or a collar: h02 and h12 found one 130 px
+# off). The lattice is fitted to them in one least- squares solve, held where
+# the outline is (FEATURE_HOLD, on nodes within a cell and FEATURE_TAPER px of
+# it) and kept from bending (FEATURE_BEND, second differences: a fitted
+# polynomial bent 190 px past the brows and folded the nose onto the forehead;
+# a spline through the anchors folded the cheek). The outline holds above the
+# eyes, and below them unless the chin is more than CHIN_MOVED of the eyes'
+# span from where the key has it (raised with the mouth where the picture keeps
+# the jaw, h01's jaw bared the back hair behind it). Then the jaw goes where
+# the picture has it: along the face's outline below the mouth, every JAW_STEP
+# of the span where the front picture shows that outline as skin's edge
+# (JAW_SKIN, within CHIN_TRUST), the point the features carried it to moves
+# along the outline's normal to the turned picture's first edge (JAW_EDGE)
+# within JAW_REACH of the span, unless it moves JAW_ODD of the span apart from
+# its neighbours. The points step out from the chin's point, and where they
+# land is smoothed along the line (JAW_SOFT of the span: each edge found is a
+# few px off its own way, and pinned as found they were bumps; smoothed as
+# moves, the chin's, much the largest, came out short and its point stayed down
+# where the picture has it up). The line takes the chin over and is pinned
+# JAW_PULL times harder than the features' centres (the bending kept the point
+# down). The band JAW_BAND px inside it moves with it, so the line stays as
+# thin as drawn (seen from below the lower face stretches 1.45x, at its edge
+# 2.5x, and the chin's 2 px line had become a 6 px fringe). The oc-witch
+# pointed chin is then a wide flat jaw from ear to ear, rounder than the
+# lattice's 26 px cells draw: the key is refitted on FEATURE_FINE nodes (the
+# same map, then as stiff as before; the runtime takes up to 64). A turn is
+# left as fitted: the decomposition has its silhouette, and a field moving its
+# inside folded the cheek. A field that would cut into the face (face lost with
+# face still past it: below, or on both sides, more than FEATURE_DIP px from
+# what it draws) is scaled down until it does not, by halves (FEATURE_CUT px).
+FEATURE_MIN_PIXELS = 30
+FEATURE_TAPER = 40
+FEATURE_HOLD = 3.0
+FEATURE_BEND = 0.3
+FEATURE_CUT = 20
+FEATURE_DIP = 4
+FEATURE_FINE = 64
+FEATURE_EYES = {'eye:L': ['eyewhite-r', 'irides-r', 'eyelash-r'], 'eye:R': ['eyewhite-l', 'irides-l', 'eyelash-l']}
+FEATURE_SEEN = {'nose': ['nose'], 'mouth': ['mouth'], 'brow:L': ['eyebrow-r'], 'brow:R': ['eyebrow-l']}
+MOUTH_END = 3
+MOUTH_BAND = 6
+CHIN_DROP = 0.05
+CHIN_TRUST = 8
+CHIN_FOLD = 0.5
+CHIN_MOVED = 0.1
+JAW_TANGENT = 6
+JAW_WIDTH = 2
+JAW_INSIDE = 6
+JAW_EDGE = 0.06
+JAW_SKIN = 0.12
+JAW_REACH = 0.25
+JAW_STEP = 0.07
+JAW_ODD = 0.1
+JAW_BAND = 8
+JAW_SOFT = 0.05
+JAW_PULL = 3.0
+
+
+def feature_centre(dec, names):
+    """The centre of the given layers' pixels, None under FEATURE_MIN_PIXELS."""
+    drawn = np.zeros((dec.H, dec.W), bool)
+    for name in names:
+        if name in dec.layers:
+            drawn |= dec.layers[name][..., 3] > 0.5
+    if drawn.sum() < FEATURE_MIN_PIXELS:
+        return None
+    ys, xs = np.nonzero(drawn)
+    return float(xs.mean()), float(ys.mean())
+
+
+def mouth_ends(dec):
+    """The mouth's left and right ends, None under FEATURE_MIN_PIXELS."""
+    if 'mouth' not in dec.layers:
+        return None
+    ys, xs = np.nonzero(dec.layers['mouth'][..., 3] > 0.5)
+    if len(xs) < FEATURE_MIN_PIXELS:
+        return None
+    left, right = xs <= xs.min() + MOUTH_END, xs >= xs.max() - MOUTH_END
+    return (float(xs[left].mean()), float(ys[left].mean())), (float(xs[right].mean()), float(ys[right].mean()))
+
+
+def chin_row(picture, x, y, reach):
+    """The first row under (x, y) where the picture darkens from the skin there, None when it does not."""
+    x, y = int(round(x)), int(round(y))
+    band = picture[y + 8:y + int(reach), max(0, x - 12):x + 13].mean(-1).mean(1)
+    if len(band) < 16:
+        return None
+    below = np.nonzero(band < np.median(band[:8]) - CHIN_DROP)[0]
+    return y + 8 + int(below[0]) if len(below) else None
+
+
+def feature_anchors(front, t, keys, side, pictures):
+    """Each feature's (front point, turned point)."""
+    found = {}
+    for family, names in FEATURE_EYES.items():
+        p, key = feature_centre(front, names), keys.get(family, {}).get(side)
+        if p is not None and key is not None:
+            qx, qy = turned_position(key, np.float32([p[0]]), np.float32([p[1]]))
+            found[family] = (p, (float(qx[0]), float(qy[0])))
+    for family, names in FEATURE_SEEN.items():
+        p, q = feature_centre(front, names), feature_centre(t, names)
+        if p is not None and q is not None:
+            found[family] = (p, q)
+    # The mouth's corners too: its line bends with the face below it.
+    ends = [mouth_ends(d) for d in (front, t)]
+    if 'mouth' in found and None not in ends:
+        found['mouth:l'], found['mouth:r'] = (ends[0][0], ends[1][0]), (ends[0][1], ends[1][1])
+        # And as thin as drawn: the face around it stretches, the mouth's line does not.
+        (px, py), (qx, qy) = found['mouth']
+        found['mouth:a'], found['mouth:b'] = ((px, py - MOUTH_BAND), (qx, qy - MOUTH_BAND)), ((px, py + MOUTH_BAND), (qx, qy + MOUTH_BAND))
+    if pictures and 'mouth' in found:
+        (px, py), (qx, qy) = found['mouth']
+        column = np.nonzero(front.layers['face'][:, int(round(px)), 3] > 0.5)[0]
+        if len(column) and column.max() > py:
+            bottom = int(column.max())
+            reach = 2.5 * (bottom - py)
+            seen = chin_row(pictures[0], px, py, reach)
+            there = chin_row(pictures[1], qx, qy, reach) if seen is not None and abs(seen - bottom) <= CHIN_TRUST else None
+            # A jaw folds no more than half its length: past that the line found is another (a shadow, a collar).
+            if there is not None and abs((there - seen) - (qy - py)) <= CHIN_FOLD * (bottom - py):
+                found['chin'] = ((px, float(bottom)), (qx, float(there + bottom - seen)))
+    return found
+
+
+def jaw_anchors(front, found, pictures, span, key):
+    """
+    The jaw's outline where the turned picture has it: (front point, turned
+    point) along the face's outline below the mouth, each point carried by
+    `key` and moved along the outline's normal to the picture's edge there.
+    """
+    (px, py), (qx, qy) = found['mouth']
+    face = (front.layers['face'][..., 3] > 0.5).astype(np.uint8)
+    contours, _ = cv2.findContours(face, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    line = max(contours, key=len)[:, 0].astype(np.float64)
+    ahead, behind = np.roll(line, -JAW_TANGENT, 0), np.roll(line, JAW_TANGENT, 0)
+    normal = np.stack([(ahead - behind)[:, 1], -(ahead - behind)[:, 0]], 1)
+    normal /= np.maximum(np.hypot(*normal.T), 1e-9)[:, None]
+    # Outward: off the face.
+    probe = np.clip(np.round(line + 4 * normal).astype(int), 0, [front.W - 1, front.H - 1])
+    normal[face[probe[:, 1], probe[:, 0]] > 0] *= -1
+
+    def colour(picture, points):
+        ix = np.clip(np.round(points[..., 0]).astype(int), 0, picture.shape[1] - 1)
+        iy = np.clip(np.round(points[..., 1]).astype(int), 0, picture.shape[0] - 1)
+        return picture[iy, ix]
+
+    def edge(picture, point, n, inside, reach):
+        """How far along n, from `inside` px in, the picture first leaves the colour it has there; None if it does not."""
+        steps = np.arange(-inside, reach + 1)
+        across = np.arange(-JAW_WIDTH, JAW_WIDTH + 1)
+        side = np.array([-n[1], n[0]])
+        points = point + steps[:, None, None] * n + across[None, :, None] * side
+        profile = colour(picture, points).mean(1)
+        start = profile[:JAW_INSIDE].mean(0)
+        off = np.nonzero(np.abs(profile - start).max(1) > JAW_EDGE)[0]
+        off = off[off >= JAW_INSIDE]
+        return (start, float(steps[off[0]])) if len(off) else (start, None)
+
+    skin = [colour(pictures[0], np.array([px, py + 12])), colour(pictures[1], np.array([qx, qy + 12]))]
+    reach = JAW_REACH * span
+    out = {}
+    below = np.nonzero(line[:, 1] > py)[0]
+    # Out from the chin's point both ways: the point itself is one of them.
+    tip = below[np.argmax(line[below, 1])]
+    step = max(1, int(round(JAW_STEP * span)))
+    for i in below[(below - tip) % step == 0]:
+        p = line[i]
+        n = normal[i]
+        start, seen = edge(pictures[0], p, n, JAW_INSIDE + CHIN_TRUST, 2 * CHIN_TRUST)
+        # Seen as the face's edge in the front picture: skin inside, and the edge at the outline.
+        if seen is None or abs(seen) > CHIN_TRUST or np.abs(start - skin[0]).max() > JAW_SKIN:
+            continue
+        tx, ty = turned_position(key, np.float32([p[0]]), np.float32([p[1]]))
+        q = np.array([tx[0], ty[0]], np.float64)
+        start, there = edge(pictures[1], q, n, reach, reach)
+        if there is None or np.abs(start - skin[1]).max() > JAW_SKIN:
+            continue
+        out[f'jaw:{i}'] = ((float(p[0]), float(p[1])), (float(q[0] + (there - seen) * n[0]), float(q[1] + (there - seen) * n[1])))
+    # A jaw's line moves smoothly along it: a point off from its neighbours found another line.
+    names = list(out)
+    moved = np.array([np.subtract(out[k][1], out[k][0]) for k in names]).reshape(-1, 2)
+    kept = [k for j, k in enumerate(names)
+            if len(moved[max(0, j - 2):j + 3]) >= 3
+            and np.hypot(*(moved[j] - np.median(moved[max(0, j - 2):j + 3], 0))) <= JAW_ODD * span]
+    # And the edges found are a few px off each their own way: the line is their smoothed run.
+    # (Smoothed as moves, the chin's, much the largest, came out short: its point stayed down.)
+    at = np.array([int(k.split(':')[1]) for k in kept], np.float64)
+    found_at = np.array([out[k][1] for k in kept]).reshape(-1, 2)
+    keep = {}
+    for k, i in zip(kept, at.astype(int)):
+        near = np.exp(-0.5 * ((at - i) / (JAW_SOFT * span)) ** 2)
+        tx, ty = (near[:, None] * found_at).sum(0) / near.sum()
+        (fx, fy), n = out[k][0], normal[i]
+        keep[k] = ((fx, fy), (float(tx), float(ty)))
+        # Its line as thin as it was drawn: the band inside the outline moves with it, unstretched.
+        keep[f'band:{i}'] = ((fx - JAW_BAND * n[0], fy - JAW_BAND * n[1]), (float(tx - JAW_BAND * n[0]), float(ty - JAW_BAND * n[1])))
+    return keep
+
+
+def hold_face_to_features(front, t, keys, side, log, pictures=None):
+    """On a nod, moves the face key's inside to where the turned drawing has the features; pictures: (front, turned) RGB."""
+    key = keys.get('face', {}).get(side)
+    if side not in ('up', 'down') or key is None or 'face' not in t.layers or 'face' not in front.layers:
+        return None
+    found = feature_anchors(front, t, keys, side, pictures)
+    eyes = [found[f] for f in FEATURE_EYES if f in found]
+    if len(eyes) < 2 or len(found) < 3:
+        return None
+    span = np.hypot(eyes[0][0][0] - eyes[1][0][0], eyes[0][0][1] - eyes[1][0][1])
+    low = min(q[1] for _, q in eyes)
+    face_t = (t.layers['face'][..., 3] > 0.5).astype(np.uint8)
+    edge = (face_t > 0) & (cv2.erode(face_t, np.ones((3, 3), np.uint8)) == 0)
+    rows = np.arange(t.H)[:, None]
+    x0, y0, x1, y1 = key['box']
+    g = key['grid']
+    xs, ys = np.linspace(x0, x1, g), np.linspace(y0, y1, g)
+    jaw = False
+    if 'chin' in found:
+        (px, py), (qx, qy) = found['chin']
+        bx, by = sample(np.asarray(key['back'], np.float32).reshape(-1, 2), xs, ys, np.float32([qx]), np.float32([qy]))
+        jaw = np.hypot(px - qx - bx[0], py - qy - by[0]) > CHIN_MOVED * span
+    fitted = key
+    if jaw:
+        # A raised chin's shape is finer than the lattice's cells: the same map on a finer one.
+        fine = int(FEATURE_FINE)
+        fx, fy = np.meshgrid(np.linspace(x0, x1, fine), np.linspace(y0, y1, fine))
+        bx, by = sample(np.asarray(key['back'], np.float32).reshape(-1, 2), xs, ys, fx.ravel().astype(np.float32), fy.ravel().astype(np.float32))
+        key = dict(key, grid=fine, back=[float(v) for v in np.stack([bx, by], 1).ravel()])
+        g = fine
+        xs, ys = np.linspace(x0, x1, g), np.linspace(y0, y1, g)
+    free = (rows >= low) & jaw
+    held = edge & ~free
+    inside = cv2.distanceTransform((~held).astype(np.uint8), cv2.DIST_L2, 5) * ((face_t > 0) | free)
+    gy, gx = np.meshgrid(ys, xs, indexing='ij')
+    nodes = np.stack([gx.ravel(), gy.ravel()], 1)
+    # A lattice node one cell from the held outline still draws it.
+    cell = max(x1 - x0, y1 - y0) / (g - 1)
+
+    def taper(points, margin=0.0):
+        ix = np.clip(np.round(points[:, 0]).astype(int), 0, t.W - 1)
+        iy = np.clip(np.round(points[:, 1]).astype(int), 0, t.H - 1)
+        return np.clip((inside[iy, ix] - margin) / FEATURE_TAPER, 0, 1)
+
+    names = list(found)
+    P = np.array([found[n][0] for n in names])
+    Q = np.array([found[n][1] for n in names])
+    back = np.asarray(key['back'], np.float64).reshape(-1, 2)
+    old = back.copy()
+
+    def missed(b, P, Q):
+        bx, by = sample(b.astype(np.float32), xs, ys, Q[:, 0].astype(np.float32), Q[:, 1].astype(np.float32))
+        return P - (Q + np.stack([bx, by], 1))
+
+    def bilinear(points):
+        """Each point's weights on the lattice's nodes."""
+        fx = np.clip((points[:, 0] - x0) / (x1 - x0) * (g - 1), 0, g - 1 - 1e-6)
+        fy = np.clip((points[:, 1] - y0) / (y1 - y0) * (g - 1), 0, g - 1 - 1e-6)
+        ix, iy = fx.astype(int), fy.astype(int)
+        ax, ay = fx - ix, fy - iy
+        S = np.zeros((len(points), g * g))
+        for dy, dx, w in ((0, 0, (1 - ax) * (1 - ay)), (0, 1, ax * (1 - ay)), (1, 0, (1 - ax) * ay), (1, 1, ax * ay)):
+            np.add.at(S, (np.arange(len(points)), (iy + dy) * g + ix + dx), w)
+        return S
+
+    # Second differences across the lattice, down and across: what keeps it from bending, and so from folding.
+    second = np.diff(np.eye(g), 2, axis=0)
+    bend = np.kron(np.eye(g), second.T @ second) + np.kron(second.T @ second, np.eye(g))
+    wn = taper(nodes, cell)[:, None]
+
+    def carry(back, P, Q):
+        # One least-squares fit on the lattice: the anchors, held where the outline is, smooth throughout.
+        # The jaw's line is drawn where the picture has it: pinned harder than the features' centres.
+        w = taper(Q, cell) * np.where([n.split(':')[0] in ('jaw', 'band') for n in names], JAW_PULL, 1.0)
+        S = bilinear(Q) * w[:, None]
+        hold = np.diag((FEATURE_HOLD * (wn[:, 0] == 0)) ** 2)
+        # As stiff as on the lattice fitted: a finer one's second differences are smaller.
+        stiff = (FEATURE_BEND * (g - 1) / (fitted['grid'] - 1)) ** 2
+        return back + np.linalg.solve(S.T @ S + hold + stiff * bend, S.T @ (missed(back, P, Q) * w[:, None]))
+
+    back = carry(back, P, Q)
+    if jaw:
+        # The jaw's line where the picture has it, found from where the features carried it.
+        outline = jaw_anchors(front, found, pictures, span, dict(key, back=[float(v) for v in back.ravel()]))
+        if outline:
+            # The line has the chin: one point of it found apart would be a step in it.
+            rest = [j for j, n in enumerate(names) if n != 'chin']
+            names[:] = [names[j] for j in rest] + list(outline)
+            P = np.r_[P[rest], [p for p, _ in outline.values()]]
+            Q = np.r_[Q[rest], [q for _, q in outline.values()]]
+        back = carry(back, P, Q)
+    face = front.layers['face']
+
+    def drawn(b):
+        return remap(face, *lattice_maps(dict(key, back=b.ravel()), t.W, t.H))[..., 3] > 0.5
+
+    def cut(a):
+        below = np.flip(np.maximum.accumulate(np.flip(a, 0), 0), 0)
+        left, right = np.maximum.accumulate(a, 1), np.flip(np.maximum.accumulate(np.flip(a, 1), 1), 1)
+        # An outline moved a few px is not a cut.
+        near = cv2.dilate(a.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * FEATURE_DIP + 1,) * 2)) > 0
+        return int((was & ~a & ~near & (below | (left & right))).sum())
+
+    was = drawn(old)
+    share = 1.0
+    while share > 0.1:
+        trial = old + share * (back - old)
+        a = drawn(trial)
+        if cut(a) <= FEATURE_CUT:
+            break
+        share /= 2
+    if share <= 0.1:
+        log(f'{side:5s} face not held to the features: it would cut into the face')
+        return None
+    back = old + share * (back - old)
+    before, after = np.hypot(*missed(old, P, Q).T), np.hypot(*missed(back, P, Q).T)
+    fitted.update(grid=g, back=[float(v) for v in back.ravel()])
+    log(f'{side:5s} face held to the features x{share:g}: ' + ', '.join(f'{n} {b:.0f}->{a:.0f}' for n, b, a in zip(names, before, after)))
+    return dict(zip(names, (round(float(a), 1) for a in after)))
+
+
 # ---------------------------------------------------------------- the picture itself
 
 # The decompositions say which part is which; the turned picture says where it
@@ -2234,6 +2568,9 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
             for family, fit in fits.items():
                 keys.setdefault(family, {})[side] = fit
     seconds['directions'] = round(time.time() - started)
+    drawn = {side: placed_illustration(path, front.W, front.H) for side, path in pictures.items()} if pictures else {}
+    for side, t in turned.items():
+        hold_face_to_features(front, t, keys, side, log, (drawn['front'][0], drawn[side][0]) if side in drawn else None)
     # Big headwear is a part of its own: where its decomposition failed it, it starts from the head's move.
     if big_headwear(front) and 'face' in keys:
         ys, xs = np.nonzero(front.layers['headwear'][..., 3] > 0.3)
@@ -2279,10 +2616,8 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
     # Accessories ride rigidly: every piece of every hair clip and earring,
     # matched on the illustrations when given (they hold what the
     # decompositions re-render or drop).
-    drawn = {}
     recovered = []
     if pictures:
-        drawn = {side: placed_illustration(path, front.W, front.H) for side, path in pictures.items()}
         raise_buried_accessories(front, drawn['front'][0], log)
         restore_ornaments(front, drawn['front'][0], log)
     pieces = [(mask, name.startswith('earwear')) for mask, name in accessory_pieces(front) if name.split('-')[0] not in own]
