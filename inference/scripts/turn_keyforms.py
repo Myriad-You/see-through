@@ -812,6 +812,38 @@ def hidden_ornament(front, name, picture, near):
     return hidden, nearer
 
 
+# An ornament taken from the picture by a cut mask keeps, on its rim, the
+# picture's blend of it and what lies under it: a pale halo over the page or a
+# pale part, a dark one over dark hair, and a stair of hard steps as it moves.
+# On the rim (MATTE_RIM px either side of the cut) the picture is read as the
+# ornament's own colour as it shows just inside, over what lies under it there:
+# how much of each gives the rim's alpha, and the rim takes the ornament's
+# colour. Where the two colours are too alike to tell apart (closer than
+# MATTE_CONTRAST), the cut stays; so it does along another piece of the same
+# part (a hat's brim raised over the hair): two soft edges laid together let
+# what is under both show through the seam.
+MATTE_RIM = 1
+MATTE_CONTRAST = 0.08
+
+
+def matte_rim(art, picture, under, kin):
+    """
+    The rim of `art` with the alpha and colour the picture shows there over
+    `under`, away from `kin` (where another piece of the part is drawn): the
+    rim set, its colours and its alphas.
+    """
+    k = 2 * MATTE_RIM + 1
+    inner = cv2.erode(art.astype(np.uint8), np.ones((k, k), np.uint8)) > 0
+    rim = (cv2.dilate(art.astype(np.uint8), np.ones((k, k), np.uint8)) > 0) & ~inner
+    own, weight = colour_around(picture, inner.astype(np.float32), 2 * k + 1)
+    span = own - under
+    reach = (span * span).sum(-1)
+    alpha = np.clip(((picture - under) * span).sum(-1) / np.maximum(reach, 1e-6), 0, 1)
+    seam = cv2.dilate(kin.astype(np.uint8), np.ones((2 * k + 1, 2 * k + 1), np.uint8)) > 0
+    sure = rim & ~seam & (weight > 0.05) & (reach > MATTE_CONTRAST ** 2)
+    return sure, own[sure], alpha[sure]
+
+
 def restore_ornaments(front, picture, log):
     """Redraws each ornament layer as the picture shows it at rest."""
     report = {}
@@ -845,6 +877,10 @@ def restore_ornaments(front, picture, log):
         layer[art, :3] = picture[art]
         layer[art, 3] = 1.0
         layer[near & ~art, 3] = 0.0
+        kin = np.any([front.layers[n][..., 3] > 0.5 for n in front.order
+                      if n != name and n.split('-')[0] == name.split('-')[0]] + [np.zeros_like(art)], 0)
+        sure, rgb, alpha = matte_rim(art, picture, under, kin & ~art)
+        finishing(front).append((name, sure, rgb, alpha, layer[sure, 3].copy()))
         report[name] = round(float(ratio), 2)
     log(f'ornaments redrawn from the picture {report}')
     return report
@@ -1688,12 +1724,36 @@ def split_front_hair(front, keys, log):
     return len(ids)
 
 
+def finishing(front):
+    """
+    What the edges get once the keys are found (finish_edges): (layer, where,
+    colour, alpha, the alpha found there then). Until then every layer keeps
+    its cut edges, so the fits see what they always saw.
+    """
+    if not hasattr(front, 'edges'):
+        front.edges = []
+    return front.edges
+
+
 def finish_edges(front, log):
     """
-    Gives the layers their finished edges once the keys are found: locks
-    soften where they meet. Until then every layer keeps its cut edges, so
-    the fits see what they always saw.
+    Gives the layers their finished edges: an ornament's rim takes the
+    picture's blend, locks soften where they meet. What a later step changed
+    there since is left as it is.
     """
+    done = 0
+    for name, where, rgb, alpha, found in finishing(front):
+        if name not in front.layers:
+            continue
+        layer = front.layers[name]
+        ok = np.abs(layer[where, 3] - found) < 0.02
+        ys, xs = np.nonzero(where)
+        ys, xs = ys[ok], xs[ok]
+        layer[ys, xs, :3] = rgb[ok]
+        layer[ys, xs, 3] = alpha[ok]
+        done += len(ys)
+    front.edges = []
+    log(f'finished {done} px of edges')
     soften_lock_seams(front, log)
 
 
