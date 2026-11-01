@@ -1617,6 +1617,17 @@ def sub_lattice(key, box, grid=LOCK_GRID):
     return dict(box=[float(v) for v in box], grid=grid, back=[float(v) for p in zip(bx, by) for v in p])
 
 
+# Where two locks meet, the one over feathers its edge (a Gaussian of
+# LOCK_FEATHER px across the seam) and the one under runs on beneath it
+# (LOCK_UNDER px), both with the hair's own colour there. At rest the two
+# give the drawing back; as they part on a turn the seam is soft and has hair
+# behind it, where a cut mask left a stair of hard steps over what lies under.
+# The locks are fitted as cut and softened once the keys are found
+# (finish_edges), before the bake that fills what of them lies hidden.
+LOCK_FEATHER = 0.8
+LOCK_UNDER = 6
+
+
 def split_front_hair(front, keys, log):
     """
     The front hair as locks (hair_locks.py): one layer per lock in its place in
@@ -1653,10 +1664,21 @@ def split_front_hair(front, keys, log):
     # The whole front hair's key stays: a figure keyed by its head (figure_head)
     # keeps its own front hair whole.
     whole = keys['front-hair']
+    under_disc = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * LOCK_UNDER + 1, 2 * LOCK_UNDER + 1))
+    near = np.ones((5, 5), np.uint8)
+    front.lock_seams = {}
     for n, k in enumerate(ids, 1):
         name = f'front hair-{n}'
+        mine = full == k
+        over = np.isin(full, ids[n:])
+        under = np.isin(full, ids[:n - 1])
+        fade = np.ones(mine.shape, np.float32)
+        seam = (cv2.dilate(mine.astype(np.uint8), near) > 0) & (cv2.dilate(under.astype(np.uint8), near) > 0) & mine
+        fade[seam] = cv2.GaussianBlur(mine.astype(np.float32), (0, 0), LOCK_FEATHER)[seam]
+        beneath = (cv2.dilate(mine.astype(np.uint8), under_disc) > 0) & over
+        front.lock_seams[name] = (fade, L[..., 3] * beneath, [f'front hair-{m}' for m in range(n + 1, len(ids) + 1)])
         layer = L.copy()
-        layer[..., 3] *= full == k
+        layer[..., 3] *= mine
         front.layers[name] = layer
         front.order.insert(at + n - 1, name)
         ly, lx = np.nonzero(layer[..., 3] > 0.02)
@@ -1664,6 +1686,30 @@ def split_front_hair(front, keys, log):
         keys[lock_family(name)] = {side: sub_lattice(key, box) for side, key in whole.items()}
     log(f'front hair: {len(ids)} locks')
     return len(ids)
+
+
+def finish_edges(front, log):
+    """
+    Gives the layers their finished edges once the keys are found: locks
+    soften where they meet. Until then every layer keeps its cut edges, so
+    the fits see what they always saw.
+    """
+    soften_lock_seams(front, log)
+
+
+def soften_lock_seams(front, log):
+    """
+    Feathers each lock where it lies over another and runs it on beneath the
+    locks over it, where they are still drawn (not cut by the picture).
+    """
+    seams = getattr(front, 'lock_seams', {})
+    for name, (fade, beneath, over) in seams.items():
+        if name in front.layers:
+            cover = np.max([front.layers[n][..., 3] for n in over if n in front.layers] + [np.zeros_like(fade)], 0)
+            layer = front.layers[name]
+            layer[..., 3] = np.maximum(layer[..., 3] * fade, beneath * (cover > 0.5))
+    if seams:
+        log(f'softened the seams of {len(seams)} locks')
 
 
 LOCK_FEATURES = ('eyewhite', 'irides', 'eyelash', 'eyebrow', 'nose', 'mouth')
@@ -2763,6 +2809,8 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
         for side, picture in turned_pictures.items():
             cut_by_picture(turned[side], picture, lambda line, side=side: log(f'{side:5s} {line}'))
     cut_crown(front, complete, log)
+    if not drawn:
+        finish_edges(front, log)
     baked = bake(front, turned, complete, log, turned_pictures)
     seconds['baked'] = round(time.time() - started)
     # How the time went, to size the work to the machine it runs on.
@@ -2786,6 +2834,7 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
                     for family, key in moved.items():
                         complete[family][side] = key
                     result['picture'][side] = change
+        finish_edges(front, log)
         result['baked'] = bake(front, turned, complete, log, turned_pictures)
         key_multiply(front, turned, complete, drawn['front'][0], turned_pictures, log)
     # An iris riding its eye carries the eye's key as its own.
