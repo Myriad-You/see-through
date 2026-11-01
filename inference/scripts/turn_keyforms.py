@@ -711,6 +711,10 @@ UNDER_PIECE_RADIUS = 6
 BURIED_MATCH = 40
 
 
+RAISED_UNDER = 6
+RAISED_INSET = 4
+
+
 def raise_buried_accessories(front, picture, log):
     """Moves the parts of accessory layers the picture shows on top to a layer over the others."""
     owner = front.owner()
@@ -737,6 +741,19 @@ def raise_buried_accessories(front, picture, log):
         raised[part, 3] = np.where(layer[part, 3] > 0, np.maximum(layer[part, 3], 0.0), 1.0)
         inner = cv2.erode(part.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
         raised[inner, 3] = 1.0
+        # What stays runs on RAISED_UNDER px beneath the raised part from the
+        # seam between them, short of the raised part's other edges (by
+        # RAISED_INSET px, where what lies under it shows through its soft rim):
+        # where the two part on a nod, the seam shows the part, not what is
+        # behind it. It takes the raised part's colours there (the picture's),
+        # not the decomposition's guess.
+        # Given back when the edges are finished (finish_edges).
+        rest = (layer[..., 3] > 0.5) & ~part
+        disc = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * RAISED_UNDER + 1, 2 * RAISED_UNDER + 1))
+        inset = np.ones((2 * RAISED_INSET + 1, 2 * RAISED_INSET + 1), np.uint8)
+        other = ~part & ~rest
+        beneath = part & (cv2.dilate(rest.astype(np.uint8), disc) > 0) & ~(cv2.dilate(other.astype(np.uint8), inset) > 0)
+        finishing(front).append((name, beneath, raised[beneath, :3].copy(), np.ones(int(beneath.sum()), np.float32), None))
         layer[part, 3] = 0
         # Numbered, as Myriad reads a further drawing of the same part.
         number = 2
@@ -1727,8 +1744,8 @@ def split_front_hair(front, keys, log):
 def finishing(front):
     """
     What the edges get once the keys are found (finish_edges): (layer, where,
-    colour, alpha, the alpha found there then). Until then every layer keeps
-    its cut edges, so the fits see what they always saw.
+    colour, alpha, the alpha found there then or None). Until then every
+    layer keeps its cut edges, so the fits see what they always saw.
     """
     if not hasattr(front, 'edges'):
         front.edges = []
@@ -1737,16 +1754,20 @@ def finishing(front):
 
 def finish_edges(front, log):
     """
-    Gives the layers their finished edges: an ornament's rim takes the
-    picture's blend, locks soften where they meet. What a later step changed
-    there since is left as it is.
+    Gives the layers their finished edges: a raised piece's part runs on
+    beneath it, an ornament's rim takes the picture's blend, locks soften
+    where they meet. What a later step changed there since is left as it is.
     """
     done = 0
     for name, where, rgb, alpha, found in finishing(front):
         if name not in front.layers:
             continue
         layer = front.layers[name]
-        ok = np.abs(layer[where, 3] - found) < 0.02
+        if found is None:
+            # Beneath another piece: only where nothing was drawn since.
+            ok = layer[where, 3] < 0.02
+        else:
+            ok = np.abs(layer[where, 3] - found) < 0.02
         ys, xs = np.nonzero(where)
         ys, xs = ys[ok], xs[ok]
         layer[ys, xs, :3] = rgb[ok]
