@@ -2345,7 +2345,49 @@ def key_multiply(front, turned, keys, front_picture, pictures, log):
     return report
 
 
-def bake(front, turned, keys, log, pictures=None):
+# Combing hidden hair: each pixel is averaged over COMB_REACH px either side
+# along the strand, whose direction is read from the hair that shows within
+# about COMB_SIGMA px, or COMB_WIDE px where little shows near.
+COMB_REACH = 10
+COMB_SIGMA = 6
+COMB_WIDE = 30
+COMB_PASSES = 2
+
+
+def strand_direction(rgb, known):
+    """Per pixel, the unit vector along the strands of the hair `known` shows around it."""
+    lum = rgb @ np.array([0.299, 0.587, 0.114], np.float32)
+    gx = cv2.Sobel(lum, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(lum, cv2.CV_32F, 0, 1, ksize=3)
+    w = cv2.erode(known.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(np.float32)
+    tensors = []
+    for s in (COMB_SIGMA, COMB_WIDE):
+        n = np.maximum(cv2.GaussianBlur(w, (0, 0), s), 1e-4)
+        tensors.append([cv2.GaussianBlur(g * w, (0, 0), s) / n for g in (gx * gx, gy * gy, gx * gy)] + [n])
+    (xx, yy, xy, near), (XX, YY, XY, _) = tensors
+    t = np.clip(near / 0.3, 0, 1)
+    xx, yy, xy = xx * t + XX * (1 - t), yy * t + YY * (1 - t), xy * t + XY * (1 - t)
+    theta = 0.5 * np.arctan2(2 * xy, xx - yy) + np.pi / 2
+    return np.cos(theta), np.sin(theta)
+
+
+def comb_strands(layer, region):
+    """Averages `layer`'s colour along its strands inside `region`, blending in over 3 px from its edge."""
+    drawn = layer[..., 3] > 0.5
+    dx, dy = strand_direction(layer[..., :3], drawn & ~region)
+    ys, xs = np.mgrid[0:layer.shape[0], 0:layer.shape[1]].astype(np.float32)
+    src = np.concatenate([layer[..., :3] * drawn[..., None], drawn[..., None].astype(np.float32)], 2)
+    total = np.zeros_like(src)
+    for t in range(-COMB_REACH, COMB_REACH + 1):
+        g = np.exp(-0.5 * (2 * t / COMB_REACH) ** 2)
+        total += g * cv2.remap(src, xs + t * dx, ys + t * dy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+    combed = total[..., :3] / np.maximum(total[..., 3:], 1e-4)
+    edge = cv2.distanceTransform(region.astype(np.uint8), cv2.DIST_L2, 3)
+    blend = (np.clip(edge / 3, 0, 1) * region * (total[..., 3] > 1e-3))[..., None]
+    layer[..., :3] = layer[..., :3] * (1 - blend) + combed * blend
+
+
+def bake(front, turned, keys, log, pictures=None, comb=False):
     """
     Hidden pixels of the parts a turn uncovers, from the turned drawings where
     the same part is on top: their pictures' colours when given (side -> RGB)
@@ -2413,6 +2455,12 @@ def bake(front, turned, keys, log, pictures=None):
                 drawn = cv2.inpaint(rgb, unknown, UNDER_PIECE_RADIUS, cv2.INPAINT_TELEA)
                 layer[guess, :3] = drawn[guess].astype(np.float32) / 255
                 taken['drawn'] = int(guess.sum())
+        if comb and family.split(':')[0] in ('back-hair', 'front-hair') and hidden.any():
+            # Taken pixel by pixel from the turns and the guess between them, the
+            # hidden hair is a patchwork of flat blocks with stepped edges: combed
+            # along the strands it reads as hair when a turn uncovers it.
+            for _ in range(COMB_PASSES):
+                comb_strands(layer, hidden)
         report[name] = dict(hidden=int(hidden.sum()), **taken)
     log(f'baked {report}')
     return report
@@ -2892,7 +2940,7 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
     cut_crown(front, complete, log)
     if not drawn:
         finish_edges(front, log)
-    baked = bake(front, turned, complete, log, turned_pictures)
+    baked = bake(front, turned, complete, log, turned_pictures, comb=not drawn)
     seconds['baked'] = round(time.time() - started)
     # How the time went, to size the work to the machine it runs on.
     result = dict(canvas=[front.W, front.H], keyforms=complete, fit=report, baked=baked, locks=locks,
@@ -2916,7 +2964,7 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
                         complete[family][side] = key
                     result['picture'][side] = change
         finish_edges(front, log)
-        result['baked'] = bake(front, turned, complete, log, turned_pictures)
+        result['baked'] = bake(front, turned, complete, log, turned_pictures, comb=True)
         key_multiply(front, turned, complete, drawn['front'][0], turned_pictures, log)
     # An iris riding its eye carries the eye's key as its own.
     for sides in complete.values():
