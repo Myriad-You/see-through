@@ -1495,9 +1495,19 @@ def hold_face_to_features(front, t, keys, side, log, pictures=None):
 # picture has it), and a key fitted to that inherits it. So the keys are
 # rendered together, as the runtime draws them, and compared with the picture
 # by dense flow; each part's lattice takes up the flow where that part shows.
-PICTURE_ROUNDS = 3
+#
+# Dense flow finds a far move badly on a repeated pattern: a hat 50 px from
+# where the picture has it, with a band of stars ~55 px apart, has some of its
+# stars matched to the next star, both ways alike. Those samples bent the hat's
+# lattice into a fold there (a star drawn as a smear with a tail), and whether
+# they passed the check hung on pixels far off: 291 px of an earring moved the
+# hat 46 px (2026-11-02 witch). So the first round takes up only the broad move
+# (PICTURE_FIRST_SMOOTH times as smooth), which such a patch cannot bend; the
+# rounds after it find what is left from near, where the stars match their own.
+PICTURE_ROUNDS = 4
 PICTURE_STRIDE = 3
 PICTURE_SMOOTH = 0.5
+PICTURE_FIRST_SMOOTH = 8
 PICTURE_HOLD = 0.05
 
 
@@ -1580,7 +1590,7 @@ def headwear_error(front, keys, side, key, picture, box):
     return edge_distance(rgb, picture, region)
 
 
-def refit_lattice(key, px, py, target):
+def refit_lattice(key, px, py, target, smooth=PICTURE_SMOOTH):
     """Least squares of a lattice through backward offsets measured at turned points, smooth, held near the old one."""
     x0, y0, x1, y1 = key['box']
     g = key['grid']
@@ -1592,10 +1602,10 @@ def refit_lattice(key, px, py, target):
     np.put_along_axis(M, idx, wts, 1)
     scale = np.sqrt(len(px) / n)
     L = laplacian(g)
-    A = np.vstack([M, L * PICTURE_SMOOTH * scale, np.eye(n, dtype=np.float32) * PICTURE_HOLD * scale])
+    A = np.vstack([M, L * smooth * scale, np.eye(n, dtype=np.float32) * PICTURE_HOLD * scale])
     out = np.zeros((n, 2), np.float32)
     for c in range(2):
-        rhs = np.concatenate([target[:, c], L @ old[:, c] * PICTURE_SMOOTH * scale, old[:, c] * PICTURE_HOLD * scale])
+        rhs = np.concatenate([target[:, c], L @ old[:, c] * smooth * scale, old[:, c] * PICTURE_HOLD * scale])
         out[:, c] = np.linalg.lstsq(A, rhs, rcond=None)[0]
     return dict(key, back=[float(v) for v in out.reshape(-1)])
 
@@ -1633,7 +1643,8 @@ def refine_on_picture(front, keys, side, picture, extra, log, own=()):
     region[max(0, ys.min() - 60):ys.max() + 60, max(0, xs.min() - 60):xs.max() + 60] = True
     rgb, top = render_keys(layers, keys, side, W, H)
     start = before = edge_distance(rgb, picture, region)
-    for _ in range(PICTURE_ROUNDS):
+    for round_ in range(PICTURE_ROUNDS):
+        smooth = PICTURE_SMOOTH * (PICTURE_FIRST_SMOOTH if round_ == 0 else 1)
         flow, agree = picture_flow(rgb, picture)
         yy, xx = np.mgrid[0:H:PICTURE_STRIDE, 0:W:PICTURE_STRIDE]
         fx, fy = flow[yy, xx, 0], flow[yy, xx, 1]
@@ -1660,7 +1671,7 @@ def refine_on_picture(front, keys, side, picture, extra, log, own=()):
             inside = (px >= x0) & (px <= x1) & (py >= y0) & (py <= y1)
             if inside.sum() < 200:
                 continue
-            trial[family] = dict(keys[family], **{side: refit_lattice(key, px[inside], py[inside], target[inside])})
+            trial[family] = dict(keys[family], **{side: refit_lattice(key, px[inside], py[inside], target[inside], smooth)})
             iris = riding_iris(keys, family, side)
             if iris:
                 trial[iris] = dict(keys[iris], **{side: dict(trial[family][side], rides='eye')})
