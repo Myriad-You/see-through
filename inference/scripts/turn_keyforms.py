@@ -711,7 +711,6 @@ UNDER_PIECE_RADIUS = 6
 BURIED_MATCH = 40
 
 
-RAISED_UNDER = 6
 RAISED_INSET = 4
 
 
@@ -741,18 +740,17 @@ def raise_buried_accessories(front, picture, log):
         raised[part, 3] = np.where(layer[part, 3] > 0, np.maximum(layer[part, 3], 0.0), 1.0)
         inner = cv2.erode(part.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
         raised[inner, 3] = 1.0
-        # What stays runs on RAISED_UNDER px beneath the raised part from the
-        # seam between them, short of the raised part's other edges (by
-        # RAISED_INSET px, where what lies under it shows through its soft rim):
-        # where the two part on a nod, the seam shows the part, not what is
-        # behind it. It takes the raised part's colours there (the picture's),
-        # not the decomposition's guess.
+        # What stays runs on beneath the whole raised part, short of the raised
+        # part's other edges (by RAISED_INSET px, where what lies under it shows
+        # through its soft rim): where the two part on a nod or a tilt, however
+        # far, the seam shows the part, not what is behind it. It takes the
+        # raised part's colours there (the picture's), not the decomposition's
+        # guess.
         # Given back when the edges are finished (finish_edges).
         rest = (layer[..., 3] > 0.5) & ~part
-        disc = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * RAISED_UNDER + 1, 2 * RAISED_UNDER + 1))
         inset = np.ones((2 * RAISED_INSET + 1, 2 * RAISED_INSET + 1), np.uint8)
         other = ~part & ~rest
-        beneath = part & (cv2.dilate(rest.astype(np.uint8), disc) > 0) & ~(cv2.dilate(other.astype(np.uint8), inset) > 0)
+        beneath = part & ~(cv2.dilate(other.astype(np.uint8), inset) > 0)
         finishing(front).append((name, beneath, raised[beneath, :3].copy(), np.ones(int(beneath.sum()), np.float32), None))
         layer[part, 3] = 0
         # Numbered, as Myriad reads a further drawing of the same part.
