@@ -124,6 +124,25 @@ def big_headwear(dec):
     face = (dec.layers['face'][..., 3] > 0.5).sum()
     area = (dec.layers['headwear'][..., 3] > 0.5).sum()
     return area if face and area >= BIG_HEADWEAR * face else None
+
+
+def is_hat(front, name):
+    """
+    Whether headwear layer `name` is a hat or a piece of one (its brim's front
+    drawn apart): it, or a headwear layer it overlaps, is as big as
+    BIG_HEADWEAR of the face. A clip is not.
+    """
+    if family_of(name) != 'headwear' or 'face' not in front.layers:
+        return False
+    face = (front.layers['face'][..., 3] > 0.5).sum()
+    drawn = front.layers[name][..., 3] > 0.5
+    for other in front.order:
+        if family_of(other) != 'headwear':
+            continue
+        it = front.layers[other][..., 3] > 0.5
+        if it.sum() >= BIG_HEADWEAR * face and (other == name or (it & drawn).any()):
+            return True
+    return False
 # The neck is not taken from the turned drawings: each is lit its own way, and
 # under the chin they patch into bands. The decomposition's own inpainting is
 # one smooth cylinder of skin with the chin's shadow, which the neck's key
@@ -859,6 +878,13 @@ def matte_rim(art, picture, under, kin):
     return sure, own[sure], alpha[sure]
 
 
+def enclosed_by(art):
+    """What `art` encloses: its holes, each under RESTORE_HOLE of its area."""
+    n, gaps, stats, _ = cv2.connectedComponentsWithStats((~art).astype(np.uint8))
+    border = set(np.unique(np.concatenate([gaps[0], gaps[-1], gaps[:, 0], gaps[:, -1]])))
+    return np.isin(gaps, [g for g in range(1, n) if g not in border and stats[g, 4] < RESTORE_HOLE * art.sum()])
+
+
 def restore_ornaments(front, picture, log):
     """Redraws each ornament layer as the picture shows it at rest."""
     report = {}
@@ -877,10 +903,19 @@ def restore_ornaments(front, picture, log):
         art = near & ((differs > RESTORE_DIFFERENT) | (drawn & (differs > RESTORE_DIFFERENT_DRAWN)))
         art = cv2.morphologyEx(art.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)) > 0
         # What the ornament encloses is the ornament (a highlight as pale as the skin under it).
-        n, gaps, stats, _ = cv2.connectedComponentsWithStats((~art).astype(np.uint8))
-        border = set(np.unique(np.concatenate([gaps[0], gaps[-1], gaps[:, 0], gaps[:, -1]])))
-        enclosed = [g for g in range(1, n) if g not in border and stats[g, 4] < RESTORE_HOLE * art.sum()]
-        art |= np.isin(gaps, enclosed)
+        art |= enclosed_by(art)
+        # Beyond its drawing the picture differs from the other layers also
+        # where the decomposition redrew them (the strands of hair around an
+        # earring). An earring swings on its own, and hair taken as it swings
+        # off the hair: there it is the picture only where that is nearer the
+        # earring as it shows around than what lies under it, or what the rest
+        # of it encloses. An ornament that goes with the head keeps all of it
+        # (the rest as the picture has it; a moon's pearl as pale as the hair).
+        if name.split('-')[0] == 'earwear':
+            mine, _ = colour_around(layer[..., :3], drawn.astype(np.float32), RESTORE_AROUND)
+            theirs, _ = colour_around(under, (~drawn).astype(np.float32), RESTORE_AROUND)
+            kept = art & (drawn | (picture_distance(mine, picture) <= picture_distance(theirs, picture)))
+            art &= kept | enclosed_by(kept)
         hidden, nearer = hidden_ornament(front, name, picture, near)
         if (art & hidden & ~nearer).any():
             kept = cv2.morphologyEx((art & nearer).astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)) > 0
@@ -1675,8 +1710,12 @@ def sub_lattice(key, box, grid=LOCK_GRID):
 # behind it, where a cut mask left a stair of hard steps over what lies under.
 # The locks are fitted as cut and softened once the keys are found
 # (finish_edges), before the bake that fills what of them lies hidden.
+# A slit the lock under closes around (up to LOCK_CLOSE px across: a strand
+# cut off from it by the lock over) it runs on beneath whole, so a tilt that
+# parts them shows hair there, not the hat's lining behind.
 LOCK_FEATHER = 0.8
 LOCK_UNDER = 6
+LOCK_CLOSE = 12
 
 
 def split_front_hair(front, keys, log):
@@ -1716,6 +1755,7 @@ def split_front_hair(front, keys, log):
     # keeps its own front hair whole.
     whole = keys['front-hair']
     under_disc = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * LOCK_UNDER + 1, 2 * LOCK_UNDER + 1))
+    close_disc = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * LOCK_CLOSE + 1, 2 * LOCK_CLOSE + 1))
     near = np.ones((5, 5), np.uint8)
     front.lock_seams = {}
     for n, k in enumerate(ids, 1):
@@ -1726,7 +1766,8 @@ def split_front_hair(front, keys, log):
         fade = np.ones(mine.shape, np.float32)
         seam = (cv2.dilate(mine.astype(np.uint8), near) > 0) & (cv2.dilate(under.astype(np.uint8), near) > 0) & mine
         fade[seam] = cv2.GaussianBlur(mine.astype(np.float32), (0, 0), LOCK_FEATHER)[seam]
-        beneath = (cv2.dilate(mine.astype(np.uint8), under_disc) > 0) & over
+        closed = cv2.morphologyEx(mine.astype(np.uint8), cv2.MORPH_CLOSE, close_disc) > 0
+        beneath = ((cv2.dilate(mine.astype(np.uint8), under_disc) > 0) | closed) & over
         front.lock_seams[name] = (fade, L[..., 3] * beneath, [f'front hair-{m}' for m in range(n + 1, len(ids) + 1)])
         layer = L.copy()
         layer[..., 3] *= mine
@@ -1993,11 +2034,22 @@ CUT_RIM = 4
 # recover as its own piece, and so are the pieces found missing (`keep`).
 PICTURE_INSET = 2
 PICTURE_MATCH = 60
+# Between an earring's arms and links (its notches, closed up to SWING_NOTCH
+# px) the hair shows at rest, cut to the earring's outline: taken from the
+# picture, those cut-outs stay on the hair as the earring swings away, pale
+# hooks among the decomposition's strands. There the hair keeps its own.
+SWING_NOTCH = 15
 
 
 def paint_from_picture(front, picture, log, keep=None):
     """Gives each layer's interior that shows at rest the picture's colours where it is the same art."""
     over = np.zeros((front.H, front.W), np.float32)
+    earrings = np.zeros((front.H, front.W), np.uint8)
+    for name in front.order:
+        if name.split('-')[0] == 'earwear':
+            earrings |= (front.layers[name][..., 3] > 0.05).astype(np.uint8)
+    notch = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (SWING_NOTCH, SWING_NOTCH))
+    notches = cv2.morphologyEx(earrings, cv2.MORPH_CLOSE, notch) > 0
     report = {}
     for name in reversed(front.order):
         layer = front.layers[name]
@@ -2005,6 +2057,8 @@ def paint_from_picture(front, picture, log, keep=None):
         shows = (layer[..., 3] > 0.95) & (over < 0.05) & same
         if keep is not None:
             shows &= ~keep
+        if name.split('-')[0] != 'earwear':
+            shows &= ~notches
         shows = cv2.erode(shows.astype(np.uint8), np.ones((2 * PICTURE_INSET + 1, 2 * PICTURE_INSET + 1), np.uint8)) > 0
         if shows.any():
             layer[shows, :3] = picture[shows]
@@ -2030,6 +2084,92 @@ def cut_garment_under_face(front, log):
     front.layers['topwear'][..., 3] *= ~hidden
     log(f'cut the garment under the face: {int(hidden.sum())} px')
     return int(hidden.sum())
+
+
+# A hole the picture cuts in a garment (cut_by_picture), smaller than this
+# share of it, where the picture shows a front lock's colour more than the
+# garment's and the lock touches it, is that lock hanging over the garment.
+HAIR_HOLE = 0.01
+HAIR_GARMENTS = ('topwear', 'neckwear')
+# Where the picture's hair goes on past the hole, over this share of a band
+# just outside it (HAIR_HOLE_BAND), the hole is a torn-off piece of a strand the
+# decomposition put in the coat: on the lock it would be a block of its own.
+HAIR_HOLE_TORN = 0.3
+HAIR_HOLE_BAND = 9
+# Hair or garment there is told by the picture's colour: nearer the lock's or
+# one of the garment's main colours around the hole (HAIR_HOLE_COLOURS within
+# HAIR_HOLE_RING, a colour with less than HAIR_HOLE_MINOR of the ring not one).
+HAIR_HOLE_RING = 15
+HAIR_HOLE_COLOURS = 3
+HAIR_HOLE_MINOR = 0.2
+
+
+def hair_through_garment(front, picture, uncut, log):
+    """
+    The picture shows a lock over the coat where the decomposition has it
+    behind, in the back hair: cutting the coat there leaves a hole, which
+    reads as the lock at rest, but the lock turns and the hole stays, back
+    hair in the coat. The coat gets back what the cut took (`uncut`, its
+    alpha before), and the lock it touches takes what of the hole the picture
+    shows as hair, in the picture's colours (not the back hair's, a block of
+    another shade), unless that hair goes on past the hole.
+    """
+    locks = [n for n in front.order if n == 'front hair' or LOCK_LAYER.match(n)]
+    if not locks:
+        return 0
+    moved = {}
+    for name in [n for n in front.order if n in uncut]:
+        garment = front.layers[name]
+        gi = front.order.index(name)
+        above = [l for l in locks if front.order.index(l) > gi]
+        if not above:
+            continue
+        drawn = garment[..., 3] > 0.5
+        n, gaps, stats, _ = cv2.connectedComponentsWithStats((~drawn).astype(np.uint8), connectivity=4)
+        border = set(np.unique(np.concatenate([gaps[0], gaps[-1], gaps[:, 0], gaps[:, -1]])))
+        below = np.full((front.H, front.W), '', dtype=object)
+        for under in front.order[:gi]:
+            below[front.layers[under][..., 3] > 0.5] = under
+        for g in range(1, n):
+            if g in border or stats[g, 4] >= HAIR_HOLE * drawn.sum():
+                continue
+            hole = gaps == g
+            if (below[hole] == 'back hair').mean() < 0.5 or (uncut[name][hole] > 0.5).mean() < 0.5:
+                continue
+            x0, y0, w, h = stats[g, :4]
+            k = 2 * max(w, h) + 1
+            around = cv2.dilate(hole.astype(np.uint8), np.ones((k, k), np.uint8)) > 0
+            count, lock = max((int((around & (front.layers[l][..., 3] > 0.95)).sum()), l) for l in above)
+            if not count:
+                continue
+            ring = (cv2.dilate(hole.astype(np.uint8), np.ones((HAIR_HOLE_RING, HAIR_HOLE_RING), np.uint8)) > 0) & ~hole & (garment[..., 3] > 0.98)
+            if ring.sum() < HAIR_HOLE_COLOURS:
+                continue
+            _, which, centres = cv2.kmeans(garment[ring, :3].astype(np.float32), HAIR_HOLE_COLOURS, None,
+                                           (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1e-3), 3, cv2.KMEANS_PP_CENTERS)
+            main = centres[np.bincount(which.ravel(), minlength=HAIR_HOLE_COLOURS) / len(which) >= HAIR_HOLE_MINOR]
+            L = front.layers[lock]
+            hair = np.median(L[around & (L[..., 3] > 0.95), :3], axis=0)
+            seen = (cv2.dilate(hole.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0) & (garment[..., 3] < uncut[name])
+            band = ((cv2.dilate(hole.astype(np.uint8), np.ones((HAIR_HOLE_BAND, HAIR_HOLE_BAND), np.uint8)) > 0)
+                    & ~seen & (garment[..., 3] > 0.98) & (L[..., 3] < 0.5))
+            py, px = np.nonzero(seen | band)
+            hairlike = np.zeros_like(seen)
+            hairlike[py, px] = (np.linalg.norm(picture[py, px] - hair, axis=-1)
+                                < np.linalg.norm(picture[py, px, None] - main, axis=-1).min(-1))
+            if hairlike[hole].mean() < 0.5:
+                continue
+            torn = band.any() and hairlike[band].mean() > HAIR_HOLE_TORN
+            garment[seen, 3] = uncut[name][seen]
+            if not torn:
+                cover = cv2.GaussianBlur((hairlike & seen).astype(np.float32), (0, 0), 0.7) * seen
+                onto = cover > L[..., 3]
+                L[onto, :3] = picture[onto]
+                L[onto, 3] = cover[onto]
+            moved.setdefault(name, []).append((int(x0 + w // 2), int(y0 + h // 2), int(hole.sum()), 'closed' if torn else lock))
+    if moved:
+        log(f'hair through the garment (x, y, px, lock or closed) {moved}')
+    return sum(len(v) for v in moved.values())
 
 
 def cut_by_picture(front, picture, log, lift=False):
@@ -2203,6 +2343,119 @@ def keyed_alpha(front, names, keys, side):
     return cover
 
 
+# A hat turns with the head, and so does the top of the fringe under it, but
+# each is fitted on its own: on a turn the fringe slid out from under the brim
+# and bared its hidden top, which no turned drawing has. Where a hat over it
+# covers a lock, the lock goes as the hat does; below the brim it comes back
+# to its own key over about GLUE_SOFT px. The lock's lattice is taken finer
+# (GLUE_GRID) so the brim's line is followed.
+GLUE_SOFT = 12
+GLUE_GRID = 25
+
+
+def glue_under_hat(front, keys, log):
+    """Locks covered by a hat go as the hat does there, on every turn."""
+    if 'headwear' not in keys:
+        return
+    hats = [i for i, n in enumerate(front.order) if family_of(n) == 'headwear']
+    report = {}
+    for li, name in enumerate(front.order):
+        family = lock_family(name) or (BAKED.get(name) if BAKED.get(name) == 'front-hair' else None)
+        if not family or family not in keys:
+            continue
+        hat = np.zeros((front.H, front.W), np.float32)
+        for i in hats:
+            if i > li:
+                hat = np.maximum(hat, front.layers[front.order[i]][..., 3])
+        under = (hat > 0.9) & (front.layers[name][..., 3] > 0.25)
+        if under.sum() < MIN_MISSING_AREA:
+            continue
+        outside = cv2.distanceTransform((hat <= 0.9).astype(np.uint8), cv2.DIST_L2, 5)
+        weight = np.exp(-outside / GLUE_SOFT).astype(np.float32)
+        for side, key in list(keys[family].items()):
+            hat_key = keys['headwear'].get(side)
+            if key is None or hat_key is None:
+                continue
+            fine = sub_lattice(key, key['box'], GLUE_GRID)
+            g = GLUE_GRID
+            x0, y0, x1, y1 = fine['box']
+            gx, gy = np.meshgrid(np.linspace(x0, x1, g), np.linspace(y0, y1, g))
+            gx, gy = gx.ravel(), gy.ravel()
+            own = np.asarray(fine['back'], np.float32).reshape(-1, 2)
+            hg = hat_key['grid']
+            hx0, hy0, hx1, hy1 = hat_key['box']
+            hb = np.asarray(hat_key['back'], np.float32).reshape(-1, 2)
+            bx, by = sample(hb, np.linspace(hx0, hx1, hg), np.linspace(hy0, hy1, hg), gx, gy)
+            # Where the point lands at rest, by the lock's own key.
+            rx = np.clip(np.round(gx + own[:, 0]).astype(int), 0, front.W - 1)
+            ry = np.clip(np.round(gy + own[:, 1]).astype(int), 0, front.H - 1)
+            w = weight[ry, rx][:, None]
+            back = own * (1 - w) + np.stack([bx, by], 1) * w
+            keys[family][side] = dict(key, box=fine['box'], grid=g, back=[float(v) for v in back.ravel()])
+            report[f'{family} {side}'] = int((w > 0.5).sum())
+    if report:
+        log(f'glued under the hat {report}')
+
+
+# A hat's lining is drawn only where it shows: under a lock hanging over it
+# there is none, and the lock swinging on a tilt bares the hair behind the
+# hat (and slivers of lining left between its strands). The lining runs on
+# beneath the locks over it, and into the slits between their strands, by
+# HAT_UNDER px from where its edge follows a lock's (it was cut there by the
+# lock), not from where it crosses a lock (the brim's own edge), so it does
+# not reach past the brim.
+HAT_UNDER = 24
+# Hat colours this near the hair's (RGB, 0-1) are strands drawn onto it.
+HAT_NOT_HAIR = 0.15
+
+
+def hat_under_locks(front, log):
+    """Runs a hat's lining on beneath the locks hanging over it."""
+    report = {}
+    ring = np.ones((3, 3), np.uint8)
+    for li, name in enumerate(front.order):
+        # A clip's ribbon run on under the hair shows as a dark band when it turns.
+        if not is_hat(front, name):
+            continue
+        locks = [n for n in front.order[li + 1:] if lock_family(n) or BAKED.get(n) == 'front-hair']
+        if not locks:
+            continue
+        layer = front.layers[name]
+        over = np.max([front.layers[n][..., 3] for n in locks], 0) > 0.5
+        # The hat itself, not slivers of it between strands.
+        hat = cv2.morphologyEx((layer[..., 3] > 0.5).astype(np.uint8), cv2.MORPH_OPEN, ring)
+        n, lab, stats, _ = cv2.connectedComponentsWithStats(hat)
+        if n < 2:
+            continue
+        hat = (lab == 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))).astype(np.uint8)
+        rim = hat.astype(bool) & ~(cv2.erode(hat, ring) > 0)
+        lock_rim = over & ~(cv2.erode(over.astype(np.uint8), ring) > 0)
+        cut = rim & (cv2.dilate(lock_rim.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0)
+        crossing = rim & ~cut & (cv2.dilate(over.astype(np.uint8), ring) > 0)
+        from_cut = cv2.distanceTransform((~cut).astype(np.uint8), cv2.DIST_L2, 5)
+        from_crossing = cv2.distanceTransform((~crossing).astype(np.uint8), cv2.DIST_L2, 5)
+        # The slits between a lock's strands too: the picture has the lining there.
+        slits = cv2.morphologyEx(over.astype(np.uint8), cv2.MORPH_CLOSE,
+                                 cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * LOCK_CLOSE + 1, 2 * LOCK_CLOSE + 1))) > 0
+        new = slits & ~hat.astype(bool) & (from_cut <= HAT_UNDER) & (from_cut < from_crossing) & (layer[..., 3] < 0.5)
+        if new.sum() < MIN_MISSING_AREA:
+            continue
+        ys, xs = np.nonzero(new)
+        pad = 2 * HAT_UNDER
+        y0, y1 = max(0, ys.min() - pad), min(front.H, ys.max() + pad + 1)
+        x0, x1 = max(0, xs.min() - pad), min(front.W, xs.max() + pad + 1)
+        rgb = (np.clip(layer[y0:y1, x0:x1, :3], 0, 1) * 255).astype(np.uint8)
+        # Coloured from the hat, not the strands drawn onto its edge.
+        hair = np.median(np.concatenate([front.layers[n][..., :3][front.layers[n][..., 3] > 0.5] for n in locks]), 0)
+        known = (cv2.erode(hat, ring, iterations=2) > 0) & (np.linalg.norm(layer[..., :3] - hair, axis=2) > HAT_NOT_HAIR)
+        drawn = cv2.inpaint(rgb, 1 - known[y0:y1, x0:x1].astype(np.uint8), UNDER_PIECE_RADIUS, cv2.INPAINT_TELEA)
+        layer[ys, xs, :3] = drawn[ys - y0, xs - x0].astype(np.float32) / 255
+        layer[ys, xs, 3] = 1.0
+        report[name] = int(new.sum())
+    if report:
+        log(f'ran the hat on under the locks {report}')
+
+
 def cut_crown(front, keys, log):
     """Cuts the face above its hairline and at the temples where no pose shows a hole for it."""
     if 'face' not in front.layers:
@@ -2304,6 +2557,82 @@ def strays_to_locks(front, zone, log):
     return len(moved)
 
 
+# A key is a lattice over the turned drawing, each point saying where it was at
+# rest; the runtime finds each rest vertex's turned place by inverting it. Where
+# the fit turns a cell over (two points' places at rest swapped, a jaw's corner
+# squeezed past its neighbour), a rest point has two turned places, the
+# inversion jumps between them, and the outline there folds into a spur as the
+# head turns. Over the part's own pixels (UNFOLD_REACH px around), the points
+# of cells landing turned over (their area at rest under UNFOLD_FLOOR of the
+# cell's) are drawn toward their neighbours' offsets until none is; a cell
+# only squeezed (the far eye at the full turn) is the turn as drawn. Cells
+# landing off the part are left as fitted, and so are the accessories' keys,
+# which carry rigid pieces over a box mostly empty.
+UNFOLD_FLOOR = 0.02
+UNFOLD_REACH = 2
+UNFOLD_ROUNDS = 400
+
+
+def lattice_cells_landed(key):
+    """Per cell, its corners' places at rest (t + back(t)), and the least area ratio of its triangles there."""
+    g = key['grid']
+    x0, y0, x1, y1 = key['box']
+    X, Y = np.meshgrid(np.linspace(x0, x1, g), np.linspace(y0, y1, g))
+    at = np.stack([X, Y], -1)
+    landed = at + np.asarray(key['back'], np.float64).reshape(g, g, 2)
+
+    def area(points, a, b, c):
+        A, B, C = (points[j:g - 1 + j, i:g - 1 + i] for j, i in (a, b, c))
+        return (B[..., 0] - A[..., 0]) * (C[..., 1] - A[..., 1]) - (C[..., 0] - A[..., 0]) * (B[..., 1] - A[..., 1])
+    corners = (((0, 0), (1, 0), (0, 1)), ((1, 1), (0, 1), (1, 0)), ((0, 0), (1, 0), (1, 1)), ((0, 0), (1, 1), (0, 1)))
+    ratio = np.min([area(landed, *t) / area(at, *t) for t in corners], 0)
+    return landed, ratio
+
+
+def unfold_keys(front, keys, log):
+    """Draws the points of turned-over or crushed cells over each part's pixels toward their neighbours."""
+    reach = np.ones((2 * UNFOLD_REACH + 1, 2 * UNFOLD_REACH + 1), np.uint8)
+    report = {}
+    for family, sides in keys.items():
+        names = [n for n in front.order if family_of(n) == family]
+        if not names or family in ACCESSORIES:
+            continue
+        mask = cv2.dilate(np.any([front.layers[n][..., 3] > 0.05 for n in names], 0).astype(np.uint8), reach)
+        inside = cv2.integral(mask)
+        for side, key in sides.items():
+            if 'back' not in key:
+                continue
+            landed, ratio = lattice_cells_landed(key)
+            # Whether any of the part's pixels lies in each cell's landed bounds.
+            g = key['grid']
+            quads = np.stack([landed[:-1, :-1], landed[:-1, 1:], landed[1:, :-1], landed[1:, 1:]], 0)
+            lo = np.clip(np.floor(quads.min(0)).astype(int), 0, [front.W, front.H])
+            hi = np.clip(np.ceil(quads.max(0)).astype(int) + 1, 0, [front.W, front.H])
+            count = (inside[hi[..., 1], hi[..., 0]] - inside[lo[..., 1], hi[..., 0]]
+                     - inside[hi[..., 1], lo[..., 0]] + inside[lo[..., 1], lo[..., 0]])
+            on = count > 0
+            if not (on & (ratio < UNFOLD_FLOOR)).any():
+                continue
+            back = np.asarray(key['back'], np.float64).reshape(g, g, 2)
+            fitted = back.copy()
+            for _ in range(UNFOLD_ROUNDS):
+                bad = on & (ratio < UNFOLD_FLOOR)
+                if not bad.any():
+                    break
+                points = np.zeros((g, g), bool)
+                for dj in (0, 1):
+                    for di in (0, 1):
+                        points[dj:g - 1 + dj, di:g - 1 + di] |= bad
+                edge = np.pad(back, ((1, 1), (1, 1), (0, 0)), mode='edge')
+                around = (edge[:-2, 1:-1] + edge[2:, 1:-1] + edge[1:-1, :-2] + edge[1:-1, 2:]) / 4
+                back[points] = (back[points] + around[points]) / 2
+                key['back'] = [float(v) for v in back.reshape(-1)]
+                _, ratio = lattice_cells_landed(key)
+            moved = np.linalg.norm(back - fitted, axis=-1)
+            report[f'{family}/{side}'] = (int((moved > 0.5).sum()), round(float(moved.max()), 1))
+    log(f'unfolded keys (points moved, most px) {report}')
+
+
 # The light on a part changes as the head turns: a neck the raised chin no
 # longer shades is lighter, one the lowered chin shades darker. Each key of
 # such a part holds a multiply colour (as Cubism keys one): the mean colour of
@@ -2385,6 +2714,39 @@ def comb_strands(layer, region):
     layer[..., :3] = layer[..., :3] * (1 - blend) + combed * blend
 
 
+# The fringe's hidden top keeps the decomposition's strands, and right above
+# a brim's edge they carry its shadow: when the brim and the hair part on a
+# tilt, a dark band shows on the hair (the turned drawings have it there
+# too). Over HAT_EDGE px above the edge the hair is the hair below it,
+# mirrored across the edge, fading back to what it was over the band.
+HAT_EDGE = 24
+
+
+def mirror_under_brim(front, li, layer):
+    """The hidden hair right above a hat's lower edge, mirrored from the hair below. Returns the px changed."""
+    hat = np.zeros((front.H, front.W), np.float32)
+    for above in front.order[li + 1:]:
+        if is_hat(front, above):
+            hat = np.maximum(hat, front.layers[above][..., 3])
+    under = (hat > 0.5) & (layer[..., 3] > 0.25)
+    if under.sum() < MIN_MISSING_AREA:
+        return 0
+    # Per pixel, how many rows down the brim ends (no further than HAT_EDGE).
+    rows = np.full((front.H, front.W), HAT_EDGE + 1, np.int32)
+    for y in range(front.H - 2, -1, -1):
+        rows[y] = np.where(under[y], np.minimum(rows[y + 1] + 1, HAT_EDGE + 1), 0)
+    band = under & (rows <= HAT_EDGE)
+    ys, xs = np.nonzero(band)
+    my = ys + 2 * rows[ys, xs] - 1
+    ok = my < front.H
+    ys, xs, my = ys[ok], xs[ok], my[ok]
+    shown = (layer[my, xs, 3] > 0.5) & (hat[my, xs] < 0.5)
+    ys, xs, my = ys[shown], xs[shown], my[shown]
+    w = np.clip(2 - 2 * rows[ys, xs] / HAT_EDGE, 0, 1)[:, None]
+    layer[ys, xs, :3] = layer[ys, xs, :3] * (1 - w) + layer[my, xs, :3] * w
+    return len(ys)
+
+
 def bake(front, turned, keys, log, pictures=None, comb=False):
     """
     Hidden pixels of the parts a turn uncovers, from the turned drawings where
@@ -2394,15 +2756,28 @@ def bake(front, turned, keys, log, pictures=None, comb=False):
     """
     owners = {side: t.owner() for side, t in turned.items()}
     report = {}
+    if not hasattr(front, 'unbaked'):
+        front.unbaked = {name: front.layers[name][..., :3].copy() for name in front.order
+                         if BAKED.get(name) or lock_family(name)}
+    unbaked = front.unbaked
     for li, name in enumerate(front.order):
         family = BAKED.get(name) or lock_family(name)
         if not family or family not in keys:
             continue
         layer = front.layers[name]
+        # What only an earring covers is no turn's to bare: the earring swings
+        # off it, and the turned drawings have the earring near there, its
+        # outline in their hair. It keeps the decomposition's own.
         cover = np.zeros((front.H, front.W), np.float32)
         for above in front.order[li + 1:]:
-            cover = np.maximum(cover, front.layers[above][..., 3])
+            if above.split('-')[0] != 'earwear':
+                cover = np.maximum(cover, front.layers[above][..., 3])
         hidden = (layer[..., 3] > 0.25) & (cover > 0.9)
+        # In the last bake only (where it combs), as the keys are refined on the
+        # first: the part starts again from the decomposition's colours, and
+        # only what a turn bares is taken (below).
+        if comb:
+            layer[hidden, :3] = unbaked[name][hidden]
         qy, qx = np.nonzero(hidden)
         filled = np.zeros((front.H, front.W), bool)
         revealed = np.zeros(len(qx), bool)
@@ -2423,6 +2798,13 @@ def bake(front, turned, keys, log, pictures=None, comb=False):
                 exposed = keyed_alpha(front, front.order[li + 1:], keys, side)[iy, ix] < 0.5
                 revealed |= exposed
                 mine |= exposed & np.isin(owners[side][iy, ix], names)
+            if comb:
+                # What stays covered on a turn (a fringe's top under a hat that
+                # turns with it) is not in the turned drawing: it has other hair
+                # there (the fringe's lower strands). Only what the parts over it,
+                # at their keys, leave bare is taken; the rest keeps the
+                # decomposition's own strands.
+                mine &= keyed_alpha(front, front.order[li + 1:], keys, side)[iy, ix] < 0.5
             mine &= ~filled[qy, qx]
             src = t.family(names)
             if pictures and side in pictures:
@@ -2453,12 +2835,18 @@ def bake(front, turned, keys, log, pictures=None, comb=False):
                 drawn = cv2.inpaint(rgb, unknown, UNDER_PIECE_RADIUS, cv2.INPAINT_TELEA)
                 layer[guess, :3] = drawn[guess].astype(np.float32) / 255
                 taken['drawn'] = int(guess.sum())
-        if comb and family.split(':')[0] in ('back-hair', 'front-hair') and hidden.any():
+        if comb and family.split(':')[0] in ('back-hair', 'front-hair') and filled.any():
             # Taken pixel by pixel from the turns and the guess between them, the
             # hidden hair is a patchwork of flat blocks with stepped edges: combed
             # along the strands it reads as hair when a turn uncovers it.
+            # The decomposition's own strands, where nothing was taken, are left as drawn.
+            region = filled.copy()
+            if 'drawn' in taken:
+                region[qy[revealed], qx[revealed]] |= True
             for _ in range(COMB_PASSES):
-                comb_strands(layer, hidden)
+                comb_strands(layer, region & hidden)
+        if comb and family.split(':')[0] == 'front-hair':
+            taken['brim'] = mirror_under_brim(front, li, layer)
         report[name] = dict(hidden=int(hidden.sum()), **taken)
     log(f'baked {report}')
     return report
@@ -2923,7 +3311,9 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
         fill_under_piece(front, mask, host, log)
     cut_garment_under_face(front, log)
     if drawn:
+        uncut = {n: front.layers[n][..., 3].copy() for n in front.order if n.split('-')[0] in HAIR_GARMENTS}
         cut_by_picture(front, drawn['front'][0], log, lift=True)
+        hair_through_garment(front, drawn['front'][0], uncut, log)
         raise_hair_over_eyes(front, drawn['front'][0], log)
         # Not the pieces the import recovers on their own.
         keep = np.zeros((front.H, front.W), np.uint8)
@@ -2937,6 +3327,9 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
             cut_by_picture(turned[side], picture, lambda line, side=side: log(f'{side:5s} {line}'))
     cut_crown(front, complete, log)
     if not drawn:
+        unfold_keys(front, complete, log)
+        glue_under_hat(front, complete, log)
+        hat_under_locks(front, log)
         finish_edges(front, log)
     baked = bake(front, turned, complete, log, turned_pictures, comb=not drawn)
     seconds['baked'] = round(time.time() - started)
@@ -2961,6 +3354,9 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
                     for family, key in moved.items():
                         complete[family][side] = key
                     result['picture'][side] = change
+        unfold_keys(front, complete, log)
+        glue_under_hat(front, complete, log)
+        hat_under_locks(front, log)
         finish_edges(front, log)
         result['baked'] = bake(front, turned, complete, log, turned_pictures, comb=True)
         key_multiply(front, turned, complete, drawn['front'][0], turned_pictures, log)
