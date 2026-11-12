@@ -2359,7 +2359,9 @@ def keyed_alpha(front, names, keys, side):
 # and bared its hidden top, which no turned drawing has. Where a hat over it
 # covers a lock, the lock goes as the hat does; below the brim it comes back
 # to its own key over about GLUE_SOFT px. The lock's lattice is taken finer
-# (GLUE_GRID) so the brim's line is followed.
+# (GLUE_GRID) so the brim's line is followed. Only a hat (is_hat): a clip's
+# key carries a rigid piece over a box mostly empty, and a lock glued to it
+# shears against its own key and turns over.
 GLUE_SOFT = 12
 GLUE_GRID = 25
 
@@ -2368,7 +2370,7 @@ def glue_under_hat(front, keys, log):
     """Locks covered by a hat go as the hat does there, on every turn."""
     if 'headwear' not in keys:
         return
-    hats = [i for i, n in enumerate(front.order) if family_of(n) == 'headwear']
+    hats = [i for i, n in enumerate(front.order) if is_hat(front, n)]
     report = {}
     for li, name in enumerate(front.order):
         family = lock_family(name) or (BAKED.get(name) if BAKED.get(name) == 'front-hair' else None)
