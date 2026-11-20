@@ -2248,9 +2248,18 @@ def lift_ornaments(front, name, cut, below, log):
         closed = cv2.morphologyEx(layer[..., 3], cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
         layer[..., 3] = np.where(hidden, np.maximum(layer[..., 3], closed), layer[..., 3])
         inside = hidden & (layer[..., 3] > 0)
-        rgb = (np.clip(layer[..., :3], 0, 1) * 255).astype(np.uint8)
-        filled = cv2.inpaint(rgb, inside.astype(np.uint8), LIFT_RADIUS, cv2.INPAINT_TELEA)
-        layer[inside, :3] = filled[inside].astype(np.float32) / 255
+        if inside.any():
+            # Only the part itself is read: a transparent pixel's colour is black, and
+            # read beside an ornament hanging past the part's edge it blackens the fill.
+            ys, xs = np.nonzero(inside)
+            pad = 8 * LIFT_RADIUS
+            y0, y1 = max(0, ys.min() - pad), min(front.H, ys.max() + 1 + pad)
+            x0, x1 = max(0, xs.min() - pad), min(front.W, xs.max() + 1 + pad)
+            part, mine = layer[y0:y1, x0:x1], inside[y0:y1, x0:x1]
+            rgb = (np.clip(part[..., :3], 0, 1) * 255).astype(np.uint8)
+            unknown = mine | (part[..., 3] < 0.5)
+            filled = cv2.inpaint(rgb, unknown.astype(np.uint8), LIFT_RADIUS, cv2.INPAINT_TELEA)
+            part[mine, :3] = filled[mine].astype(np.float32) / 255
         cut &= ~hidden
         front.order.remove(other)
         front.order.insert(front.order.index(name) + 1, other)

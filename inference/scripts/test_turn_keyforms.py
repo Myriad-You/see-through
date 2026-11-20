@@ -213,6 +213,24 @@ def test_a_turned_face_is_left_as_fitted():
     assert keys['face']['plus']['back'] == fitted
 
 
+def test_a_clip_lifted_over_the_hairs_edge_is_not_filled_black_under():
+    # A clip hanging past the lock's edge (gold, x 50..75) the decomposition put under
+    # the lock (lavender, x 20..60): lifted over it, the lock is filled from itself, not
+    # from the transparent black past its edge.
+    clip = layer([((50, 40, 75, 60), GOLD)])
+    hair = layer([((20, 10, 60, 90), HAIR)])
+    front = Made([('headwear', clip), ('front hair-1', hair)])
+    cut = np.zeros((H, W), bool)
+    cut[40:60, 50:60] = True
+    _, below, _ = turn_keyforms.composite_of(front, ['headwear'])
+    turn_keyforms.lift_ornaments(front, 'front hair-1', cut, below, quiet)
+    assert front.order == ['front hair-1', 'headwear'], front.order
+    lock = front.layers['front hair-1']
+    drawn = lock[..., 3] > 0.5
+    darkest = lock[..., :3][drawn].sum(-1).min()
+    assert darkest > 0.9 * sum(HAIR), f'the lock under the clip is darkened: {darkest:.2f}'
+
+
 if __name__ == '__main__':
     for name, test in list(globals().items()):
         if name.startswith('test_'):
