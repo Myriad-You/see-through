@@ -231,6 +231,49 @@ def test_a_clip_lifted_over_the_hairs_edge_is_not_filled_black_under():
     assert darkest > 0.9 * sum(HAIR), f'the lock under the clip is darkened: {darkest:.2f}'
 
 
+def flat_key(dx, dy, g=17):
+    return {'box': [0, 0, W - 1, H - 1], 'grid': g, 'back': [float(v) for _ in range(g * g) for v in (-dx, -dy)]}
+
+
+def tails_beside_face(ties=2):
+    """
+    A face (x 40..80, y 10..60) with rear hair over the crown and its sides, and a tail hanging
+    beside it each side (x 10..35 and 85..110, y 30..95), a ribbon (y 30..40) tied at each top.
+    """
+    face = layer([((40, 10, 80, 60), SKIN)])
+    hair = layer([((10, 5, 110, 40), HAIR), ((10, 30, 35, 95), HAIR), ((85, 30, 110, 95), HAIR)])
+    made = [('back hair', hair), ('face', face)]
+    ribbons = [((12, 30, 33, 40), GOLD), ((87, 30, 108, 40), GOLD)][:ties]
+    if ribbons:
+        made.append(('headwear', layer(ribbons)))
+    front = Made(made)
+    keys = {'face': {s: flat_key(20 if s == 'plus' else -20, 0) for s in ('plus', 'minus')},
+            'back-hair': {s: flat_key(0, 0) for s in ('plus', 'minus')},
+            'headwear': {s: flat_key(0, 0) for s in ('plus', 'minus')}}
+    return front, keys
+
+
+def test_a_twin_tail_tied_beside_the_face_goes_along_with_the_head():
+    front, keys = tails_beside_face()
+    turn_keyforms.carry_hanging_hair(front, keys, quiet)
+    for side, way in (('plus', 1), ('minus', -1)):
+        key = keys['back-hair'][side]
+        tx, _ = turn_keyforms.turned_position(key, np.array([22.0, 60.0]), np.array([80.0, 8.0]))
+        assert abs(tx[0] - 22 - way * 20 * turn_keyforms.HANGING_CARRY) < 2, f'the tail goes with the head: {tx[0] - 22:.1f}'
+        assert abs(tx[1] - 60) < 1, f'the crown stays as fitted: {tx[1] - 60:.1f}'
+        rx, _ = turn_keyforms.turned_position(keys['headwear'][side], np.array([22.0]), np.array([34.0]))
+        assert abs(rx[0] - 22 - way * 20 * turn_keyforms.HANGING_CARRY) < 3, f'the ribbon goes with its tail: {rx[0] - 22:.1f}'
+
+
+def test_hair_tied_on_one_side_or_none_stays_as_fitted():
+    # One tie alone (a side braid, a bun over long hair) would take that side's hair along and not the other's.
+    for ties in (0, 1):
+        front, keys = tails_beside_face(ties)
+        before = [list(keys['back-hair'][s]['back']) for s in ('plus', 'minus')]
+        turn_keyforms.carry_hanging_hair(front, keys, quiet)
+        assert [keys['back-hair'][s]['back'] for s in ('plus', 'minus')] == before, ties
+
+
 if __name__ == '__main__':
     for name, test in list(globals().items()):
         if name.startswith('test_'):

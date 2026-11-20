@@ -2419,6 +2419,94 @@ def glue_under_hat(front, keys, log):
         log(f'glued under the hat {report}')
 
 
+# A twin tail hangs from a tie at the side of the head. Turned drawings keep
+# it near where it was, swinging in towards the neck while the face goes the
+# other way (as a head turning about its own axis would): the head seems to
+# turn under a wig that stays. Where it is tied on both sides, the rear hair
+# hanging beside the face, below TIED_ROOT_DROP of its height, from an ornament
+# tied on it (a ribbon, a scrunchie), and that ornament, are carried along with the head by
+# HANGING_CARRY of the face's move, whole from the tie down; the hair above it
+# comes back to its fitted key over HANGING_SOFT px, the edge feathered by
+# HANGING_FEATHER px.
+TIED_ROOT_DROP = 0.3
+HANGING_CARRY = 0.7
+HANGING_SOFT = 40
+HANGING_FEATHER = 6
+HANGING_TIE_AREA = 0.01
+
+
+def carry_hanging_hair(front, keys, log):
+    """Twin tails and the ties on them go along with the head on a turn."""
+    if 'face' not in keys or 'back-hair' not in keys:
+        return
+    face = front.layers['face'][..., 3] > 0.5 if 'face' in front.layers else None
+    back = [n for n in front.order if family_of(n) == 'back-hair']
+    if face is None or not face.any() or not back:
+        return
+    fy, fx = np.nonzero(face)
+    fx0, fx1, fy0, fy1 = fx.min(), fx.max(), fy.min(), fy.max()
+    hair = np.zeros((front.H, front.W), bool)
+    for n in back:
+        hair |= front.layers[n][..., 3] > 0.5
+    ties = np.zeros((front.H, front.W), bool)
+    for n in front.order:
+        if family_of(n) == 'headwear' or n.split('-')[0] == 'headwear':
+            ties |= front.layers[n][..., 3] > 0.5
+    count, labels, stats, centers = cv2.connectedComponentsWithStats(ties.astype(np.uint8))
+    weight = np.zeros((front.H, front.W), np.float32)
+    rows = np.arange(front.H, dtype=np.float32)[:, None]
+    low = fy0 + TIED_ROOT_DROP * (fy1 - fy0)
+    found = []
+    for zone in (np.arange(front.W) < fx0, np.arange(front.W) > fx1):
+        # The tie: an ornament beside the face, below its top, sitting on rear hair.
+        tied = [k for k in range(1, count)
+                if stats[k, cv2.CC_STAT_AREA] >= HANGING_TIE_AREA * face.sum()
+                and zone[int(centers[k][0])] and centers[k][1] > low
+                and (hair & (labels == k)).sum() > 0.2 * stats[k, cv2.CC_STAT_AREA]]
+        if not tied:
+            continue
+        k = max(tied, key=lambda k: stats[k, cv2.CC_STAT_AREA])
+        top = stats[k, cv2.CC_STAT_TOP]
+        # Whole from the tie down, so the tie and the hair under it go as one.
+        lobe = (hair & zone[None, :]).astype(np.float32) * np.clip((rows - top + HANGING_SOFT) / HANGING_SOFT, 0, 1)
+        lobe[labels == k] = 1
+        weight = np.maximum(weight, lobe)
+        found.append((round(centers[k][0]), round(centers[k][1])))
+    # Tied on both sides: a pair of tails (or of buns). One tied side alone (a
+    # side braid, a bun over long hair) carried would take that side's long hair
+    # with the head and leave the other side's behind.
+    if len(found) < 2:
+        return
+    weight = cv2.GaussianBlur(weight, (0, 0), HANGING_FEATHER)
+    sy, sx = fy[::7], fx[::7]
+    report = {}
+    for side in ('plus', 'minus'):
+        face_key = keys['face'].get(side)
+        if face_key is None:
+            continue
+        tx, ty = turned_position(face_key, sx.astype(np.float32), sy.astype(np.float32))
+        carry = HANGING_CARRY * np.array([np.mean(tx - sx), np.mean(ty - sy)], np.float32)
+        for family in ('back-hair', 'headwear'):
+            key = keys.get(family, {}).get(side)
+            if key is None:
+                continue
+            g = key['grid']
+            x0, y0, x1, y1 = key['box']
+            gx, gy = np.meshgrid(np.linspace(x0, x1, g), np.linspace(y0, y1, g))
+            own = np.asarray(key['back'], np.float32).reshape(-1, 2)
+            # A lattice point that lands on the tail at rest is carried: the tail is
+            # found further along. Where it lands is where it lands once carried.
+            w = np.zeros((g * g, 1), np.float32)
+            for _ in range(4):
+                rx = np.clip(np.round(gx.ravel() + own[:, 0] - w[:, 0] * carry[0]).astype(int), 0, front.W - 1)
+                ry = np.clip(np.round(gy.ravel() + own[:, 1] - w[:, 0] * carry[1]).astype(int), 0, front.H - 1)
+                w = weight[ry, rx][:, None]
+            moved = own - w * carry
+            keys[family][side] = dict(key, back=[float(v) for v in moved.ravel()])
+        report[side] = [round(float(v)) for v in carry]
+    log(f'carried the hanging hair at {found} along with the head {report}')
+
+
 # A hat's lining is drawn only where it shows: under a lock hanging over it
 # there is none, and the lock swinging on a tilt bares the hair behind the
 # hat (and slivers of lining left between its strands). The lining runs on
@@ -3351,6 +3439,7 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
     if not drawn:
         unfold_keys(front, complete, log)
         glue_under_hat(front, complete, log)
+        carry_hanging_hair(front, complete, log)
         hat_under_locks(front, log)
         finish_edges(front, log)
     baked = bake(front, turned, complete, log, turned_pictures, comb=not drawn)
@@ -3378,6 +3467,7 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
                     result['picture'][side] = change
         unfold_keys(front, complete, log)
         glue_under_hat(front, complete, log)
+        carry_hanging_hair(front, complete, log)
         hat_under_locks(front, log)
         finish_edges(front, log)
         result['baked'] = bake(front, turned, complete, log, turned_pictures, comb=True)
