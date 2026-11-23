@@ -186,16 +186,18 @@ class Decomposition:
         out = np.zeros((self.H, self.W, 4), np.float32)
         for name in self.order:
             if name in names:
-                a = self.layers[name][..., 3:4]
-                out[..., :3] = out[..., :3] * (1 - a) + self.layers[name][..., :3] * a
-                out[..., 3:4] = a + out[..., 3:4] * (1 - a)
+                layer = self.layers[name]
+                a = layer[..., 3]
+                na = 1 - a
+                for c in range(3):
+                    out[..., c] = out[..., c] * na + layer[..., c] * a
+                out[..., 3] = a + out[..., 3] * na
         return out
 
     def composite(self):
         out = np.ones((self.H, self.W, 3), np.float32)
         for name in self.order:
-            a = self.layers[name][..., 3:4]
-            out = out * (1 - a) + self.layers[name][..., :3] * a
+            out = over(out, self.layers[name])
         return out
 
     def owner(self):
@@ -234,12 +236,54 @@ def warp_forward(img, offsets, xs, ys):
     return remap(img, sx.reshape(H, W), sy.reshape(H, W))
 
 
-def remap(img, sx, sy):
-    pm = np.concatenate([img[..., :3] * img[..., 3:4], img[..., 3:4]], 2).astype(np.float32)
-    out = cv2.remap(pm, sx.astype(np.float32), sy.astype(np.float32), cv2.INTER_LINEAR,
+# Channel by channel throughout: over (H, W, 3) numpy's inner loop is the three
+# channels, a pixel at a time; over one channel's plane it is the whole plane.
+
+def premultiplied(img):
+    """A layer with its colours weighted by its coverage, as it is resampled."""
+    pm = np.empty(img.shape, np.float32)
+    a = img[..., 3]
+    for c in range(3):
+        np.multiply(img[..., c], a, out=pm[..., c], casting='same_kind')
+    pm[..., 3] = a
+    return pm
+
+
+def unpremultiply(out):
+    """A resampled layer's colours divided back by its coverage, in place: none where there is next to no coverage."""
+    a = out[..., 3]
+    den = np.where(a > 1e-4, a, np.float32(np.inf))
+    for c in range(3):
+        out[..., c] /= den
+    return out
+
+
+def over(rgb, layer):
+    """layer drawn over rgb."""
+    a = layer[..., 3]
+    na = 1 - a
+    out = np.empty_like(rgb)
+    for c in range(3):
+        out[..., c] = rgb[..., c] * na + layer[..., c] * a
+    return out
+
+
+def colour_gap(P, Q):
+    """Per pixel, the mean absolute difference of two drawings' colours."""
+    s = np.abs(P[..., 0] - Q[..., 0])
+    s += np.abs(P[..., 1] - Q[..., 1])
+    s += np.abs(P[..., 2] - Q[..., 2])
+    s /= np.float32(3)
+    return s
+
+
+def remap(img, sx, sy, pm=None):
+    """img drawn where (sx, sy) says each pixel comes from. pm: img premultiplied, when the caller keeps it."""
+    if pm is None:
+        pm = premultiplied(img)
+    out = cv2.remap(pm, np.asarray(sx, np.float32), np.asarray(sy, np.float32), cv2.INTER_LINEAR,
                     borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-    a = out[..., 3:4]
-    return np.concatenate([np.where(a > 1e-4, out[..., :3] / np.maximum(a, 1e-4), 0), a], 2)
+    return unpremultiply(out)
 
 
 def metrics(P, Q):
@@ -316,13 +360,14 @@ def coarse_forward(A, B, grid, search_steps=()):
 
     def cost(off):
         # Rendered through the inverse lattice: the forward warp itself is slow.
-        P = full_backward(A, to_backward(off, xs, ys, grid * 2 - 1, w, h))
+        P = full_backward(A, to_backward(off, xs, ys, grid * 2 - 1, w, h), pm)
         pa, qa = P[..., 3], B[..., 3]
         region = (pa > 0.02) | (qa > 0.02)
         return (np.abs(pa - qa)[region].mean() * 4 +
-                (np.abs(P[..., :3] - B[..., :3]).mean(2) * np.minimum(pa, qa))[region].mean())
+                (colour_gap(P, B) * np.minimum(pa, qa))[region].mean())
 
     if search_steps:
+        pm = premultiplied(A)
         best = cost(offsets)
         for size in search_steps:
             for _ in range(2):
@@ -381,17 +426,24 @@ def _grid_maps(h, w, grid, region):
     return _GRID_MAPS[key]
 
 
-def render_backward(A, back, region, cw=None, ch=None):
+def render_backward(A, back, region, cw=None, ch=None, pm=None):
     h, w = A.shape[:2]
     xx, yy, gx, gy = _grid_maps(h, w, back.shape[0], tuple(int(v) for v in region))
     o = cv2.remap(np.ascontiguousarray(back, np.float32), gx, gy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-    return remap(A, xx + o[..., 0], yy + o[..., 1])
+    return remap(A, xx + o[..., 0], yy + o[..., 1], pm)
 
 
 def refine_backward(A, B, back, smooth=0.0005, steps=(8.0, 4.0, 2.0, 1.0, 0.5), rounds=4):
     """Coordinate descent on the lattice, many points at once: points three
     apart touch cells that do not overlap, so each of the nine classes moves
-    together, judged on the cells around each point from one render."""
+    together, judged on the cells around each point from one render.
+
+    A trial moves only its class's points, and a point moves only the cells
+    around it: a trial is drawn there alone, over the error the lattice had,
+    and the error of the lattice a class leaves is put together from the
+    trials its points took. The sums are the same running sums over the whole
+    error either way, so the search goes exactly as when every trial was
+    drawn whole."""
     grid = back.shape[0]
     h, w = A.shape[:2]
     cw, ch = (w - 1) / (grid - 1), (h - 1) / (grid - 1)
@@ -401,11 +453,14 @@ def refine_backward(A, B, back, smooth=0.0005, steps=(8.0, 4.0, 2.0, 1.0, 0.5), 
     x1 = np.clip(((np.arange(grid) + 1) * cw + 1).astype(int), 0, w)
     y0 = np.clip(((np.arange(grid) - 1) * ch).astype(int), 0, h)
     y1 = np.clip(((np.arange(grid) + 1) * ch + 1).astype(int), 0, h)
+    pm = premultiplied(A)
+    xx, yy, gx, gy = _grid_maps(h, w, grid, (0, 0, w, h))
 
-    def region_costs(lattice):
-        P = render_backward(A, lattice, (0, 0, w, h), cw, ch)
+    def error(P, Q):
         pa, qa = P[..., 3], Q[..., 3]
-        E = np.abs(pa - qa) * 4 + np.abs(P[..., :3] - Q[..., :3]).mean(2) * np.minimum(pa, qa)
+        return np.abs(pa - qa) * 4 + colour_gap(P, Q) * np.minimum(pa, qa)
+
+    def sums(E):
         S = np.zeros((h + 1, w + 1), np.float64)
         S[1:, 1:] = E.cumsum(0).cumsum(1)
         return (S[y1][:, x1] - S[y0][:, x1] - S[y1][:, x0] + S[y0][:, x0])
@@ -415,46 +470,84 @@ def refine_backward(A, B, back, smooth=0.0005, steps=(8.0, 4.0, 2.0, 1.0, 0.5), 
         mean = (padded[:-2, 1:-1] + padded[2:, 1:-1] + padded[1:-1, :-2] + padded[1:-1, 2:]) / 4
         return smooth * ((lattice - mean) ** 2).sum(2) * cw * ch
 
+    # The error of the lattice as it stands, kept up as it moves.
+    E = error(render_backward(A, back, (0, 0, w, h), cw, ch, pm), Q)
     # Only points with something to fit nearby take part.
-    live = region_costs(back) > 0
+    live = sums(E) > 0
     alpha = np.maximum(A[..., 3], Q[..., 3])
     S = np.zeros((h + 1, w + 1)); S[1:, 1:] = (alpha > 0.02).cumsum(0).cumsum(1)
     live |= (S[y1][:, x1] - S[y0][:, x1] - S[y1][:, x0] + S[y0][:, x0]) > 0
-    classes = [(ci, cj) for cj in range(3) for ci in range(3)]
+
+    def bands(lo, hi, taking):
+        """The pixel runs [lo, hi) of the lattice lines taking part, and where each starts when they are laid end to end."""
+        runs, at = [], 0
+        for k in np.nonzero(taking)[0]:
+            if hi[k] > lo[k]:
+                runs.append((int(lo[k]), int(hi[k]), at))
+                at += int(hi[k] - lo[k])
+        return runs
+
+    classes = []
+    for cj in range(3):
+        for ci in range(3):
+            mask = np.zeros((grid, grid), bool)
+            mask[cj::3, ci::3] = True
+            mask &= live
+            if not mask.any():
+                classes.append(None)
+                continue
+            rows, cols = bands(y0, y1, mask.any(1)), bands(x0, x1, mask.any(0))
+            ry = np.concatenate([np.arange(a, b) for a, b, _ in rows])
+            rx = np.concatenate([np.arange(a, b) for a, b, _ in cols])
+            pick = np.ix_(ry, rx)
+            classes.append((mask, rows, cols, np.ascontiguousarray(xx[pick]), np.ascontiguousarray(yy[pick]),
+                            np.ascontiguousarray(gx[pick]), np.ascontiguousarray(gy[pick]), np.ascontiguousarray(Q[pick])))
+
     for step in steps:
         for _ in range(rounds):
             moved = 0
-            for ci, cj in classes:
-                mask = np.zeros((grid, grid), bool)
-                mask[cj::3, ci::3] = True
-                mask &= live
-                if not mask.any():
+            for cls in classes:
+                if cls is None:
                     continue
-                base = region_costs(back) + smoothness(back)
+                mask, rows, cols, sxx, syy, sgx, sgy, sQ = cls
+                base = sums(E) + smoothness(back)
                 best = base.copy()
                 best_move = np.zeros((grid, grid, 2), np.float32)
+                took = np.full((grid, grid), -1, int)
+                trials = []
                 for c in range(2):
                     for sign in (1, -1):
                         trial = back.copy()
                         trial[..., c][mask] += sign * step
-                        cost = region_costs(trial) + smoothness(trial)
+                        o = cv2.remap(np.ascontiguousarray(trial, np.float32), sgx, sgy, cv2.INTER_LINEAR,
+                                      borderMode=cv2.BORDER_REPLICATE)
+                        part = error(remap(A, sxx + o[..., 0], syy + o[..., 1], pm), sQ)
+                        Et = E.copy()
+                        for ya, yb, ty in rows:
+                            for xa, xb, tx in cols:
+                                Et[ya:yb, xa:xb] = part[ty:ty + yb - ya, tx:tx + xb - xa]
+                        cost = sums(Et) + smoothness(trial)
                         better = mask & (cost < best - 1e-6)
                         best[better] = cost[better]
                         best_move[better] = 0
                         best_move[..., c][better] = sign * step
+                        took[better] = len(trials)
+                        trials.append(Et)
                 changed = mask & (best < base - 1e-6)
                 if changed.any():
                     back[changed] += best_move[changed]
                     moved += int(changed.sum())
+                    for j, i in zip(*np.nonzero(changed)):
+                        E[y0[j]:y1[j], x0[i]:x1[i]] = trials[took[j, i]][y0[j]:y1[j], x0[i]:x1[i]]
             if moved == 0:
                 break
     return back
 
 
-def full_backward(A, back):
+def full_backward(A, back, pm=None):
     grid = back.shape[0]
     h, w = A.shape[:2]
-    return render_backward(A, back, (0, 0, w, h), (w - 1) / (grid - 1), (h - 1) / (grid - 1))
+    return render_backward(A, back, (0, 0, w, h), (w - 1) / (grid - 1), (h - 1) / (grid - 1), pm)
 
 
 def fit_family(front, turned, names, family, log):
@@ -506,10 +599,10 @@ def composite_of(front, names):
     alpha = np.zeros((front.H, front.W), np.float32)
     for i, name in enumerate(front.order):
         if name in names:
-            a = front.layers[name][..., 3:4]
-            rgb = rgb * (1 - a) + front.layers[name][..., :3] * a
-            top[a[..., 0] > 0.5] = i
-            alpha = np.maximum(alpha, a[..., 0])
+            layer = front.layers[name]
+            rgb = over(rgb, layer)
+            top[layer[..., 3] > 0.5] = i
+            alpha = np.maximum(alpha, layer[..., 3])
     return rgb, top, alpha
 
 
@@ -1522,32 +1615,65 @@ def family_of(name):
     return base if base in ACCESSORIES else None
 
 
-def lattice_maps(key, W, H):
-    """Per canvas pixel, the backward offset of a key (its lattice clamped at the box, as the runtime samples it)."""
+def lattice_maps(key, W, H, region=None):
+    """Per canvas pixel, the backward offset of a key (its lattice clamped at the box, as the runtime samples it).
+    region: (xa, ya, xb, yb), those pixels alone."""
     x0, y0, x1, y1 = key['box']
     g = key['grid']
     back = np.asarray(key['back'], np.float32).reshape(g, g, 2)
-    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+    xa, ya, xb, yb = region or (0, 0, W, H)
+    yy, xx = np.mgrid[ya:yb, xa:xb].astype(np.float32)
     gx = np.clip((xx - x0) / max(1e-6, x1 - x0) * (g - 1), 0, g - 1).astype(np.float32)
     gy = np.clip((yy - y0) / max(1e-6, y1 - y0) * (g - 1), 0, g - 1).astype(np.float32)
     o = cv2.remap(back, gx, gy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
     return xx + o[..., 0], yy + o[..., 1]
 
 
-def render_keys(layers, keys, side, W, H):
-    """The front layers drawn at one key, back to front: RGB over white and which layer is on top."""
+def drawn_box(layer):
+    """The pixel box (xa, ya, xb, yb) a layer has any coverage in; None for an empty one."""
+    a = layer[..., 3] > 0
+    ys = np.flatnonzero(a.any(1))
+    if not len(ys):
+        return None
+    xs = np.flatnonzero(a.any(0))
+    return int(xs[0]), int(ys[0]), int(xs[-1]) + 1, int(ys[-1]) + 1
+
+
+def render_keys(layers, keys, side, W, H, kept=None):
+    """The front layers drawn at one key, back to front: RGB over white and which layer is on top.
+
+    A layer is drawn only where it can show: within its own box, or, moved by
+    a key, within that box grown by the key's largest offset (a lattice moves
+    no pixel further than its furthest point). Elsewhere it has no coverage
+    and leaves what is under it as it is. kept: a dict the caller keeps while
+    the layers stay as they are, for their boxes and weighted colours."""
     rgb = np.ones((H, W, 3), np.float32)
     top = np.full((H, W), -1, np.int32)
-    maps = {}
+    kept = {} if kept is None else kept
     for i, (name, family, layer) in enumerate(layers):
+        if i not in kept:
+            box = drawn_box(layer)
+            if box is None:
+                kept[i] = None
+            else:
+                xa, ya, xb, yb = box
+                kept[i] = (box, premultiplied(layer[ya:yb, xa:xb]))
+        if kept[i] is None:
+            continue
+        (xa, ya, xb, yb), weighted = kept[i]
         key = keys.get(family, {}).get(side) if family else None
-        if key is not None:
-            if family not in maps:
-                maps[family] = lattice_maps(key, W, H)
-            layer = remap(layer, *maps[family])
-        a = layer[..., 3:4]
-        rgb = rgb * (1 - a) + layer[..., :3] * a
-        top[a[..., 0] > 0.5] = i
+        if key is None:
+            region, piece = (xa, ya, xb, yb), layer[ya:yb, xa:xb]
+        else:
+            reach = int(np.ceil(np.abs(np.asarray(key['back'], np.float32)).max())) + 2
+            region = (max(0, xa - reach), max(0, ya - reach), min(W, xb + reach), min(H, yb + reach))
+            sx, sy = lattice_maps(key, W, H, region)
+            # The layer's own box is all of it there is to read: past it there is nothing, as on the whole canvas.
+            out = cv2.remap(weighted, sx - xa, sy - ya, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+            piece = unpremultiply(out)
+        ra, rb, rc, rd = region
+        rgb[rb:rd, ra:rc] = over(rgb[rb:rd, ra:rc], piece)
+        top[rb:rd, ra:rc][piece[..., 3] > 0.5] = i
     return rgb, top
 
 
@@ -1641,7 +1767,8 @@ def refine_on_picture(front, keys, side, picture, extra, log, own=()):
         return None
     region = np.zeros((H, W), bool)
     region[max(0, ys.min() - 60):ys.max() + 60, max(0, xs.min() - 60):xs.max() + 60] = True
-    rgb, top = render_keys(layers, keys, side, W, H)
+    kept = {}
+    rgb, top = render_keys(layers, keys, side, W, H, kept)
     start = before = edge_distance(rgb, picture, region)
     for round_ in range(PICTURE_ROUNDS):
         smooth = PICTURE_SMOOTH * (PICTURE_FIRST_SMOOTH if round_ == 0 else 1)
@@ -1675,7 +1802,7 @@ def refine_on_picture(front, keys, side, picture, extra, log, own=()):
             iris = riding_iris(keys, family, side)
             if iris:
                 trial[iris] = dict(keys[iris], **{side: dict(trial[family][side], rides='eye')})
-        new_rgb, new_top = render_keys(layers, trial, side, W, H)
+        new_rgb, new_top = render_keys(layers, trial, side, W, H, kept)
         # Each part keeps its change only if its own outline draws closer.
         accepted = []
         for family in [f for f in trial if trial[f] is not keys[f] and not trial[f][side].get('rides')]:
@@ -1691,7 +1818,7 @@ def refine_on_picture(front, keys, side, picture, extra, log, own=()):
                 accepted.append(f'{family} {old_d:.2f}->{new_d:.2f}')
         if not accepted:
             break
-        rgb, top = render_keys(layers, keys, side, W, H)
+        rgb, top = render_keys(layers, keys, side, W, H, kept)
         after = edge_distance(rgb, picture, region)
         log(f'{side:5s} picture: {before:.2f} -> {after:.2f} ({", ".join(accepted)})')
         before = after
@@ -1862,8 +1989,7 @@ def folds(back, box, min_det=LOCK_MIN_DET):
 
 
 def _over(rgb, a, src):
-    sa = src[..., 3:4]
-    return rgb * (1 - sa) + src[..., :3] * sa, src[..., 3] + a * (1 - src[..., 3])
+    return over(rgb, src), src[..., 3] + a * (1 - src[..., 3])
 
 
 def fit_locks_on_turned(front, turned, keys, side, log):
@@ -1890,6 +2016,7 @@ def fit_locks_on_turned(front, turned, keys, side, log):
     Trgb = small(T[cy0:cy1, cx0:cx1, :3])
     F = small(feature[cy0:cy1, cx0:cx1].astype(np.float32))
     layers = {n: small(front.layers[n]) for n in names}
+    weighted = {n: premultiplied(layers[n]) for n in names}
     h, w = Ta.shape
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
     px = cx0 + (xx + 0.5) / LOCK_SCALE - 0.5
@@ -1909,11 +2036,11 @@ def fit_locks_on_turned(front, turned, keys, side, log):
         gx = np.clip((px - x0) / max(1e-6, x1 - x0) * (g - 1), 0, g - 1).astype(np.float32)
         gy = np.clip((py - y0) / max(1e-6, y1 - y0) * (g - 1), 0, g - 1).astype(np.float32)
         o = cv2.remap(back, gx, gy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-        return remap(layers[n], (px + o[..., 0] + 0.5) * LOCK_SCALE - 0.5, (py + o[..., 1] + 0.5) * LOCK_SCALE - 0.5)
+        return remap(layers[n], (px + o[..., 0] + 0.5) * LOCK_SCALE - 0.5, (py + o[..., 1] + 0.5) * LOCK_SCALE - 0.5, weighted[n])
 
     def cost(rgb, a):
         both = np.minimum(a, Ta)
-        return float((np.abs(a - Ta) * 4 + np.abs(rgb - Trgb).mean(2) * both + a * F * LOCK_FEATURE_WEIGHT).mean())
+        return float((np.abs(a - Ta) * 4 + colour_gap(rgb, Trgb) * both + a * F * LOCK_FEATURE_WEIGHT).mean())
 
     rendered = {n: render(n) for n in names}
     rgb, a = np.zeros((h, w, 3), np.float32), np.zeros((h, w), np.float32)
