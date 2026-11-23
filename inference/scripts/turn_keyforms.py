@@ -478,10 +478,19 @@ def refine_backward(A, B, back, smooth=0.0005, steps=(8.0, 4.0, 2.0, 1.0, 0.5), 
         pa, qa = P[..., 3], Q[..., 3]
         return np.abs(pa - qa) * 4 + colour_gap(P, Q) * np.minimum(pa, qa)
 
+    # The boxes' sums are differences of the error's running sums, down the
+    # columns and then along the rows. They are read only on the rows the
+    # boxes start and end on, so only those rows are summed along: the same
+    # float32 sums as over the whole picture.
+    rows_read = np.unique(np.concatenate([y0, y1]))
+    at_y0, at_y1 = np.searchsorted(rows_read, y0), np.searchsorted(rows_read, y1)
+
     def sums(E):
-        S = np.zeros((h + 1, w + 1), np.float64)
-        S[1:, 1:] = E.cumsum(0).cumsum(1)
-        return (S[y1][:, x1] - S[y0][:, x1] - S[y1][:, x0] + S[y0][:, x0])
+        down = E.cumsum(0)
+        S = np.zeros((len(rows_read), w + 1), np.float64)
+        below = rows_read > 0
+        S[below, 1:] = down[rows_read[below] - 1].cumsum(1)
+        return (S[at_y1][:, x1] - S[at_y0][:, x1] - S[at_y1][:, x0] + S[at_y0][:, x0])
 
     def smoothness(lattice):
         padded = np.pad(lattice, ((1, 1), (1, 1), (0, 0)), mode='edge')
@@ -521,6 +530,7 @@ def refine_backward(A, B, back, smooth=0.0005, steps=(8.0, 4.0, 2.0, 1.0, 0.5), 
             classes.append((mask, rows, cols, np.ascontiguousarray(xx[pick]), np.ascontiguousarray(yy[pick]),
                             np.ascontiguousarray(gx[pick]), np.ascontiguousarray(gy[pick]), np.ascontiguousarray(Q[pick])))
 
+    stood = None
     for step in steps:
         for _ in range(rounds):
             moved = 0
@@ -528,7 +538,10 @@ def refine_backward(A, B, back, smooth=0.0005, steps=(8.0, 4.0, 2.0, 1.0, 0.5), 
                 if cls is None:
                     continue
                 mask, rows, cols, sxx, syy, sgx, sgy, sQ = cls
-                base = sums(E) + smoothness(back)
+                if stood is None:
+                    # As the lattice stands: the same for the next class too when this one moves nothing.
+                    stood = sums(E)
+                base = stood + smoothness(back)
                 best = base.copy()
                 best_move = np.zeros((grid, grid, 2), np.float32)
                 took = np.full((grid, grid), -1, int)
@@ -557,6 +570,7 @@ def refine_backward(A, B, back, smooth=0.0005, steps=(8.0, 4.0, 2.0, 1.0, 0.5), 
                     moved += int(changed.sum())
                     for j, i in zip(*np.nonzero(changed)):
                         E[y0[j]:y1[j], x0[i]:x1[i]] = trials[took[j, i]][y0[j]:y1[j], x0[i]:x1[i]]
+                    stood = None
             if moved == 0:
                 break
     return back
@@ -1707,8 +1721,15 @@ def head_edges(rgb):
                                   cv2.COLOR_RGB2GRAY), 60, 140) > 0
 
 
-def edge_distance(a, b, region):
-    ea, eb = head_edges(a) & region, head_edges(b) & region
+def edge_distance(a, b, region, found=None):
+    """found: a dict the caller keeps while the pictures stay as they are, for their outlines (by the array itself)."""
+    if found is None:
+        ea, eb = head_edges(a) & region, head_edges(b) & region
+    else:
+        for picture in (a, b):
+            if id(picture) not in found:
+                found[id(picture)] = (picture, head_edges(picture))
+        ea, eb = found[id(a)][1] & region, found[id(b)][1] & region
     if ea.sum() < 20 or eb.sum() < 20:
         return 0.0
     da = cv2.distanceTransform((~eb).astype(np.uint8), cv2.DIST_L2, 5)[ea]
@@ -1793,7 +1814,8 @@ def refine_on_picture(front, keys, side, picture, extra, log, own=()):
     region[max(0, ys.min() - 60):ys.max() + 60, max(0, xs.min() - 60):xs.max() + 60] = True
     kept = {}
     rgb, top = render_keys(layers, keys, side, W, H, kept)
-    start = before = edge_distance(rgb, picture, region)
+    found = {}
+    start = before = edge_distance(rgb, picture, region, found)
     for round_ in range(PICTURE_ROUNDS):
         smooth = PICTURE_SMOOTH * (PICTURE_FIRST_SMOOTH if round_ == 0 else 1)
         flow, agree = picture_flow(rgb, picture)
@@ -1833,8 +1855,8 @@ def refine_on_picture(front, keys, side, picture, extra, log, own=()):
             iris = riding_iris(keys, family, side)
             mine = np.array([i for i, (_, f, _) in enumerate(layers) if f in members_of(keys, family, side)])
             near = cv2.dilate((np.isin(top, mine) | np.isin(new_top, mine)).astype(np.uint8), np.ones((9, 9), np.uint8)) > 0
-            old_d = edge_distance(rgb, picture, region & near)
-            new_d = edge_distance(new_rgb, picture, region & near)
+            old_d = edge_distance(rgb, picture, region & near, found)
+            new_d = edge_distance(new_rgb, picture, region & near, found)
             if new_d < old_d - 0.02:
                 keys[family] = trial[family]
                 if iris:
@@ -1843,7 +1865,9 @@ def refine_on_picture(front, keys, side, picture, extra, log, own=()):
         if not accepted:
             break
         rgb, top = render_keys(layers, keys, side, W, H, kept)
-        after = edge_distance(rgb, picture, region)
+        # The drawings of the round gone by are not read again.
+        found = {k: v for k, v in found.items() if v[0] is picture}
+        after = edge_distance(rgb, picture, region, found)
         log(f'{side:5s} picture: {before:.2f} -> {after:.2f} ({", ".join(accepted)})')
         before = after
     log(f'{side:5s} picture total {start:.2f} -> {before:.2f}')
