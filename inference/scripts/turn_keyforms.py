@@ -1729,22 +1729,34 @@ def headwear_error(front, keys, side, key, picture, box):
 
 
 def refit_lattice(key, px, py, target, smooth=PICTURE_SMOOTH):
-    """Least squares of a lattice through backward offsets measured at turned points, smooth, held near the old one."""
+    """Least squares of a lattice through backward offsets measured at turned points, smooth, held near the old one.
+
+    Solved by its normal equations: a measured point weighs on the four lattice
+    points around it and no other, so the n x n system is summed straight from
+    the points (in float64) instead of factoring the points x n matrix. The
+    lattice comes out the same to about its last float32 bit."""
     x0, y0, x1, y1 = key['box']
     g = key['grid']
     n = g * g
-    old = np.asarray(key['back'], np.float32).reshape(n, 2)
+    old = np.asarray(key['back'], np.float32).reshape(n, 2).astype(np.float64)
     xs = np.linspace(x0, x1, g); ys = np.linspace(y0, y1, g)
     idx, wts = bilinear_weights(px, py, xs, ys)
-    M = np.zeros((len(px), n), np.float32)
-    np.put_along_axis(M, idx, wts, 1)
+    w = wts.astype(np.float32).astype(np.float64)
     scale = np.sqrt(len(px) / n)
-    L = laplacian(g)
-    A = np.vstack([M, L * smooth * scale, np.eye(n, dtype=np.float32) * PICTURE_HOLD * scale])
-    out = np.zeros((n, 2), np.float32)
+    L = laplacian(g).astype(np.float64) * (smooth * scale)
+    hold = (PICTURE_HOLD * scale) ** 2
+    N = np.zeros(n * n)
+    for i in range(4):
+        for j in range(4):
+            N += np.bincount(idx[:, i] * n + idx[:, j], weights=w[:, i] * w[:, j], minlength=n * n)
+    N = N.reshape(n, n) + L.T @ L + np.eye(n) * hold
+    r = np.zeros((n, 2))
     for c in range(2):
-        rhs = np.concatenate([target[:, c], L @ old[:, c] * smooth * scale, old[:, c] * PICTURE_HOLD * scale])
-        out[:, c] = np.linalg.lstsq(A, rhs, rcond=None)[0]
+        t = target[:, c].astype(np.float64)
+        for i in range(4):
+            r[:, c] += np.bincount(idx[:, i], weights=w[:, i] * t, minlength=n)
+    r += L.T @ (L @ old) + old * hold
+    out = np.linalg.solve(N, r).astype(np.float32)
     return dict(key, back=[float(v) for v in out.reshape(-1)])
 
 
