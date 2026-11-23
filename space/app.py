@@ -556,6 +556,15 @@ def figure_stitch(image, whole_psd, upper_psd, middle_psd, lower_psd, tiles):
     return out
 
 
+# How many calls of one endpoint run at once (Gradio's own default is one).
+# ZeroGPU gives each decomposition a GPU of its own, so Myriad's five (a
+# figure's twelve) need not wait in line for one another; the light checks
+# each decode a PSD or two on the CPU. The fits (keyforms, body_keys), the
+# stitching and the enlarging fill the container's CPUs alone and stay at one.
+GPU_AT_ONCE = 6
+LIGHT_AT_ONCE = 4
+
+
 with gr.Blocks(title="See-through: Layer Decomposition") as demo:
     gr.Markdown(
         "# See-through: Single-image Layer Decomposition for Anime Characters\n\n"
@@ -624,7 +633,7 @@ with gr.Blocks(title="See-through: Layer Decomposition") as demo:
             fn=decompose,
             inputs=[canvas_image, canvas_size, canvas_seed, canvas_split, canvas_scale, canvas_condition],
             outputs=[canvas_psd, canvas_gallery, canvas_depth],
-            api_name="decompose",
+            api_name="decompose", concurrency_limit=GPU_AT_ONCE,
         )
         lean_tags = gr.Textbox(value="front hair,back hair,head,neck,neckwear", label="Body tags (lean)")
         lean_steps = gr.Slider(minimum=10, maximum=30, value=30, step=1, label="Steps (lean)")
@@ -633,7 +642,7 @@ with gr.Blocks(title="See-through: Layer Decomposition") as demo:
             fn=decompose_lean,
             inputs=[canvas_image, canvas_size, canvas_seed, canvas_split, lean_tags, lean_steps],
             outputs=[canvas_psd, canvas_gallery, canvas_depth],
-            api_name="decompose_lean",
+            api_name="decompose_lean", concurrency_limit=GPU_AT_ONCE,
         )
         canvas_hair = gr.Radio(choices=["canvas", "head"], value="head", label="Hair pass")
         canvas_hair_btn = gr.Button("Run with hair pass")
@@ -641,7 +650,7 @@ with gr.Blocks(title="See-through: Layer Decomposition") as demo:
             fn=decompose_hair,
             inputs=[canvas_image, canvas_size, canvas_seed, canvas_split, canvas_hair],
             outputs=[canvas_psd, canvas_gallery, canvas_depth],
-            api_name="decompose_hair",
+            api_name="decompose_hair", concurrency_limit=GPU_AT_ONCE,
         )
 
     with gr.Tab("Hidden region"):
@@ -704,14 +713,14 @@ with gr.Blocks(title="See-through: Layer Decomposition") as demo:
             check_psd = gr.File(label="Decomposition PSD to check")
             check_json = gr.JSON(label="Check")
         check_btn = gr.Button("Check")
-        check_btn.click(fn=check, inputs=[check_psd], outputs=[check_json], api_name="check")
+        check_btn.click(fn=check, inputs=[check_psd], outputs=[check_json], api_name="check", concurrency_limit=LIGHT_AT_ONCE)
         turns_json = gr.JSON(label="Turned pictures")
         turns_btn = gr.Button("Check the turned pictures (front PSD and pictures above)")
         turns_btn.click(
             fn=check_turns,
             inputs=[key_front, pic_front, pic_right, pic_left, pic_up, pic_down],
             outputs=[turns_json],
-            api_name="check_turns",
+            api_name="check_turns", concurrency_limit=LIGHT_AT_ONCE,
         )
         with gr.Row():
             judge_psd = gr.File(label="One turned decomposition", file_types=[".psd"])
@@ -723,7 +732,7 @@ with gr.Blocks(title="See-through: Layer Decomposition") as demo:
             fn=judge_turn,
             inputs=[key_front, judge_psd, pic_front, judge_png, judge_side],
             outputs=[judge_json],
-            api_name="judge_turn",
+            api_name="judge_turn", concurrency_limit=LIGHT_AT_ONCE,
         )
 
     with gr.Tab("Figure head"):
@@ -743,12 +752,12 @@ with gr.Blocks(title="See-through: Layer Decomposition") as demo:
                 fig_found = gr.JSON(label="Head box")
                 fig_crop = gr.File(label="Head picture")
                 fig_out_json = gr.File(label="Keyforms on the figure")
-        fig_btn.click(fn=figure_head, inputs=[fig_psd, fig_image], outputs=[fig_found, fig_crop], api_name="figure_head")
+        fig_btn.click(fn=figure_head, inputs=[fig_psd, fig_image], outputs=[fig_found, fig_crop], api_name="figure_head", concurrency_limit=LIGHT_AT_ONCE)
         keys_btn.click(
             fn=figure_keys,
             inputs=[fig_image, fig_psd, fig_keys, fig_box],
             outputs=[fig_out_json],
-            api_name="figure_keys",
+            api_name="figure_keys", concurrency_limit=LIGHT_AT_ONCE,
         )
         with gr.Row():
             hair_head = gr.File(label="Head's decomposition (baked, front hair in locks)", file_types=[".psd"])
@@ -783,7 +792,7 @@ with gr.Blocks(title="See-through: Layer Decomposition") as demo:
                 st_out = gr.File(label="Figure PSD")
         up_btn.click(fn=upscale, inputs=[up_in], outputs=[up_out], api_name="upscale")
         plan_btn.click(fn=figure_plan, inputs=[plan_psd, up_in], outputs=[plan_json, plan_upper, plan_middle, plan_lower],
-                       api_name="figure_plan")
+                       api_name="figure_plan", concurrency_limit=LIGHT_AT_ONCE)
         st_btn.click(fn=figure_stitch, inputs=[up_in, plan_psd, st_upper, st_middle, st_lower, st_plan], outputs=[st_out],
                      api_name="figure_stitch")
 
