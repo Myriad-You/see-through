@@ -3025,6 +3025,19 @@ def bake(front, turned, keys, log, pictures=None, comb=False):
     """
     owners = {side: t.owner() for side, t in turned.items()}
     report = {}
+    sources = {}
+
+    def source(side, t, names):
+        """A turned decomposition's part, with the picture's colours where the two agree: the same for every layer that asks."""
+        kept = (side, tuple(names))
+        if kept not in sources:
+            src = t.family(names)
+            if pictures and side in pictures:
+                # The picture where the decomposition's part is what it shows (not other art it took in).
+                agrees = picture_distance(src[..., :3], pictures[side]) < BURIED_MATCH
+                src = np.concatenate([np.where(agrees[..., None], pictures[side], src[..., :3]), src[..., 3:4]], 2)
+            sources[kept] = src
+        return sources[kept]
     if not hasattr(front, 'unbaked'):
         front.unbaked = {name: front.layers[name][..., :3].copy() for name in front.order
                          if BAKED.get(name) or lock_family(name)}
@@ -3060,11 +3073,15 @@ def bake(front, turned, keys, log, pictures=None, comb=False):
             ix = np.clip(np.round(tx).astype(int), 0, front.W - 1); iy = np.clip(np.round(ty).astype(int), 0, front.H - 1)
             names = turned_names(family)
             mine = np.isin(owners[side][iy, ix], names)
+            bare = None
+            if family == 'back-hair' or comb:
+                # Whether what lies over the part, at its keys for this turn, leaves it bare there.
+                bare = keyed_alpha(front, front.order[li + 1:], keys, side)[iy, ix] < 0.5
             if family == 'back-hair':
                 # Where nothing keyed covers it at this turn, the back hair is what shows of
                 # the scalp there: whatever hair the turn has on top.
                 names = names + ['front hair']
-                exposed = keyed_alpha(front, front.order[li + 1:], keys, side)[iy, ix] < 0.5
+                exposed = bare
                 revealed |= exposed
                 mine |= exposed & np.isin(owners[side][iy, ix], names)
             if comb:
@@ -3073,13 +3090,9 @@ def bake(front, turned, keys, log, pictures=None, comb=False):
                 # there (the fringe's lower strands). Only what the parts over it,
                 # at their keys, leave bare is taken; the rest keeps the
                 # decomposition's own strands.
-                mine &= keyed_alpha(front, front.order[li + 1:], keys, side)[iy, ix] < 0.5
+                mine &= bare
             mine &= ~filled[qy, qx]
-            src = t.family(names)
-            if pictures and side in pictures:
-                # The picture where the decomposition's part is what it shows (not other art it took in).
-                agrees = picture_distance(src[..., :3], pictures[side]) < BURIED_MATCH
-                src = np.concatenate([np.where(agrees[..., None], pictures[side], src[..., :3]), src[..., 3:4]], 2)
+            src = source(side, t, names)
             x0 = np.clip(np.floor(tx).astype(int), 0, front.W - 2); y0 = np.clip(np.floor(ty).astype(int), 0, front.H - 2)
             fx = np.clip(tx - x0, 0, 1)[:, None]; fy = np.clip(ty - y0, 0, 1)[:, None]
             vals = (src[y0, x0] * (1 - fx) * (1 - fy) + src[y0, x0 + 1] * fx * (1 - fy) +
@@ -3121,7 +3134,8 @@ def bake(front, turned, keys, log, pictures=None, comb=False):
     return report
 
 
-def save_psd(front, path):
+def save_psd(front, path, flattened=True):
+    """flattened: with the picture of all its layers together, as a PSD handed out carries (no reader of ours wants it)."""
     from PIL import Image
     out = PSDImage.new(mode='RGBA', size=(front.W, front.H), depth=8)
     for name in front.order:
@@ -3132,6 +3146,8 @@ def save_psd(front, path):
         t, b, l, r = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
         crop = (np.clip(f[t:b, l:r], 0, 1) * 255 + 0.5).astype(np.uint8)
         out.create_pixel_layer(Image.fromarray(crop, 'RGBA'), name=name, top=int(t), left=int(l), opacity=255)
+    if not flattened:
+        out._updated = False
     out.save(path)
 
 
@@ -3425,7 +3441,13 @@ def host_report():
         quota = open('/sys/fs/cgroup/cpu.max').read().strip()
     except OSError:
         quota = None
-    return dict(cpu_count=os.cpu_count(), affinity=affinity, cpu_max=quota)
+    # How many threads the libraries under the fit start for themselves: past the quota they only wait on each other.
+    try:
+        from threadpoolctl import threadpool_info
+        blas = [dict(api=pool.get('internal_api'), threads=pool.get('num_threads')) for pool in threadpool_info()]
+    except Exception:
+        blas = None
+    return dict(cpu_count=os.cpu_count(), affinity=affinity, cpu_max=quota, cv_threads=cv2.getNumThreads(), blas=blas)
 
 
 def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
@@ -3564,7 +3586,7 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
     if locks >= 2:
         with tempfile.TemporaryDirectory() as tmp:
             split_path = os.path.join(tmp, 'split.psd')
-            save_psd(front, split_path)
+            save_psd(front, split_path, flattened=False)
             with ProcessPoolExecutor(max_workers=workers) as pool:
                 jobs = {side: pool.submit(_fit_locks_direction, split_path, complete, side, path,
                                           pictures.get(side) if pictures else None)
@@ -3612,7 +3634,7 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
         # uncover is taken again for the moved keys.
         with tempfile.TemporaryDirectory() as tmp:
             baked_path = os.path.join(tmp, 'baked.psd')
-            save_psd(front, baked_path)
+            save_psd(front, baked_path, flattened=False)
             with ProcessPoolExecutor(max_workers=workers) as pool:
                 jobs = {side: pool.submit(_refine_direction, baked_path, complete, side, pictures['front'], pictures[side], recovered, own)
                         for side in turned if side in pictures}
