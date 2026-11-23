@@ -165,6 +165,17 @@ def turned_names(family):
 
 # ---------------------------------------------------------------- layers
 
+def drawn_box(layer):
+    """The pixel box (xa, ya, xb, yb) a layer has any coverage in; None for an empty one.
+    Outside it the layer leaves whatever it is drawn over as it was, to the bit."""
+    a = layer[..., 3] > 0
+    ys = np.flatnonzero(a.any(1))
+    if not len(ys):
+        return None
+    xs = np.flatnonzero(a.any(0))
+    return int(xs[0]), int(ys[0]), int(xs[-1]) + 1, int(ys[-1]) + 1
+
+
 class Decomposition:
     def __init__(self, path):
         self.psd = PSDImage.open(path)
@@ -186,25 +197,32 @@ class Decomposition:
         out = np.zeros((self.H, self.W, 4), np.float32)
         for name in self.order:
             if name in names:
-                layer = self.layers[name]
+                box = drawn_box(self.layers[name])
+                if box is None:
+                    continue
+                xa, ya, xb, yb = box
+                layer, part = self.layers[name][ya:yb, xa:xb], out[ya:yb, xa:xb]
                 a = layer[..., 3]
                 na = 1 - a
                 for c in range(3):
-                    out[..., c] = out[..., c] * na + layer[..., c] * a
-                out[..., 3] = a + out[..., 3] * na
+                    part[..., c] = part[..., c] * na + layer[..., c] * a
+                part[..., 3] = a + part[..., 3] * na
         return out
 
     def composite(self):
         out = np.ones((self.H, self.W, 3), np.float32)
         for name in self.order:
-            out = over(out, self.layers[name])
+            box = drawn_box(self.layers[name])
+            if box is not None:
+                xa, ya, xb, yb = box
+                out[ya:yb, xa:xb] = over(out[ya:yb, xa:xb], self.layers[name][ya:yb, xa:xb])
         return out
 
     def owner(self):
-        owner = np.full((self.H, self.W), '', dtype=object)
-        for name in self.order:
-            owner[self.layers[name][..., 3] > 0.5] = name
-        return owner
+        top = np.full((self.H, self.W), len(self.order), np.int32)
+        for i, name in enumerate(self.order):
+            top[self.layers[name][..., 3] > 0.5] = i
+        return np.array(list(self.order) + [''], dtype=object)[top]
 
 
 # ---------------------------------------------------------------- lattices
@@ -599,10 +617,14 @@ def composite_of(front, names):
     alpha = np.zeros((front.H, front.W), np.float32)
     for i, name in enumerate(front.order):
         if name in names:
-            layer = front.layers[name]
-            rgb = over(rgb, layer)
-            top[layer[..., 3] > 0.5] = i
-            alpha = np.maximum(alpha, layer[..., 3])
+            box = drawn_box(front.layers[name])
+            if box is None:
+                continue
+            xa, ya, xb, yb = box
+            layer = front.layers[name][ya:yb, xa:xb]
+            rgb[ya:yb, xa:xb] = over(rgb[ya:yb, xa:xb], layer)
+            top[ya:yb, xa:xb][layer[..., 3] > 0.5] = i
+            alpha[ya:yb, xa:xb] = np.maximum(alpha[ya:yb, xa:xb], layer[..., 3])
     return rgb, top, alpha
 
 
@@ -1629,16 +1651,6 @@ def lattice_maps(key, W, H, region=None):
     return xx + o[..., 0], yy + o[..., 1]
 
 
-def drawn_box(layer):
-    """The pixel box (xa, ya, xb, yb) a layer has any coverage in; None for an empty one."""
-    a = layer[..., 3] > 0
-    ys = np.flatnonzero(a.any(1))
-    if not len(ys):
-        return None
-    xs = np.flatnonzero(a.any(0))
-    return int(xs[0]), int(ys[0]), int(xs[-1]) + 1, int(ys[-1]) + 1
-
-
 def render_keys(layers, keys, side, W, H, kept=None):
     """The front layers drawn at one key, back to front: RGB over white and which layer is on top.
 
@@ -2029,12 +2041,19 @@ def fit_locks_on_turned(front, turned, keys, side, log):
         back = np.asarray(key['back'], np.float32).reshape(g, g, 2)
         return key, back + cv2.resize(corr[n], (g, g), interpolation=cv2.INTER_LINEAR)
 
-    def render(n):
-        key, back = lattice(n)
+    def on_lattice(n):
+        """Where each pixel sits on a lock's lattice: the same through the whole search."""
+        key = keys[lock_family(n)][side]
         x0, y0, x1, y1 = key['box']
         g = key['grid']
-        gx = np.clip((px - x0) / max(1e-6, x1 - x0) * (g - 1), 0, g - 1).astype(np.float32)
-        gy = np.clip((py - y0) / max(1e-6, y1 - y0) * (g - 1), 0, g - 1).astype(np.float32)
+        return (np.clip((px - x0) / max(1e-6, x1 - x0) * (g - 1), 0, g - 1).astype(np.float32),
+                np.clip((py - y0) / max(1e-6, y1 - y0) * (g - 1), 0, g - 1).astype(np.float32))
+
+    placed = {n: on_lattice(n) for n in names}
+
+    def render(n):
+        key, back = lattice(n)
+        gx, gy = placed[n]
         o = cv2.remap(back, gx, gy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
         return remap(layers[n], (px + o[..., 0] + 0.5) * LOCK_SCALE - 0.5, (py + o[..., 1] + 0.5) * LOCK_SCALE - 0.5, weighted[n])
 
@@ -2058,6 +2077,7 @@ def fit_locks_on_turned(front, turned, keys, side, log):
                 above_rgb, above_a = np.zeros((h, w, 3), np.float32), np.zeros((h, w), np.float32)
                 for m in names[k + 1:]:
                     above_rgb, above_a = _over(above_rgb, above_a, rendered[m])
+                clear = 1 - above_a
                 for j in range(LOCK_COARSE):
                     for i in range(LOCK_COARSE):
                         for c in range(2):
@@ -2067,7 +2087,9 @@ def fit_locks_on_turned(front, turned, keys, side, log):
                                 if not folds(back, key['box']):
                                     r = render(n)
                                     mid_rgb, mid_a = _over(below_rgb, below_a, r)
-                                    e = cost(mid_rgb * (1 - above_a[..., None]) + above_rgb, above_a + mid_a * (1 - above_a))
+                                    for channel in range(3):
+                                        mid_rgb[..., channel] = mid_rgb[..., channel] * clear + above_rgb[..., channel]
+                                    e = cost(mid_rgb, above_a + mid_a * clear)
                                     if e < best - 1e-7:
                                         best = e
                                         rendered[n] = r
@@ -2319,10 +2341,15 @@ def cut_by_picture(front, picture, log, lift=False):
     """
     report = {}
     hair = [n for n in front.order if n == 'front hair' or LOCK_LAYER.match(n)]
+    owner = now = None
     for name in [n for n in PAINTED_OVER if n in front.layers] + hair:
-        on_top = front.owner() == name
+        if owner is None:
+            # As the front stands: the same for every part until one is cut.
+            owner = front.owner()
+            now = picture_distance(front.composite(), picture)
+        stale = False
+        on_top = owner == name
         under, below, _ = composite_of(front, [n for n in front.order if n != name])
-        now = picture_distance(front.composite(), picture)
         then = picture_distance(under, picture)
         cut = on_top & (now > CUT_DIFFERENT) & (then < CUT_MATCH) & (now - then > CUT_GAIN)
         # Thin strokes too (a guessed edge under the chin): the picture shows what lies under them.
@@ -2331,6 +2358,8 @@ def cut_by_picture(front, picture, log, lift=False):
         cut = np.isin(lab, [k for k in range(1, n) if stats[k, 4] >= CUT_MIN_AREA])
         if lift and cut.any():
             cut = lift_ornaments(front, name, cut, below, log)
+            # It may have moved an ornament over the part and filled under it.
+            stale = True
         if cut.any():
             # The cut's rim, the two drawings blended, goes too where the picture is nearer what lies under.
             k = 2 * CUT_RIM + 1
@@ -2339,6 +2368,9 @@ def cut_by_picture(front, picture, log, lift=False):
             soft = cv2.GaussianBlur(cv2.dilate(cut.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(np.float32), (5, 5), 0)
             front.layers[name][..., 3] *= 1 - np.clip(soft, 0, 1)
             report[name] = int(cut.sum())
+            stale = True
+        if stale:
+            owner = now = None
     log(f'cut by the picture {report}')
     return report
 
