@@ -505,6 +505,10 @@ def refine_backward(A, B, back, smooth=0.0005, steps=(8.0, 4.0, 2.0, 1.0, 0.5), 
     S = np.zeros((h + 1, w + 1)); S[1:, 1:] = (alpha > 0.02).cumsum(0).cumsum(1)
     live |= (S[y1][:, x1] - S[y0][:, x1] - S[y1][:, x0] + S[y0][:, x0]) > 0
 
+    # With cells under a pixel wide the boxes of points three apart overlap, and a trial cannot be
+    # drawn or kept box by box: every trial, and the lattice after each class, is then drawn whole.
+    whole = cw < 1 or ch < 1
+
     def bands(lo, hi, taking):
         """The pixel runs [lo, hi) of the lattice lines taking part, and where each starts when they are laid end to end."""
         runs, at = [], 0
@@ -523,7 +527,7 @@ def refine_backward(A, B, back, smooth=0.0005, steps=(8.0, 4.0, 2.0, 1.0, 0.5), 
             if not mask.any():
                 classes.append(None)
                 continue
-            rows, cols = bands(y0, y1, mask.any(1)), bands(x0, x1, mask.any(0))
+            rows, cols = ([(0, h, 0)], [(0, w, 0)]) if whole else (bands(y0, y1, mask.any(1)), bands(x0, x1, mask.any(0)))
             ry = np.concatenate([np.arange(a, b) for a, b, _ in rows])
             rx = np.concatenate([np.arange(a, b) for a, b, _ in cols])
             pick = np.ix_(ry, rx)
@@ -568,8 +572,11 @@ def refine_backward(A, B, back, smooth=0.0005, steps=(8.0, 4.0, 2.0, 1.0, 0.5), 
                 if changed.any():
                     back[changed] += best_move[changed]
                     moved += int(changed.sum())
-                    for j, i in zip(*np.nonzero(changed)):
-                        E[y0[j]:y1[j], x0[i]:x1[i]] = trials[took[j, i]][y0[j]:y1[j], x0[i]:x1[i]]
+                    if whole:
+                        E = error(render_backward(A, back, (0, 0, w, h), cw, ch, pm), Q)
+                    else:
+                        for j, i in zip(*np.nonzero(changed)):
+                            E[y0[j]:y1[j], x0[i]:x1[i]] = trials[took[j, i]][y0[j]:y1[j], x0[i]:x1[i]]
                     stood = None
             if moved == 0:
                 break
@@ -1682,6 +1689,11 @@ def render_keys(layers, keys, side, W, H, kept=None):
             if box is None:
                 kept[i] = None
             else:
+                # A box that starts on the second column or row is read from the first: a sample between
+                # the two would be taken at a coordinate less than one below the box's start, where the
+                # subtraction is not exact (further in or out it is, or reads nothing either way).
+                xa, ya, xb, yb = box
+                box = (0 if xa <= 1 else xa, 0 if ya <= 1 else ya, xb, yb)
                 xa, ya, xb, yb = box
                 kept[i] = (box, premultiplied(layer[ya:yb, xa:xb]))
         if kept[i] is None:
@@ -1759,6 +1771,9 @@ def refit_lattice(key, px, py, target, smooth=PICTURE_SMOOTH):
     x0, y0, x1, y1 = key['box']
     g = key['grid']
     n = g * g
+    if not len(px):
+        # Nothing measured: every row of the system is zero, and its least squares the zero lattice.
+        return dict(key, back=[0.0] * (n * 2))
     old = np.asarray(key['back'], np.float32).reshape(n, 2).astype(np.float64)
     xs = np.linspace(x0, x1, g); ys = np.linspace(y0, y1, g)
     idx, wts = bilinear_weights(px, py, xs, ys)
