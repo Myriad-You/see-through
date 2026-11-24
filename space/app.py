@@ -17,11 +17,15 @@ from PIL import Image
 # The passes hand each other their parts as PNG files (about fifty written and read back for one
 # decomposition) and nothing keeps them. Written with little compression they are the same pixels,
 # several times as fast: nine seconds of a decomposition's GPU time went to compressing them.
+# Only what a decomposition writes into its own scratch directory: a picture handed out (a head's
+# crop, a figure's tiles) is sent on from the caller's side and stays as small as it was.
 _save_image = Image.Image.save
+_scratch = None
 
 
 def _save_image_fast(self, fp, format=None, **params):
-    if "compress_level" not in params and isinstance(fp, (str, os.PathLike)) and str(fp).lower().endswith(".png"):
+    if (_scratch and "compress_level" not in params and isinstance(fp, (str, os.PathLike))
+            and str(fp).startswith(_scratch) and str(fp).lower().endswith(".png")):
         params["compress_level"] = 1
     return _save_image(self, fp, format, **params)
 
@@ -130,7 +134,9 @@ def _decompose(image, resolution, seed, tblr_split, output_scale=1, size_conditi
     _move_to_gpu()
     seed_everything(seed)
 
+    global _scratch
     tmpdir = tempfile.mkdtemp(prefix="seethrough_")
+    _scratch = tmpdir + os.sep
     try:
         input_path = os.path.join(tmpdir, "input.png")
         image.save(input_path)

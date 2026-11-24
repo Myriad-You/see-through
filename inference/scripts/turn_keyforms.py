@@ -33,7 +33,6 @@ import re
 import sys
 import tempfile
 import time
-import threading
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 import cv2
@@ -429,25 +428,29 @@ def to_backward(forward, fxs, fys, grid, w, h):
 
 
 _GRID_MAPS = {}
-_GRID_LOCK = threading.Lock()
 
 
 def _grid_maps(h, w, grid, region):
     """Per pixel of the region, its place on the lattice (corner-aligned), cached."""
     key = (h, w, grid, region)
-    # Parts of one direction are fitted on threads of their own: the cache is theirs together.
-    with _GRID_LOCK:
-        maps = _GRID_MAPS.get(key)
+    # Parts of one direction are fitted on threads of their own, and the cache is theirs together.
+    # No lock is held over it: a process forked while another thread held one (the Space fits a
+    # front hair on a thread of the process that forks the whole fit's) would wait on it for good.
+    # Looking a key up and putting one in are each one step to the interpreter; two threads that
+    # both miss make the same maps, and the one that is put in last stays.
+    maps = _GRID_MAPS.get(key)
     if maps is None:
         xa, ya, xb, yb = region
         cw, ch = (w - 1) / (grid - 1), (h - 1) / (grid - 1)
         yy, xx = np.mgrid[ya:yb, xa:xb].astype(np.float32)
         maps = (xx, yy, np.clip(xx / cw, 0, grid - 1).astype(np.float32),
                 np.clip(yy / ch, 0, grid - 1).astype(np.float32))
-        with _GRID_LOCK:
-            _GRID_MAPS[key] = maps
-            if len(_GRID_MAPS) > 64:
-                _GRID_MAPS.pop(next(iter(_GRID_MAPS)))
+        _GRID_MAPS[key] = maps
+        if len(_GRID_MAPS) > 64:
+            try:
+                _GRID_MAPS.pop(next(iter(_GRID_MAPS)), None)
+            except (RuntimeError, StopIteration):
+                pass  # another thread put one in or took one out meanwhile: it goes next time
     return maps
 
 
