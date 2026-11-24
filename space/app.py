@@ -360,6 +360,28 @@ def keyforms(front_psd, right_psd, left_psd, up_psd, down_psd,
     return json_path, psd_path
 
 
+def hair_fit(front_psd, turned_psd):
+    """
+    The front hair's fit onto one turned decomposition, as keyforms reports it
+    under fit['front-hair'][side] (turn_keyforms.front_hair_fit): {fit: {iou,
+    outline, outline95}} or {fit: null}. A turn whose fringe the image model
+    redrew shows in it (its outline far further off than the opposite turn's)
+    without waiting for the whole fit. CPU only, about twenty seconds.
+    """
+    import turn_keyforms
+
+    if front_psd is None or turned_psd is None:
+        raise gr.Error("The front and one turned decomposition are needed.")
+    path = lambda f: f if isinstance(f, str) else f.name
+    t0 = time.time()
+    try:
+        fit = turn_keyforms.front_hair_fit(path(front_psd), path(turned_psd))
+    except ValueError as error:
+        raise gr.Error(str(error))
+    _log(f"Front hair fit {fit} ({time.time() - t0:.1f}s)")
+    return {"fit": fit}
+
+
 def figure_head(full_psd, image):
     """
     Where a standing figure's head is, framed as a bust (figure_head.head_crop):
@@ -714,6 +736,13 @@ with gr.Blocks(title="See-through: Layer Decomposition") as demo:
             check_json = gr.JSON(label="Check")
         check_btn = gr.Button("Check")
         check_btn.click(fn=check, inputs=[check_psd], outputs=[check_json], api_name="check", concurrency_limit=LIGHT_AT_ONCE)
+        with gr.Row():
+            hf_front = gr.File(label="Front decomposition PSD")
+            hf_turned = gr.File(label="One turned decomposition PSD")
+            hf_json = gr.JSON(label="Front hair fit")
+        hf_btn = gr.Button("Front hair fit")
+        hf_btn.click(fn=hair_fit, inputs=[hf_front, hf_turned], outputs=[hf_json], api_name="hair_fit",
+                     concurrency_limit=LIGHT_AT_ONCE)
         turns_json = gr.JSON(label="Turned pictures")
         turns_btn = gr.Button("Check the turned pictures (front PSD and pictures above)")
         turns_btn.click(

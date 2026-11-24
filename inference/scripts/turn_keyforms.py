@@ -3355,6 +3355,25 @@ def _fit_direction(front_path, turned_path):
     return fits, lines
 
 
+def front_hair_fit(front_path, turned_path):
+    """
+    How well the front hair is fitted onto one turned decomposition: what the
+    whole fit reports as fit['front-hair'][side] (iou, outline, outline95),
+    None when either decomposition has no front hair or it cannot be fitted.
+    The front hair is fitted from the two decompositions alone, before
+    anything else of the fit touches them, so this is that number without the
+    rest of the fit: a caller can tell a turn whose fringe was redrawn (the
+    outline far further off than its opposite's) while the whole fit runs.
+    """
+    front = Decomposition(front_path)
+    turned = Decomposition(turned_path)
+    names = FAMILIES['front-hair']
+    if not any(n in front.layers for n in names) or not any(n in turned.layers for n in names):
+        return None
+    fit = fit_family(front, turned, names, 'front-hair', lambda line: None)
+    return fit['fit'] if fit else None
+
+
 def _refine_direction(front_path, keys, side, front_picture, picture_path, recovered, own=()):
     front = Decomposition(front_path)
     rgb, _ = placed_illustration(front_picture, front.W, front.H)
