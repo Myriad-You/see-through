@@ -14,6 +14,20 @@ sys.path.insert(0, os.path.join(_root, "common"))
 
 from PIL import Image
 
+# The passes hand each other their parts as PNG files (about fifty written and read back for one
+# decomposition) and nothing keeps them. Written with little compression they are the same pixels,
+# several times as fast: nine seconds of a decomposition's GPU time went to compressing them.
+_save_image = Image.Image.save
+
+
+def _save_image_fast(self, fp, format=None, **params):
+    if "compress_level" not in params and isinstance(fp, (str, os.PathLike)) and str(fp).lower().endswith(".png"):
+        params["compress_level"] = 1
+    return _save_image(self, fp, format, **params)
+
+
+Image.Image.save = _save_image_fast
+
 REPO_LAYERDIFF = "layerdifforg/seethroughv0.0.2_layerdiff3d"
 REPO_DEPTH = "24yearsold/seethroughv0.0.1_marigold"
 
