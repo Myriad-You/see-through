@@ -33,7 +33,8 @@ import re
 import sys
 import tempfile
 import time
-from concurrent.futures import ProcessPoolExecutor
+import threading
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -428,20 +429,26 @@ def to_backward(forward, fxs, fys, grid, w, h):
 
 
 _GRID_MAPS = {}
+_GRID_LOCK = threading.Lock()
 
 
 def _grid_maps(h, w, grid, region):
     """Per pixel of the region, its place on the lattice (corner-aligned), cached."""
     key = (h, w, grid, region)
-    if key not in _GRID_MAPS:
+    # Parts of one direction are fitted on threads of their own: the cache is theirs together.
+    with _GRID_LOCK:
+        maps = _GRID_MAPS.get(key)
+    if maps is None:
         xa, ya, xb, yb = region
         cw, ch = (w - 1) / (grid - 1), (h - 1) / (grid - 1)
         yy, xx = np.mgrid[ya:yb, xa:xb].astype(np.float32)
-        _GRID_MAPS[key] = (xx, yy, np.clip(xx / cw, 0, grid - 1).astype(np.float32),
-                           np.clip(yy / ch, 0, grid - 1).astype(np.float32))
-        if len(_GRID_MAPS) > 64:
-            _GRID_MAPS.pop(next(iter(_GRID_MAPS)))
-    return _GRID_MAPS[key]
+        maps = (xx, yy, np.clip(xx / cw, 0, grid - 1).astype(np.float32),
+                np.clip(yy / ch, 0, grid - 1).astype(np.float32))
+        with _GRID_LOCK:
+            _GRID_MAPS[key] = maps
+            if len(_GRID_MAPS) > 64:
+                _GRID_MAPS.pop(next(iter(_GRID_MAPS)))
+    return maps
 
 
 def render_backward(A, back, region, cw=None, ch=None, pm=None):
@@ -3272,47 +3279,65 @@ def hidden_ears(front, turned, fits, log):
     return out
 
 
+# How many parts of one direction are fitted at once. The four directions have a process each, and the
+# Space's container sixteen CPUs: four threads a direction fill them. What a part's fit works with
+# (resampling, sums over planes) runs outside the interpreter's lock.
+FAMILY_THREADS = 4
+
+
 def _fit_direction(front_path, turned_path):
     front = Decomposition(front_path)
     turned = Decomposition(turned_path)
     lines = []
     fits = {}
-    # The ears last: when they cannot be fitted they ride the face or the back hair.
-    order = [f for f in FAMILIES if f != 'ears'] + ['ears']
-    for family in order:
+
+    def fitted(family):
+        """One part's fit and what it said. The parts but the ears are fitted from the two decompositions
+        alone, neither of which a fit changes: each on a thread of its own, taken up in their order."""
         names = FAMILIES[family]
         if not any(n in front.layers for n in names) or not any(n in turned.layers for n in names):
-            continue
-        if family == 'ears':
-            hidden = hidden_ears(front, turned, fits, lines.append)
-            if hidden is not None:
-                turned.layers['ears-hidden'] = hidden
-                turned.order.insert(0, 'ears-hidden')
-                names = names + ['ears-hidden']
-            front_ears = front.family(names)[..., 3] > 0.5
-            ratio = (turned.family(names)[..., 3] > 0.5).sum() / max(1, front_ears.sum())
-            if not EAR_AREA_RATIO[0] <= ratio <= EAR_AREA_RATIO[1]:
-                ys, xs = np.nonzero(front_ears)
-                key, by = ear_carrier(fits, (xs.min(), ys.min(), xs.max() + 1, ys.max() + 1)) if len(xs) else (None, None)
-                if key is not None:
-                    lines.append(f'ears        turned ears are {ratio:.1f}x the front ones: they ride the {by}')
-                    fits['ears'] = dict(key, fit=None)
-                continue
+            return None, []
+        said = []
         # The back hair turns with the whole of the hair: a turned decomposition
         # can give the crown to the front hair (h08: the back hair at 0.56-0.69
         # of its front area, the hair at 0.78-1.00), and fitted alone the back
         # hair's outline was pulled ~70 px in under it, its shine stretched across.
         fit_names = names + FAMILIES['front-hair'] if family == 'back-hair' else names
-        fit = fit_family(front, turned, fit_names, family, lines.append)
-        if fit and family == 'ears' and fit['fit']['iou'] < EAR_FIT_IOU:
-            # The turned ears are other parts (a human ear where a cat ear was dropped).
-            ys, xs = np.nonzero(front.family(names)[..., 3] > 0.5)
-            key, by = ear_carrier(fits, (xs.min(), ys.min(), xs.max() + 1, ys.max() + 1))
+        return fit_family(front, turned, fit_names, family, said.append), said
+
+    apart = [f for f in FAMILIES if f != 'ears']
+    with ThreadPoolExecutor(max_workers=FAMILY_THREADS) as pool:
+        for family, (fit, said) in zip(apart, pool.map(fitted, apart)):
+            lines.extend(said)
+            if fit:
+                fits[family] = fit
+    # The ears last: when they cannot be fitted they ride the face or the back hair.
+    names = FAMILIES['ears']
+    if any(n in front.layers for n in names) and any(n in turned.layers for n in names):
+        hidden = hidden_ears(front, turned, fits, lines.append)
+        if hidden is not None:
+            turned.layers['ears-hidden'] = hidden
+            turned.order.insert(0, 'ears-hidden')
+            names = names + ['ears-hidden']
+        front_ears = front.family(names)[..., 3] > 0.5
+        ratio = (turned.family(names)[..., 3] > 0.5).sum() / max(1, front_ears.sum())
+        if not EAR_AREA_RATIO[0] <= ratio <= EAR_AREA_RATIO[1]:
+            ys, xs = np.nonzero(front_ears)
+            key, by = ear_carrier(fits, (xs.min(), ys.min(), xs.max() + 1, ys.max() + 1)) if len(xs) else (None, None)
             if key is not None:
-                lines.append(f'ears        fitted at IoU {fit["fit"]["iou"]:.2f}: they ride the {by}')
-                fit = dict(key, fit=None)
-        if fit:
-            fits[family] = fit
+                lines.append(f'ears        turned ears are {ratio:.1f}x the front ones: they ride the {by}')
+                fits['ears'] = dict(key, fit=None)
+        else:
+            fit = fit_family(front, turned, names, 'ears', lines.append)
+            if fit and fit['fit']['iou'] < EAR_FIT_IOU:
+                # The turned ears are other parts (a human ear where a cat ear was dropped).
+                ys, xs = np.nonzero(front.family(names)[..., 3] > 0.5)
+                key, by = ear_carrier(fits, (xs.min(), ys.min(), xs.max() + 1, ys.max() + 1))
+                if key is not None:
+                    lines.append(f'ears        fitted at IoU {fit["fit"]["iou"]:.2f}: they ride the {by}')
+                    fit = dict(key, fit=None)
+            if fit:
+                fits['ears'] = fit
     for side in ('L', 'R'):
         iris, eye = fits.get(f'iris:{side}'), fits.get(f'eye:{side}')
         if not eye:
@@ -3622,6 +3647,7 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
                     keys.setdefault(family, {})[side] = lattice
             log(f'{side:5s} accessories {[(round(f["target"][0]), round(f["target"][1]), round(f["squeeze"], 2), "m" if f["matched"] else "h") for f in found]}')
     place_mouth(front, turned, keys, log)
+    seconds['pieces'] = round(time.time() - started, 1)
     # A family is keyed only with both turn keys; nod keys only as a pair.
     complete = {}
     for family, sides in keys.items():
@@ -3668,6 +3694,7 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
         for side, picture in turned_pictures.items():
             cut_by_picture(turned[side], picture, lambda line, side=side: log(f'{side:5s} {line}'))
     cut_crown(front, complete, log)
+    seconds['cuts'] = round(time.time() - started, 1)
     if not drawn:
         unfold_keys(front, complete, log)
         glue_under_hat(front, complete, log)
@@ -3697,6 +3724,7 @@ def turn_keyforms(front_path, turned_paths, log=print, pictures=None):
                     for family, key in moved.items():
                         complete[family][side] = key
                     result['picture'][side] = change
+        seconds['refined'] = round(time.time() - started, 1)
         unfold_keys(front, complete, log)
         glue_under_hat(front, complete, log)
         carry_hanging_hair(front, complete, log)
