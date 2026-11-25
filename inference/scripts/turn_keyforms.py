@@ -1,8 +1,8 @@
 """Keyed head turns from turned references.
 
-A Live2D rigger keys each part of the head at Angle X / Angle Y ±30: the
-shape the part takes when the head has turned that far. Here those shapes
-are measured. The front portrait and four turned drawings of it (the head
+A 2D rigger keys each part of the head at the ends of a turn: the shape
+the part takes when the head has turned that far. Here those shapes are
+measured. The front portrait and four turned drawings of it (the head
 turned toward image right and left, raised and lowered, about 30 degrees,
 the body unchanged and lined up) are decomposed alike; each part of the
 front decomposition is fitted onto the same part of each turned one.
@@ -2965,7 +2965,7 @@ def unfold_keys(front, keys, log):
 
 # The light on a part changes as the head turns: a neck the raised chin no
 # longer shades is lighter, one the lowered chin shades darker. Each key of
-# such a part holds a multiply colour (as Cubism keys one): the mean colour of
+# such a part holds a multiply colour: the mean colour of
 # the part where the turned picture shows it, over the mean of the part drawn
 # at that key there, relative to the same at rest.
 MULTIPLY_FAMILIES = ('neck',)
